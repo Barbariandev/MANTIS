@@ -7,9 +7,9 @@ Incentivize the production of any information that can both be represented in 10
 The validator's core responsibilities are to:
 
 1.  **Collect** encrypted data payloads from all active miners at regular intervals.
-2.  **Securely Decrypt** the payloads using a decentralized timelock mechanism (`tlock`) powered by the Drand network.
-3.  **Calculate Salience** by estimating the marginal predictive power of each miner's data using a lightweight proxy model.
-4.  **Set Weights** on the Bittensor blockchain, rewarding miners proportional to their contribution.
+2.  **Securely Decrypt** the payloads using (`tlock`)
+3.  **Calculate Salience** by estimating the marginal predictive power of each miner's data
+4.  **Set Weights** on the Bittensor blockchain, rewarding miners proportional to the salience of their historical contributions
 
 ---
 
@@ -88,7 +88,7 @@ class DataLog:
 
 ## Security Highlights
 
--   **Decentralized Time-lock:** Uses `tlock` and the public Drand randomness beacon, ensuring that data is verifiably locked without relying on any single party or blockchain state.
+-   **Time-lock:** Uses `tlock` and the public Drand randomness beacon, this prevents relay mining.
 -   **Commit Validation:** The validator verifies that the filename in a miner's commit URL matches their hotkey, preventing one miner from pointing to another's data.
 -   **Data Validation:** All decrypted payloads are strictly validated. Any data that is malformed (wrong length, values out of range) is safely discarded and replaced with a neutral zero vector.
 -   **Payload Size Limits:** `comms.py` enforces a maximum download size to mitigate denial-of-service attacks.
