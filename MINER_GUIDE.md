@@ -5,7 +5,7 @@ A quick reference for setting up your MANTIS miner. This guide details how to ge
 ## 1. Prerequisites
 
 - **Python Environment:** Python 3.8 or newer.
-- **Registered Hotkey:** Your hotkey must be registered on the MANTIS subnet. Without this, you cannot commit your data URL.
+- **Registered Hotkey:** Your hotkey must be registered on the netuid 123. Without this, you cannot commit your data URL.
 - **Cloudflare R2 Bucket:**
     - You need an R2 bucket for hosting your payload.
     - The bucket must be configured for public access.
@@ -140,4 +140,4 @@ subtensor.commit(wallet=wallet, netuid=123, data=r2_public_url) # Use the correc
 3.  Save the payload file (Step 3).
 4.  Upload the new file to R2, overwriting the old one (Step 4).
 
-You are ready to mine! 
+You are now mining!
