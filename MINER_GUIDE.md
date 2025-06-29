@@ -1,6 +1,6 @@
 # MANTIS Mining Guide
 
-A quick reference for setting up your MANTIS miner. This guide details how to generate embeddings, encrypt them using the `tlock` decentralized timelock, and submit them to the network.
+A quick reference for setting up your MANTIS miner. This guide details how to generate embeddings, encrypt them using `tlock`, and submit them to the network.
 
 ## 1. Prerequisites
 
@@ -32,7 +32,8 @@ R2_WRITE_SECRET_ACCESS_KEY="your_r2_secret_access_key"
 The core mining loop involves creating data, encrypting it for a future time, uploading it, and ensuring the network knows where to find it.
 
 ### Step 1: Build Your Embedding
-First, generate your predictive embedding. This must be a list of 100 floating-point numbers, where each value is between -1.0 and 1.0.
+First, generate your predictive embedding. This must be a list of 100 floating-point numbers, where each value is between -1.0 and 1.0. 
+A recommended first step would be to build a model that attempts to predict BTCUSD 1 hour returns.
 
 ```python
 import numpy as np
