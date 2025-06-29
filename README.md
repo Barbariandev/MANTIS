@@ -1,4 +1,4 @@
-# MANTIS Bittensor Subnet Validator – Core Overview
+# MANTIS
 
 ## Purpose
 
