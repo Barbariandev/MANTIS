@@ -1,7 +1,8 @@
 # MANTIS Bittensor Subnet Validator – Core Overview
 
 ## Purpose
-A lean, performant **validator** for Bittensor subnet **123**. It is designed to evaluate and rank miners who broadcast time-locked embeddings that predict Bitcoin price movements.
+
+Incentivize the production of any information that can both be represented in 100 embeddings and that has predictive power for BTC's next 1 hour returns.
 
 The validator's core responsibilities are to:
 
