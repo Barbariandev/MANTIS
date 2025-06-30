@@ -30,7 +30,6 @@ DRAND_PUBLIC_KEY = (
     "5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a"
 )
 
-# --- Constants ---
 ZERO_VEC = [0.0] * config.FEATURE_LENGTH
 
 def _precompute_encrypted_zero():
@@ -182,7 +181,7 @@ class DataLog:
             block_map = {ts: self.blocks[ts] for ts in payloads_to_process}
 
         if not payloads_to_process:
-            return # Nothing to do
+            return
 
         rounds_to_process: Dict[int, List[Dict]] = {}
         timesteps_to_discard = []
@@ -231,7 +230,7 @@ class DataLog:
             async with sem:
                 sig = await self._get_drand_signature(round_num)
                 if not sig:
-                    return # Signature not yet available
+                    return
 
                 logger.info(f"Decrypting batch of {len(items)} payloads for Drand round {round_num}")
                 for item in items:
@@ -265,19 +264,50 @@ class DataLog:
                     if ts in self.raw_payloads:
                         del self.raw_payloads[ts]
 
-    def get_training_data(self) -> tuple[dict[int, list], list[float]] | None:
-        if not self.plaintext_cache or len(self.blocks) < config.LAG * 2 + 1:
-            logger.warning("Not enough data to create a training set.")
+    def get_training_data(self, max_block_number: int | None = None) -> tuple[dict[int, list], list[float]] | None:
+        if not self.plaintext_cache:
+            logger.warning("Not enough data to create a training set (no plaintext cache).")
             return None
 
-        T = len(self.blocks)
-        all_uids = self._get_all_uids_unsafe() # Uses non-locking version
+        if max_block_number is not None:
+            end_idx = next((i for i, b in enumerate(self.blocks) if b >= max_block_number), len(self.blocks))
+            if end_idx == 0:
+                logger.warning(f"No data available before block {max_block_number}.")
+                return None
+            
+            blocks = self.blocks[:end_idx]
+            btc_prices = self.btc_prices[:end_idx]
+            plaintext_cache = self.plaintext_cache[:end_idx]
+        else:
+            blocks = self.blocks
+            btc_prices = self.btc_prices
+            plaintext_cache = self.plaintext_cache
+
+        TIMESTEPS_TO_SKIP = 1000
+        if len(blocks) <= TIMESTEPS_TO_SKIP:
+            logger.warning(
+                f"Not enough data for training after filtering. "
+                f"Have {len(blocks)} timesteps, but require more than "
+                f"{TIMESTEPS_TO_SKIP} to skip the initial period."
+            )
+            return None
+        
+        blocks = blocks[TIMESTEPS_TO_SKIP:]
+        btc_prices = btc_prices[TIMESTEPS_TO_SKIP:]
+        plaintext_cache = plaintext_cache[TIMESTEPS_TO_SKIP:]
+
+        if len(blocks) < config.LAG * 2 + 1:
+            logger.warning("Not enough data to create a training set after filtering and skipping initial timesteps.")
+            return None
+
+        T = len(blocks)
+        all_uids = self._get_all_uids_unsafe()
         history_dict = {uid: [] for uid in all_uids}
         btc_returns = []
 
         for t in range(T - config.LAG):
-            p_initial = self.btc_prices[t]
-            p_final = self.btc_prices[t + config.LAG]
+            p_initial = btc_prices[t]
+            p_final = btc_prices[t + config.LAG]
             if p_initial > 0:
                 btc_returns.append((p_final - p_initial) / p_initial)
             else:
@@ -286,7 +316,7 @@ class DataLog:
         effective_T = len(btc_returns)
         for t in range(effective_T):
             for uid in all_uids:
-                vector = self.plaintext_cache[t].get(uid, ZERO_VEC)
+                vector = plaintext_cache[t].get(uid, ZERO_VEC)
                 history_dict[uid].append(vector)
 
         return history_dict, btc_returns
