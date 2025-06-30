@@ -30,6 +30,7 @@ DRAND_PUBLIC_KEY = (
     "5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a"
 )
 
+# --- Constants ---
 ZERO_VEC = [0.0] * config.FEATURE_LENGTH
 
 def _precompute_encrypted_zero():
@@ -181,7 +182,7 @@ class DataLog:
             block_map = {ts: self.blocks[ts] for ts in payloads_to_process}
 
         if not payloads_to_process:
-            return
+            return # Nothing to do
 
         rounds_to_process: Dict[int, List[Dict]] = {}
         timesteps_to_discard = []
@@ -230,7 +231,7 @@ class DataLog:
             async with sem:
                 sig = await self._get_drand_signature(round_num)
                 if not sig:
-                    return
+                    return # Signature not yet available
 
                 logger.info(f"Decrypting batch of {len(items)} payloads for Drand round {round_num}")
                 for item in items:
@@ -345,28 +346,28 @@ class DataLog:
 
     @staticmethod
     def load(path: str) -> "DataLog":
-        if os.path.exists(path):
-            logger.info(f"Found local DataLog at {path}")
-            try:
-                with gzip.open(path, "rb") as f:
-                    log = pickle.load(f)
-                logger.info(f"✅ Loaded DataLog from {path}")
-                return log
-            except Exception as e:
-                logger.error(f"Failed to load local DataLog from {path}: {e}")
-                logger.warning("Starting with a new, empty DataLog.")
-                return DataLog()
-
-        logger.warning(f"No local DataLog found. Attempting to download from archive...")
+        """
+        Always fetches the latest datalog from the R2 archive, bypassing local cache.
+        """
+        logger.info(f"Always fetching latest datalog from R2 bucket: {config.DATALOG_ARCHIVE_URL}")
         try:
             url = config.DATALOG_ARCHIVE_URL
             r = requests.get(url, timeout=60, stream=True)
             r.raise_for_status()
-            with open(path, "wb") as f:
+            
+            tmp_path = path + ".tmp"
+            with open(tmp_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
+            
+            os.replace(tmp_path, path)
             logger.info(f"✅ Downloaded and saved archive to {path}")
-            return DataLog.load(path)
+
+            with gzip.open(path, "rb") as f:
+                log = pickle.load(f)
+            logger.info(f"✅ Loaded DataLog from {path}")
+            return log
+
         except Exception as e:
             logger.error(f"Failed to download or load archive from {config.DATALOG_ARCHIVE_URL}: {e}")
             logger.warning("Starting with a new, empty DataLog.")
