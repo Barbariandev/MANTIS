@@ -28,11 +28,14 @@ NUM_UIDS = 256
 
 FEATURE_LENGTH = 100
 
-HIDDEN_SIZE = 64
+HIDDEN_SIZE = 32
 LEARNING_RATE = 1e-3
+
+# A fixed seed for all RNGs to ensure reproducibility of salience scores.
+SEED = 42
 
 SAMPLE_STEP = 5
 
 LAG = 60
 
-TASK_INTERVAL = 360 
+TASK_INTERVAL = 500 
