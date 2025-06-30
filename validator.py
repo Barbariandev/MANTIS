@@ -172,7 +172,6 @@ async def run_main_loop(
     stop_event: asyncio.Event,
 ):
     last_block = sub.get_current_block()
-    next_task = last_block + config.TASK_INTERVAL
     weight_thread: threading.Thread | None = None
 
     decrypt_task = asyncio.create_task(decrypt_loop(datalog, stop_event))
@@ -194,7 +193,7 @@ async def run_main_loop(
 
                 logging.info(f"🪙 Sampled block {current_block}")
 
-                # --- Sync metagraph ---
+
                 if current_block % 100 == 0:
                     mg.sync(subtensor=sub)
                     logging.info("Metagraph synced.")
@@ -208,7 +207,7 @@ async def run_main_loop(
                 await datalog.append_step(current_block, price, payloads)
 
                 if (
-                    current_block >= next_task
+                    current_block % config.TASK_INTERVAL == 0
                     and (weight_thread is None or not weight_thread.is_alive())
                     and len(datalog.blocks) >= config.LAG * 2 + 1
                 ):
@@ -257,8 +256,11 @@ async def run_main_loop(
                             f"✅ Weights set at block {block_snapshot} (max={w_norm.max():.4f})"
                         )
 
+                    max_block_for_training = current_block - config.TASK_INTERVAL
                     async with datalog._lock:
-                        training_data = datalog.get_training_data()
+                        training_data = datalog.get_training_data(
+                            max_block_number=max_block_for_training
+                        )
                         training_data_copy = copy.deepcopy(training_data)
 
                     weight_thread = threading.Thread(
@@ -267,7 +269,6 @@ async def run_main_loop(
                         daemon=True,
                     )
                     weight_thread.start()
-                    next_task = current_block + config.TASK_INTERVAL
 
             except KeyboardInterrupt:
                 logging.info("Keyboard interrupt in main loop. Signaling shutdown.")
