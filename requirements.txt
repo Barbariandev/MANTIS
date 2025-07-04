@@ -1,0 +1,14 @@
+bittensor
+torch==2.7.1
+requests
+aiohttp
+timelock
+python-dotenv==1.1.1
+boto3 
+numpy
+scikit-learn
+scipy
+matplotlib
+pandas
+seaborn
+joblib

@@ -1,0 +1,28 @@
+[project]
+name = "MANTIS"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "bittensor",
+    "botocore",
+    "aiobotocore",
+    "python-dotenv",
+    "boto3",
+    "ccxt",
+    "numpy",
+    "requests",
+    "ipykernel",
+    "torch",
+    "pandas",
+    "pywt",
+    "scikit-learn",
+    "xgboost",
+    "tensorflow",
+    "yfinance",
+    "matplotlib",
+    "seaborn",
+    "cloudflare>=0.7.0",
+    "aiohttp",
+]
