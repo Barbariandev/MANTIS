@@ -33,6 +33,7 @@ import base64
 from pathlib import Path
 from botocore.client import Config
 import re
+from urllib.parse import urlsplit
 
 
 # Module logger
@@ -132,21 +133,34 @@ async def load( bucket:str, filename: str) -> dict:
         return None
 
 
-async def _local_path_from_url(url: str) -> str:
-    """Map https://host/path -> ~/storage/host/path"""
-    name = url.split("://", 1)[1]
-    return os.path.join(os.path.expanduser("~/storage"), name)
+BASE_CACHE = Path(os.path.expanduser("~/.mantis_cache")).resolve()
+BASE_CACHE.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+def _local_path_from_url(url: str) -> str:
+    """
+    Return a canonical **absolute** path inside `BASE_CACHE`.
+    Any ".." or absolute-path tricks will raise.
+    """
+    p = urlsplit(url)
+    if p.scheme not in {"https", "http"}:
+        raise ValueError("unsupported URL scheme")
+
+    raw = f"{p.netloc}{p.path}".lstrip("/")
+    safe_part = Path(raw).resolve().relative_to(Path("/"))
+
+    target = (BASE_CACHE / safe_part).resolve()
+    if not str(target).startswith(str(BASE_CACHE)):
+        raise ValueError("path-traversal detected in URL")
+    return str(target)
 
 async def _object_size(url: str, session: aiohttp.ClientSession, timeout: int = 10) -> int | None:
     """Return object size in bytes using HEAD or Range request, or None."""
     try:
-        # HEAD first – many servers include Content-Length here.
         async with session.head(url, timeout=timeout, headers={"Accept-Encoding": "identity"}) as r:
             if r.status == 200:
                 cl = r.headers.get("Content-Length")
                 if cl and cl.isdigit():
                     return int(cl)
-        # Fallback: Range 0-0 GET to retrieve Content-Range header.
         async with session.get(url, timeout=timeout, headers={
             "Accept-Encoding": "identity",
             "Range": "bytes=0-0",
@@ -158,7 +172,6 @@ async def _object_size(url: str, session: aiohttp.ClientSession, timeout: int = 
                     if m:
                         return int(m.group(1))
     except Exception:
-        # Any failure → size unknown
         return None
     return None
 
@@ -177,13 +190,10 @@ async def download(url: str, max_size_bytes: int | None = None):
         payloads.
     """
 
-    path = await _local_path_from_url(url)
+    path = _local_path_from_url(url)
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     async with aiohttp.ClientSession() as s:
-        # ------------------------------------------------------------------
-        # Optional size pre-check – avoids downloading huge payloads.
-        # ------------------------------------------------------------------
         if max_size_bytes is not None and max_size_bytes > 0:
             try:
                 sz = await _object_size(url, s)
@@ -196,15 +206,10 @@ async def download(url: str, max_size_bytes: int | None = None):
         async with s.get(url, timeout=600) as r:
             r.raise_for_status()
             
-            # Always read the raw body first for maximum reliability.
             body = await r.read()
             try:
-                # Attempt to decode as text and then parse as JSON. This is
-                # the most common case for our payloads.
                 data = json.loads(body.decode('utf-8'))
             except (json.JSONDecodeError, UnicodeDecodeError):
-                # If it's not valid JSON or not valid UTF-8, it's some other
-                # binary format. Return the raw bytes.
                 data = body
 
     # The local caching logic handles both dicts (from JSON) and bytes.
@@ -364,10 +369,10 @@ def upload(bucket: str, object_key: str, file_path: str | Path) -> None:
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
         region_name="auto",
-        config=Config(signature_version="s3v4"),  # R2 uses SigV4
+        config=Config(signature_version="s3v4"), 
     )
 
     logger.info("Uploading %s to bucket %s as %s", file_path, bucket, object_key)
 
     s3.upload_file(str(file_path), bucket, object_key)
-    logger.info("✅ Uploaded %s → s3://%s/%s", file_path, bucket, object_key)
+    logger.info("Uploaded %s → s3://%s/%s", file_path, bucket, object_key)
