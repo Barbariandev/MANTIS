@@ -22,6 +22,7 @@
 
 import asyncio, bittensor as bt, requests, config, comms, logging, os
 from urllib.parse import urlparse
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +31,35 @@ sub = bt.subtensor(network=NETWORK)
 
 MAX_PAYLOAD_BYTES = 25 * 1024 * 1024
 
+R2_URL_RE = re.compile(
+    r"^https://pub-[a-f0-9]{32}\.r2\.dev/([^/]+)$",
+    re.IGNORECASE
+)
+
+def _r2_url_is_valid(url: str, expected_hotkey: str) -> bool:
+    """
+    Return True iff `url` is exactly of the form
+
+        https://pub-19ef1d497c954cd79216cf8f3b43cd01.r2.dev/<hotkey>
+
+    • scheme must be HTTPS
+    • host must begin with 'pub-' and end with '.r2.dev'
+    • bucket ID must be 32 hex chars
+    • exactly ONE path segment (the miner's hotkey)
+    """
+    m = R2_URL_RE.match(url)
+    return bool(m and m.group(1).lower() == expected_hotkey.lower())
+
 async def get_miner_payloads(
     netuid: int = 123, mg: bt.metagraph = None
 ) -> dict[int, bytes]:
     """
     Fetches the current block's payloads from all active miners.
+
+    This function is now stateless. It queries the subtensor for miner commitments
+    and downloads the corresponding payloads, returning a simple dictionary
+    mapping UID to the raw payload bytes. All state management is handled by the
+    DataLog.
 
     Returns:
         A dictionary mapping miner UIDs to their payload bytes.
@@ -52,15 +77,8 @@ async def get_miner_payloads(
         if not object_url:
             return
 
-        try:
-            path_parts = urlparse(object_url).path.lstrip("/").split("/")
-            object_name = path_parts[-1] if path_parts else ""
-            if object_name.lower() != (hotkey or "").lower():
-                logger.warning(
-                    f"UID {uid} commit URL {object_url} does not match hotkey {hotkey}"
-                )
-                return
-        except Exception:
+        if not _r2_url_is_valid(object_url, hotkey):
+            logger.warning("Rejecting malformed R2 URL: %s", object_url)
             return
 
         try:
