@@ -65,7 +65,7 @@ load_dotenv()
 
 os.makedirs(config.STORAGE_DIR, exist_ok=True)
 DATALOG_PATH = os.path.join(config.STORAGE_DIR, "mantis_datalog.pkl.gz")
-SAVE_INTERVAL = 100
+SAVE_INTERVAL = 1000
 
 
 async def _fetch_price_source(session, url, parse_json=True):
