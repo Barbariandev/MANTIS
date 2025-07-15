@@ -29,6 +29,7 @@ import threading
 import time
 import asyncio
 import copy
+import json
 
 import bittensor as bt
 import torch
@@ -65,7 +66,7 @@ load_dotenv()
 
 os.makedirs(config.STORAGE_DIR, exist_ok=True)
 DATALOG_PATH = os.path.join(config.STORAGE_DIR, "mantis_datalog.pkl.gz")
-SAVE_INTERVAL = 1000
+SAVE_INTERVAL = 120
 
 
 async def _fetch_price_source(session, url, parse_json=True):
@@ -90,100 +91,17 @@ async def _get_price_from_sources(session, source_list):
 
 
 async def get_asset_prices(session: aiohttp.ClientSession) -> dict[str, float] | None:
-    sources = {
-        "BTC": [
-            ("Yahoo", "https://query1.finance.yahoo.com/v7/finance/quote?symbols=BTC-USD",
-            lambda data: data["quoteResponse"]["result"][0]["regularMarketPrice"] if data["quoteResponse"]["result"] else None),
-            ("CoinGecko", "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd",
-            lambda data: data["bitcoin"]["usd"] if "bitcoin" in data else None),
-            ("Bitstamp", "https://www.bitstamp.net/api/v2/ticker/btcusd/",
-            lambda data: float(data["last"]) if "last" in data else None)
-        ],
-        "ETH": [
-            ("Yahoo", "https://query1.finance.yahoo.com/v7/finance/quote?symbols=ETH-USD",
-            lambda data: data["quoteResponse"]["result"][0]["regularMarketPrice"] if data["quoteResponse"]["result"] else None),
-            ("CoinGecko", "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd",
-            lambda data: data["ethereum"]["usd"] if "ethereum" in data else None),
-            ("Bitstamp", "https://www.bitstamp.net/api/v2/ticker/ethusd/",
-            lambda data: float(data["last"]) if "last" in data else None)
-        ],
-        "EURUSD": [
-            ("Yahoo", "https://query1.finance.yahoo.com/v7/finance/quote?symbols=EURUSD=X",
-            lambda data: data["quoteResponse"]["result"][0]["regularMarketPrice"] if data["quoteResponse"]["result"] else None),
-            ("FreeForex", "https://www.freeforexapi.com/api/live?pairs=EURUSD",
-            lambda data: data["rates"]["EURUSD"]["rate"] if "rates" in data else None),
-            ("Stooq", "https://stooq.com/q/l/?s=eurusd&f=sd2t2ohlcv&e=csv",
-            lambda text: None if not text or "N/D" in text
-                        else float(text.splitlines()[1].split(',')[6]) if text.startswith("Symbol")
-                        else float(text.split(',')[6]))
-        ],
-        "GBPUSD": [
-            ("Yahoo", "https://query1.finance.yahoo.com/v7/finance/quote?symbols=GBPUSD=X",
-            lambda data: data["quoteResponse"]["result"][0]["regularMarketPrice"] if data["quoteResponse"]["result"] else None),
-            ("FreeForex", "https://www.freeforexapi.com/api/live?pairs=GBPUSD",
-            lambda data: data["rates"]["GBPUSD"]["rate"] if "rates" in data else None),
-            ("Stooq", "https://stooq.com/q/l/?s=gbpusd&f=sd2t2ohlcv&e=csv",
-            lambda text: None if not text or "N/D" in text
-                        else float(text.splitlines()[1].split(',')[6]) if text.startswith("Symbol")
-                        else float(text.split(',')[6]))
-        ],
-        "CADUSD": [  # CADUSD = 1 CAD in USD, invert USD/CAD
-            ("Yahoo", "https://query1.finance.yahoo.com/v7/finance/quote?symbols=CADUSD=X",
-            lambda data: data["quoteResponse"]["result"][0]["regularMarketPrice"] if data["quoteResponse"]["result"] else None),
-            ("FreeForex", "https://www.freeforexapi.com/api/live?pairs=USDCAD",
-            lambda data: (1/ data["rates"]["USDCAD"]["rate"]) if "rates" in data else None),
-            ("Stooq", "https://stooq.com/q/l/?s=usdcad&f=sd2t2ohlcv&e=csv",
-            lambda text: None if not text or "N/D" in text
-                        else 1/ float(text.splitlines()[1].split(',')[6]) if text.startswith("Symbol")
-                        else 1/ float(text.split(',')[6]))
-        ],
-        "NZDUSD": [
-            ("Yahoo", "https://query1.finance.yahoo.com/v7/finance/quote?symbols=NZDUSD=X",
-            lambda data: data["quoteResponse"]["result"][0]["regularMarketPrice"] if data["quoteResponse"]["result"] else None),
-            ("FreeForex", "https://www.freeforexapi.com/api/live?pairs=NZDUSD",
-            lambda data: data["rates"]["NZDUSD"]["rate"] if "rates" in data else None),
-            ("Stooq", "https://stooq.com/q/l/?s=nzdusd&f=sd2t2ohlcv&e=csv",
-            lambda text: None if not text or "N/D" in text
-                        else float(text.splitlines()[1].split(',')[6]) if text.startswith("Symbol")
-                        else float(text.split(',')[6]))
-        ],
-        "CHFUSD": [  # CHFUSD = 1 CHF in USD, invert USD/CHF
-            ("Yahoo", "https://query1.finance.yahoo.com/v7/finance/quote?symbols=CHFUSD=X",
-            lambda data: data["quoteResponse"]["result"][0]["regularMarketPrice"] if data["quoteResponse"]["result"] else None),
-            ("FreeForex", "https://www.freeforexapi.com/api/live?pairs=USDCHF",
-            lambda data: (1/ data["rates"]["USDCHF"]["rate"]) if "rates" in data else None),
-            ("Stooq", "https://stooq.com/q/l/?s=usdchf&f=sd2t2ohlcv&e=csv",
-            lambda text: None if not text or "N/D" in text
-                        else 1/ float(text.splitlines()[1].split(',')[6]) if text.startswith("Symbol")
-                        else 1/ float(text.split(',')[6]))
-        ],
-        "XAUUSD": [
-            ("Yahoo", "https://query1.finance.yahoo.com/v7/finance/quote?symbols=XAUUSD=X",
-            lambda data: data["quoteResponse"]["result"][0]["regularMarketPrice"] if data["quoteResponse"]["result"] else None),
-            ("Stooq", "https://stooq.com/q/l/?s=xauusd&f=sd2t2ohlcv&e=csv",
-            lambda text: None if not text or "N/D" in text
-                        else float(text.splitlines()[1].split(',')[6]) if text.startswith("Symbol")
-                        else float(text.split(',')[6])),
-        ],
-        "XAGUSD": [
-            ("Yahoo", "https://query1.finance.yahoo.com/v7/finance/quote?symbols=XAGUSD=X",
-            lambda data: data["quoteResponse"]["result"][0]["regularMarketPrice"] if data["quoteResponse"]["result"] else None),
-            ("Stooq", "https://stooq.com/q/l/?s=xagusd&f=sd2t2ohlcv&e=csv",
-            lambda text: None if not text or "N/D" in text
-                        else float(text.splitlines()[1].split(',')[6]) if text.startswith("Symbol")
-                        else float(text.split(',')[6])),
-        ]
-    }
-
-    prices = {}
-    tasks = {asset: asyncio.create_task(_get_price_from_sources(session, srcs)) for asset, srcs in sources.items()}
-    for asset, task in tasks.items():
-        price = await task
-        if price is not None:
-            prices[asset] = price
-
-    logging.info(f"Fetched prices for {len(prices)} assets: {prices}")
-    return prices
+    try:
+        async with session.get(config.PRICE_DATA_URL) as resp:
+            resp.raise_for_status()
+            text = await resp.text()
+            data = json.loads(text)
+            prices = data.get("prices", {})
+            logging.info(f"Fetched prices for {len(prices)} assets: {prices}")
+            return prices
+    except Exception as e:
+        logging.error(f"Failed to fetch prices from {config.PRICE_DATA_URL}: {e}")
+        return {}
 
 def main():
     p = argparse.ArgumentParser()
@@ -195,6 +113,12 @@ def main():
         "--no_download_datalog", 
         action="store_true", 
         help="Start with a fresh datalog instead of downloading from the archive."
+    )
+    p.add_argument(
+        "--do_save",
+        action="store_true",
+        default=False,
+        help="Whether to save the datalog periodically."
     )
     args = p.parse_args()
 
@@ -240,7 +164,10 @@ async def decrypt_loop(datalog: DataLog, mg: bt.metagraph, stop_event: asyncio.E
     logging.info("Decryption loop stopped.")
 
 
-async def save_loop(datalog: DataLog, stop_event: asyncio.Event):
+async def save_loop(datalog: DataLog, do_save: bool, stop_event: asyncio.Event):
+    if not do_save:
+        logging.info("DO_SAVE is False, skipping periodic saves.")
+        return
     logging.info("Save loop started.")
     save_interval_seconds = SAVE_INTERVAL * 12
     while not stop_event.is_set():
@@ -270,7 +197,7 @@ async def run_main_loop(
 
     tasks = [
         asyncio.create_task(decrypt_loop(datalog, mg, stop_event)),
-        asyncio.create_task(save_loop(datalog, stop_event)),
+        asyncio.create_task(save_loop(datalog, args.do_save, stop_event)),
     ]
 
     async with aiohttp.ClientSession() as session:
