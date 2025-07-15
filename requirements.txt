@@ -18,3 +18,5 @@ yfinance
 pandas-datareader
 tqdm
 xgboost
+
+# pm2 (installed globally via npm)
