@@ -1,0 +1,2 @@
+min_compute:
+  gpu: "NVIDIA GeForce RTX 4090"
