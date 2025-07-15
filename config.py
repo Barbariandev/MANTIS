@@ -24,6 +24,8 @@ import os
 
 DATALOG_ARCHIVE_URL = "https://pub-879ad825983e43529792665f4f510cd6.r2.dev/mantis_datalog.pkl.gz"
 
+PRICE_DATA_URL = "https://pub-ba8c1b8edb8046edaccecbd26b5ca7f8.r2.dev/latest_prices.json"
+
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 STORAGE_DIR = os.path.join(PROJECT_ROOT, ".storage")
 
