@@ -42,6 +42,38 @@ elif command -v yum >/dev/null 2>&1;   then sudo yum install -y pkgconfig openss
 elif command -v brew >/dev/null 2>&1;  then brew install pkg-config openssl@3
 fi
 
+# ────────────────────────────────────────────────────────────
+# Install Node.js + npm (if not present) and pm2 globally
+# ────────────────────────────────────────────────────────────
+
+if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+  echo "▶ Node.js not found – installing Node.js + npm…"
+  if command -v apt-get >/dev/null 2>&1; then
+    curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+    sudo apt-get install -y nodejs
+  elif command -v yum >/dev/null 2>&1; then
+    curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo bash -
+    sudo yum install -y nodejs
+  elif command -v brew >/dev/null 2>&1; then
+    brew install node
+  else
+    echo "❌ Could not detect package manager to install Node.js." >&2
+    echo "   Please install Node.js manually and re-run this script." >&2
+    exit 1
+  fi
+else
+  echo "▶ Node.js already installed – skipping Node installation."
+fi
+
+# Ensure pm2 is available globally
+if ! command -v pm2 >/dev/null 2>&1; then
+  echo "▶ Installing pm2 globally with npm…"
+  npm install -g pm2
+else
+  echo "▶ pm2 already installed – skipping npm install."
+fi
+
+
 if [[ ! -d "$SRC/.git" ]]; then
   git clone --depth 1 https://github.com/ideal-lab5/timelock.git "$SRC"
 else
