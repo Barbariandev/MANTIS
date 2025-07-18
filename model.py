@@ -163,6 +163,16 @@ def salience(
                 train_end = val_end
                 continue
 
+            if len(np.unique(y_train)) < 2:
+                logger.warning(f"Skipping window for {asset_name}: only one class in training data.")
+                train_end = val_end
+                continue
+
+            if len(np.unique(y_val)) < 2:
+                logger.warning(f"Skipping window for {asset_name}: only one class in validation data.")
+                train_end = val_end
+                continue
+
             dtrain = xgb.DMatrix(X_train, label=y_train)
             bst = xgb.train(xgb_params, dtrain, num_boost_round=xgb_rounds, verbose_eval=False)
             
