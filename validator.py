@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import argparse
@@ -8,20 +9,21 @@ import time
 import asyncio
 import copy
 import json
-import numpy as np 
 
 import bittensor as bt
 import torch
 import aiohttp
 from dotenv import load_dotenv
 import requests
+import numpy as np
 
 import config
 from cycle import get_miner_payloads
-from model import salience as sal_fn
+from model import multi_salience as sal_fn
 from ledger import DataLog
 
-LOG_DIR = os.path.expanduser("~/new_system_mantis")
+# Log directory inside the current working directory to avoid writing to $HOME.
+LOG_DIR = os.path.join(os.getcwd(), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 logging.basicConfig(
@@ -71,7 +73,8 @@ async def _get_price_from_sources(session, source_list):
 
 
 async def get_asset_prices(session: aiohttp.ClientSession) -> dict[str, float] | None:
-    base = {asset: 0.0 for asset in config.ASSETS}
+    tickers = [c["ticker"] for c in config.CHALLENGES]
+    base = {t: 0.0 for t in tickers}
     try:
         async with session.get(config.PRICE_DATA_URL) as resp:
             resp.raise_for_status()
@@ -79,12 +82,12 @@ async def get_asset_prices(session: aiohttp.ClientSession) -> dict[str, float] |
             data = json.loads(text)
             fetched = data.get("prices", {}) or {}
             out = dict(base)
-            for asset in config.ASSETS:
-                v = fetched.get(asset)
+            for t in tickers:
+                v = fetched.get(t)
                 try:
                     fv = float(v)
-                    if fv > 0 and fv < float('inf'):
-                        out[asset] = fv
+                    if 0 < fv < float('inf'):
+                        out[t] = fv
                 except Exception:
                     pass
             logging.info(f"Fetched prices, filled zeros where missing: {out}")
@@ -160,7 +163,7 @@ def main():
 
 
 async def decrypt_loop(datalog: DataLog, stop_event: asyncio.Event):
-    logging.info("Decryption loop started.")
+    logging.info("Decryption loop started (Drand signatures cached by default).")
     while not stop_event.is_set():
         try:
             await datalog.process_pending_payloads()
@@ -198,10 +201,6 @@ subtensor_lock = threading.Lock()
 
 
 async def get_current_block_with_retry(sub: bt.subtensor, lock: threading.Lock, timeout: int = 10) -> int:
-    """
-    Fetches the current block number from the subtensor with a retry mechanism.
-    This function will attempt to fetch the block indefinitely until it succeeds.
-    """
     retry_delay = 5
     while True:
         try:
@@ -273,18 +272,6 @@ async def run_main_loop(
                 logging.info(f"Retrieved {len(payloads)} payloads from miners. Hotkey sample: {list(payloads.keys())[:3]}")
                 await datalog.append_step(current_block, asset_prices, payloads, mg)
 
-                
-                hotkey_to_uid = {hk: uid for uid, hk in zip(mg.uids.tolist(), mg.hotkeys)}
-                uids_in_mg = mg.uids.tolist()
-                for uid in uids_in_mg:
-                    if uid not in datalog.uid_age_in_blocks:
-                        datalog.uid_age_in_blocks[uid] = 0
-                
-                current_uids = set(uids_in_mg)
-                for uid in list(datalog.uid_age_in_blocks.keys()):
-                    if uid not in current_uids:
-                        del datalog.uid_age_in_blocks[uid]
-
 
                 if (
                     current_block % config.TASK_INTERVAL == 0
@@ -293,7 +280,7 @@ async def run_main_loop(
                 ):
                     datalog_clone = copy.deepcopy(datalog)
 
-                    def worker(dlog, uid_ages, block_snapshot, metagraph, cli_args):
+                    def worker(dlog, block_snapshot, metagraph, cli_args):
                         training_data = dlog.get_training_data_sync(
                             max_block_number=block_snapshot - config.TASK_INTERVAL
                         )
@@ -315,27 +302,14 @@ async def run_main_loop(
                             weights_logger.info("Salience is empty. Assigning weights only to young UIDs if any.")
                         
                         uids = metagraph.uids.tolist()
-                        
+
                         SAMPLE_EVERY = int(config.SAMPLE_EVERY)
                         young_threshold = 36000
-                        hk2idx = getattr(dlog, 'hk2idx', {}) if hasattr(dlog, 'hk2idx') else {}
-                        idx2hk = {idx: hk for hk, idx in hk2idx.items()}
-
                         hotkey_first_block: dict[str, int] = {}
-                        for asset, ds in dlog.datasets.items():
-                            if not ds.challenges:
-                                continue
-                            ch = ds.challenges[0]
-                            for sidx, emb in ch.emb_sparse.items():
-                                if emb is None or emb.ndim != 2:
-                                    continue
-                                H = emb.shape[0]
-                                for hk_idx in range(H):
-                                    hk = idx2hk.get(hk_idx)
-                                    if not hk or hk in hotkey_first_block:
-                                        continue
-                                    row = emb[hk_idx, :]
-                                    if np.any(row != 0):
+                        for ch in dlog.challenges.values():
+                            for sidx, data in ch.sidx.items():
+                                for hk, vec in data["emb"].items():
+                                    if hk not in hotkey_first_block and np.any(vec != 0):
                                         hotkey_first_block[hk] = int(sidx) * SAMPLE_EVERY
 
                         young_uids = set()
@@ -346,7 +320,6 @@ async def run_main_loop(
                                 if uid is not None:
                                     young_uids.add(uid)
                         weights_logger.info(f"Found {len(young_uids)} young UIDs by hotkey-first-nonzero (<{young_threshold} blocks).")
-                        
 
                         mature_uid_scores = {uid: score for uid, score in sal.items() if uid not in young_uids}
                         
@@ -407,12 +380,9 @@ async def run_main_loop(
                         except Exception as e:
                             weights_logger.error(f"Failed to set weights: {e}", exc_info=True)
 
-                    async with datalog._lock:
-                        uid_ages_copy = copy.deepcopy(datalog.uid_age_in_blocks)
-
                     weight_thread = threading.Thread(
                         target=worker,
-                        args=(datalog_clone, uid_ages_copy, current_block, copy.deepcopy(mg), copy.deepcopy(args)),
+                        args=(datalog_clone, current_block, copy.deepcopy(mg), copy.deepcopy(args)),
                         daemon=True,
                     )
                     weight_thread.start()
@@ -431,3 +401,10 @@ async def run_main_loop(
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+

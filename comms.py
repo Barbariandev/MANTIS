@@ -26,7 +26,7 @@ import os
 import json
 import asyncio
 import botocore
-from typing import List, Dict
+from typing import Dict, List
 from aiobotocore.session import get_session
 import aiohttp, email.utils
 import base64
@@ -37,140 +37,105 @@ from urllib.parse import urlparse
 
 import config
 
-# Module logger
 logger = logging.getLogger(__name__)
 
-R2_BUCKET_ID = None
-def bucket():
-    global R2_BUCKET_ID
-    if R2_BUCKET_ID is not None:
-        return R2_BUCKET_ID
-    try:
-        R2_BUCKET_ID = os.getenv("R2_BUCKET_ID")
-        if not R2_BUCKET_ID:
-            return None
-        return R2_BUCKET_ID
-    except Exception as e:
-        return None
+_ENV_CACHE: Dict[str, str | None] = {}
 
-R2_ACCOUNT_ID = None
-def load_r2_account_id():
-    global R2_ACCOUNT_ID
-    if R2_ACCOUNT_ID is not None:
-        return R2_ACCOUNT_ID
-    try:
-        R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
-        if not R2_ACCOUNT_ID:
-            return None
-        return R2_ACCOUNT_ID
-    except Exception as e:
-        return None
 
-R2_ENDPOINT_URL = None
-def load_r2_endpoint_url():
-    global R2_ENDPOINT_URL
+def _cached_env(key: str) -> str | None:
+    if key not in _ENV_CACHE:
+        try:
+            _ENV_CACHE[key] = os.getenv(key)
+        except Exception:
+            _ENV_CACHE[key] = None
+    return _ENV_CACHE[key]
+
+
+def bucket() -> str | None:
+    return _cached_env("R2_BUCKET_ID")
+
+
+def load_r2_account_id() -> str | None:
+    return _cached_env("R2_ACCOUNT_ID")
+
+
+def load_r2_endpoint_url() -> str | None:
     account_id = load_r2_account_id()
-    if not account_id:
-        return None
-    try:
-        R2_ENDPOINT_URL = f"https://{account_id}.r2.cloudflarestorage.com"
-        return R2_ENDPOINT_URL
-    except Exception as e:
-        return None
+    return f"https://{account_id}.r2.cloudflarestorage.com" if account_id else None
 
-R2_WRITE_ACCESS_KEY_ID = None
-def load_r2_write_access_key_id():
-    global R2_WRITE_ACCESS_KEY_ID
-    if R2_WRITE_ACCESS_KEY_ID is not None:
-        return R2_WRITE_ACCESS_KEY_ID
-    try:
-        R2_WRITE_ACCESS_KEY_ID = os.getenv("R2_WRITE_ACCESS_KEY_ID")
-        if not R2_WRITE_ACCESS_KEY_ID:
-            return None
-        return R2_WRITE_ACCESS_KEY_ID
-    except Exception as e:
-        return None
 
-R2_WRITE_SECRET_ACCESS_KEY = None
-def load_r2_write_secret_access_key():
-    global R2_WRITE_SECRET_ACCESS_KEY
-    if R2_WRITE_SECRET_ACCESS_KEY is not None:
-        return R2_WRITE_SECRET_ACCESS_KEY
-    try:
-        R2_WRITE_SECRET_ACCESS_KEY = os.getenv("R2_WRITE_SECRET_ACCESS_KEY")
-        if not R2_WRITE_SECRET_ACCESS_KEY:
-            return None
-        return R2_WRITE_SECRET_ACCESS_KEY
-    except Exception as e:
-        return None
+def load_r2_write_access_key_id() -> str | None:
+    return _cached_env("R2_WRITE_ACCESS_KEY_ID")
+
+
+def load_r2_write_secret_access_key() -> str | None:
+    return _cached_env("R2_WRITE_SECRET_ACCESS_KEY")
 
 CLIENT_CONFIG = botocore.config.Config(max_pool_connections=256)
 session = get_session()
-    
-def get_local_path(bucket: str, filename: str ) -> str:
+
+
+def _r2_client_kwargs():
+    endpoint = load_r2_endpoint_url()
+    access_key = load_r2_write_access_key_id()
+    secret_key = load_r2_write_secret_access_key()
+    if not endpoint or not access_key or not secret_key:
+        return None
+    return dict(
+        endpoint_url=endpoint,
+        region_name="enam",
+        config=CLIENT_CONFIG,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+    )
+
+
+def _r2_client():
+    kwargs = _r2_client_kwargs()
+    return session.create_client("s3", **kwargs) if kwargs else None
+
+
+def get_local_path(bucket: str, filename: str) -> str:
     return os.path.join(config.STORAGE_DIR, "local_cache", bucket, filename)
 
-async def exists_locally( bucket:str, filename: str ) -> bool:
-    local_path = get_local_path( bucket, filename )
-    return os.path.exists(local_path)
 
-async def delete_locally( bucket:str, filename: str ) -> None:
-    local_path = get_local_path( bucket, filename )
-    if os.path.exists(local_path):
+async def exists_locally(bucket: str, filename: str) -> bool:
+    return os.path.exists(get_local_path(bucket, filename))
+
+
+async def delete_locally(bucket: str, filename: str) -> None:
+    if os.path.exists(path := get_local_path(bucket, filename)):
         try:
-            await asyncio.to_thread(os.remove, local_path)
-        except Exception as e:
+            await asyncio.to_thread(os.remove, path)
+        except Exception:
             pass
 
-async def load( bucket:str, filename: str) -> dict:
-    local_path = get_local_path(bucket, filename)
+async def load(bucket: str, filename: str) -> dict | None:
+    path = Path(get_local_path(bucket, filename))
     try:
-        def load_json(path):
-            with open(path, "r") as f:
-                return json.load(f)
-        data = await asyncio.to_thread(load_json, local_path)
-        return data
-    except Exception as e:
+        return await asyncio.to_thread(lambda p: json.loads(p.read_text()), path)
+    except Exception:
         return None
 
 
 async def _local_path_from_url(url: str) -> str:
-    """
-    Safely creates a local file path from a URL to prevent directory traversal.
-    Maps `https://hostname/path/file` to `~/.mantis_storage/hostname/file`.
-    This function is now secure against traversal attacks like `../../`.
-    """
     parsed = urlparse(url)
-    
-    # Sanitize hostname to create a safe directory name.
     host = parsed.netloc
     safe_host = re.sub(r'[^a-zA-Z0-9_.-]+', '_', host)
-
-    # The path validation in cycle.py ensures we only have one component: the hotkey.
-    # We still sanitize it here as a defense-in-depth measure.
     path_filename = os.path.basename(parsed.path)
     if not path_filename or '..' in path_filename or '/' in path_filename:
          raise ValueError(f"Invalid path component in URL: {path_filename}")
-    
     safe_filename = re.sub(r'[^a-zA-Z0-9_.-]+', '_', path_filename)
-
-    # Join sanitized parts. Using a hidden directory for safety.
     return os.path.join(config.STORAGE_DIR, "url_cache", safe_host, safe_filename)
 
 async def _object_size(url: str, session: aiohttp.ClientSession, timeout: int = 10) -> int | None:
-    """Return object size in bytes using HEAD or Range request, or None."""
     try:
-        # HEAD first – many servers include Content-Length here.
         async with session.head(url, timeout=timeout, headers={"Accept-Encoding": "identity"}) as r:
             if r.status == 200:
                 cl = r.headers.get("Content-Length")
                 if cl and cl.isdigit():
                     return int(cl)
-        # Fallback: Range 0-0 GET to retrieve Content-Range header.
-        async with session.get(url, timeout=timeout, headers={
-            "Accept-Encoding": "identity",
-            "Range": "bytes=0-0",
-        }) as r:
+        async with session.get(url, timeout=timeout, headers={"Accept-Encoding": "identity", "Range": "bytes=0-0"}) as r:
             if r.status in (200, 206):
                 cr = r.headers.get("Content-Range")
                 if cr:
@@ -178,32 +143,13 @@ async def _object_size(url: str, session: aiohttp.ClientSession, timeout: int = 
                     if m:
                         return int(m.group(1))
     except Exception:
-        # Any failure → size unknown
         return None
     return None
 
 async def download(url: str, max_size_bytes: int | None = None):
-    """Download object at URL and cache to ~/storage.
-
-    Parameters
-    ----------
-    url : str
-        HTTP(S) location to download.
-    max_size_bytes : int | None
-        Optional hard ceiling in bytes. If provided, the function first
-        issues a lightweight HEAD/Range request to obtain the object size and
-        **skips the download** (raising ``ValueError``) when that size exceeds
-        the limit. This prevents accidental OOM on gigantic or malicious
-        payloads.
-    """
-
     path = await _local_path_from_url(url)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-
     async with aiohttp.ClientSession() as s:
-        # ------------------------------------------------------------------
-        # Optional size pre-check – avoids downloading huge payloads.
-        # ------------------------------------------------------------------
         if max_size_bytes is not None and max_size_bytes > 0:
             try:
                 sz = await _object_size(url, s)
@@ -212,156 +158,84 @@ async def download(url: str, max_size_bytes: int | None = None):
             except Exception as e:
                 logger.warning("Size check failed for %s: %s", url, e)
                 raise
-
         async with s.get(url, timeout=600) as r:
             r.raise_for_status()
             body = await r.read()
-
-    # --- Start Validation ---
-    # The payload MUST be a JSON object with a specific structure.
-    # This structural validation inherently prevents "JSON bomb" attacks.
     try:
         data = json.loads(body.decode('utf-8'))
-        
         if not isinstance(data, dict):
             raise ValueError("Payload is not a JSON object.")
-        
         expected_keys = {"round", "ciphertext"}
         if set(data.keys()) != expected_keys:
             raise ValueError(f"Payload keys must be exactly {expected_keys}")
-
         if not isinstance(data['round'], int) or data['round'] < 0:
             raise ValueError("'round' must be a non-negative integer.")
-
         if not isinstance(data['ciphertext'], str):
             raise ValueError("'ciphertext' must be a string.")
-
-        hex_ct = data['ciphertext']
-        if (
-            len(hex_ct) > config.MAX_CIPHERTEXT_HEX_LEN
-            or len(hex_ct) % 2 != 0
-            or not re.fullmatch(r"[0-9a-fA-F]*", hex_ct)
-        ):
-            raise ValueError("'ciphertext' is not valid hex or exceeds size limit")
-
-
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
         logger.warning(f"Invalid payload from {url}: {e}")
         raise ValueError("Invalid payload format") from e
-    # --- End Validation ---
-
-    # Cache the validated data as a JSON string
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
     except Exception:
-        pass # Fail silently on cache write errors.
-    
+        pass
     return data
 
 
 
 
-async def exists( bucket:str, filename: str ) -> bool:
+async def exists(bucket: str, filename: str) -> bool:
+    client_ctx = _r2_client()
+    if not client_ctx:
+        return False
     try:
-        endpoint_url = load_r2_endpoint_url()
-        access_key = load_r2_write_access_key_id()
-        secret_key = load_r2_write_secret_access_key()
-        if not endpoint_url or not access_key or not secret_key:
-            return False
-
-        async with session.create_client(
-            "s3",
-            endpoint_url=endpoint_url,
-            region_name="enam",
-            config=CLIENT_CONFIG,
-            aws_access_key_id=access_key,
-            aws_secret_access_key=secret_key,
-        ) as s3_client:
+        async with client_ctx as s3_client:
             await s3_client.head_object(Bucket=bucket, Key=filename)
             return True
-    except botocore.exceptions.ClientError as e:
-        error_code = e.response.get("Error", {}).get("Code")
-        if error_code in ["404", "NoSuchKey", "NotFound"]:
-            return False
-        else:
-            return False
-    except Exception as e:
+    except botocore.exceptions.ClientError:
+        return False
+    except Exception:
         return False
     
     
-async def timestamp( bucket:str, filename: str ):
-    try:
-        endpoint_url = load_r2_endpoint_url()
-        access_key = load_r2_write_access_key_id()
-        secret_key = load_r2_write_secret_access_key()
-        if not endpoint_url or not access_key or not secret_key:
-            return None
-
-        async with session.create_client(
-            "s3",
-            endpoint_url=endpoint_url,
-            region_name="enam",
-            config=CLIENT_CONFIG,
-            aws_access_key_id=access_key,
-            aws_secret_access_key=secret_key,
-        ) as s3_client:
-            response = await s3_client.head_object(Bucket=bucket, Key=filename)
-            last_modified = response.get("LastModified")
-            if last_modified is not None:
-                return last_modified
-            else:
-                return None
-    except Exception as e:
-        return None
-
-async def list( bucket:str, prefix: str ) -> List[str]:
-    endpoint_url = load_r2_endpoint_url()
-    access_key = load_r2_write_access_key_id()
-    secret_key = load_r2_write_secret_access_key()
-
-    if not endpoint_url or not access_key or not secret_key:
+async def list(bucket: str, prefix: str) -> List[str]:
+    client_ctx = _r2_client()
+    if not client_ctx:
         return []
-
-    matching_keys = []    
+    keys: List[str] = []
     try:
-        async with session.create_client(
-            "s3",
-            endpoint_url=endpoint_url,
-            region_name="enam",
-            config=CLIENT_CONFIG,
-            aws_access_key_id=access_key,
-            aws_secret_access_key=secret_key,
-        ) as s3_client:
+        async with client_ctx as s3_client:
             paginator = s3_client.get_paginator("list_objects_v2")
             async for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-                if "Contents" in page:
-                    for obj in page["Contents"]:
-                        key = obj.get("Key", "")
-                        matching_keys.append(key)
-    except Exception as e:
-        pass
-
-    return matching_keys
-
-
-async def timestamp(url: str):
-    """Return Last-Modified datetime of a public HTTP object or None."""
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.head(url, timeout=10) as r:
-                if r.status == 200:
-                    lm = r.headers.get("Last-Modified")
-                    if lm:
-                        return email.utils.parsedate_to_datetime(lm)
+                keys.extend(obj.get("Key", "") for obj in page.get("Contents", []))
     except Exception:
         pass
-    return None
+    return keys
+
+async def timestamp(resource: str, filename: str | None = None):
+    if filename is not None:
+        client_ctx = _r2_client()
+        if not client_ctx:
+            return None
+        try:
+            async with client_ctx as s3_client:
+                resp = await s3_client.head_object(Bucket=resource, Key=filename)
+                return resp.get("LastModified")
+        except Exception:
+            return None
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.head(resource, timeout=10) as r:
+                if r.status == 200:
+                    lm = r.headers.get("Last-Modified")
+                    return email.utils.parsedate_to_datetime(lm) if lm else None
+    except Exception:
+        return None
 
 
 
 def _sanitize_b64(obj):
-    """Recursively replace any bytes/bytearray with Base64-encoded ASCII str."""
     if isinstance(obj, (bytes, bytearray)):
         return base64.b64encode(obj).decode("ascii")
     if isinstance(obj, dict):
@@ -372,24 +246,7 @@ def _sanitize_b64(obj):
 
 
 def upload(bucket: str, object_key: str, file_path: str | Path) -> None:
-    """
-    Upload a local file to Cloudflare R2. If an object with the same key already
-    exists it will be replaced.
 
-    Parameters
-    ----------
-    bucket      Name of the R2 bucket.
-    object_key  Key (path/filename) inside the bucket.
-    file_path   Path to the local file to upload.
-
-    Environment variables (loaded via `.env` or shell):
-    ---------------------------------
-    R2_ACCOUNT_ID
-    R2_WRITE_ACCESS_KEY_ID
-    R2_WRITE_SECRET_ACCESS_KEY
-    """
-
-    # Populate env vars from a .env file if present.
     load_dotenv()
 
     account_id = os.environ["R2_ACCOUNT_ID"]
@@ -404,10 +261,19 @@ def upload(bucket: str, object_key: str, file_path: str | Path) -> None:
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
         region_name="auto",
-        config=Config(signature_version="s3v4"),  # R2 uses SigV4
+        config=Config(signature_version="s3v4"),
     )
 
     logger.info("Uploading %s to bucket %s as %s", file_path, bucket, object_key)
 
     s3.upload_file(str(file_path), bucket, object_key)
     logger.info("✅ Uploaded %s → s3://%s/%s", file_path, bucket, object_key)
+
+
+
+
+
+
+
+
+

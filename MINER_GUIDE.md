@@ -24,19 +24,18 @@ The core mining loop involves creating data, encrypting it for a future time, up
 
 ### Step 1: Build Your Multi-Asset Embeddings
 
-You must submit embeddings for all configured assets. Each asset has a different required embedding dimension, as defined in the network's configuration.
+You must submit embeddings for all configured challenges. Each challenge has a required embedding dimension defined in the network's configuration.
 
 All values in your embeddings must be between -1.0 and 1.0. The task for all assets is a binary prediction of the price change over the next 1 hour.
 
 ```python
 import numpy as np
-from config import ASSETS, ASSET_EMBEDDING_DIMS # Assume a local config.py
+from config import CHALLENGES
 
-# Generate embeddings for each asset (replace with your model outputs)
-# The order must match the order in config.ASSETS
+# Generate embeddings for each challenge (replace with your model outputs)
 multi_asset_embedding = [
-    np.random.uniform(-1, 1, size=ASSET_EMBEDDING_DIMS[asset]).tolist()
-    for asset in ASSETS
+    np.random.uniform(-1, 1, size=c["dim"]).tolist()
+    for c in CHALLENGES
 ]
 ```
 
@@ -135,3 +134,4 @@ The network trains a predictive model for each asset and calculates your salienc
 - **Zero Submissions**: If you submit only zeros for an asset, your contribution for that asset will be 0. Providing valuable embeddings for all assets is the best way to maximize your rewards.
 
 You are now ready to mine with multi-asset support!
+

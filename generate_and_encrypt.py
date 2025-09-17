@@ -8,7 +8,7 @@ import requests
 
 from timelock import Timelock
 
-from config import ASSET_EMBEDDING_DIMS
+from config import CHALLENGES
 
 DRAND_API = "https://api.drand.sh/v2"
 DRAND_BEACON_ID = "quicknet"
@@ -20,10 +20,7 @@ DRAND_PUBLIC_KEY = (
 LOCK_TIME_SECONDS = 30
 
 def generate_multi_asset_embeddings() -> List[List[float]]:
-    return [
-        [random.uniform(-1, 1) for _ in range(dim)]
-        for dim in ASSET_EMBEDDING_DIMS.values()
-    ]
+    return [[random.uniform(-1, 1) for _ in range(c["dim"])] for c in CHALLENGES]
 
 def generate_and_encrypt(hotkey: str, filename: str | None = None):
     if filename is None:
@@ -64,3 +61,4 @@ def generate_and_encrypt(hotkey: str, filename: str | None = None):
 if __name__ == "__main__":
     example_hotkey = "5..."
     generate_and_encrypt(hotkey=example_hotkey, filename=f"{example_hotkey}") 
+

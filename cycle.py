@@ -100,3 +100,4 @@ async def get_miner_payloads(
         await asyncio.sleep(0.1)
 
     return payloads
+

@@ -1,101 +1,14 @@
 from __future__ import annotations
-
-import asyncio, copy, json, logging, os, time, numpy as np
-import pickle, gzip
-from typing import Dict, Any, List
-import zipfile
+import asyncio, copy, json, logging, os, pickle, gzip
 from collections import defaultdict
-import bittensor as bt
-
+from dataclasses import dataclass, field
+from typing import Dict, List, Any
+import numpy as np, aiohttp, bittensor as bt
 from timelock import Timelock
-import aiohttp
-
 import config
 
 logger = logging.getLogger(__name__)
-
-from dataclasses import dataclass, field
-
-SECONDS_PER_BLOCK: int = 12
-SAMPLE_EVERY: int = config.SAMPLE_EVERY
-
-@dataclass
-class ChallengeData:
-    hotkeys: int
-    dim: int
-    emb_sparse: Dict[int, np.ndarray] = field(default_factory=dict)
-
-    def __post_init__(self):
-        for sidx, arr in self.emb_sparse.items():
-            if not isinstance(arr, np.ndarray):
-                self.emb_sparse[sidx] = np.array(arr, dtype=np.float16)
-            elif arr.dtype != np.float16:
-                self.emb_sparse[sidx] = arr.astype(np.float16)
-
-    def get_embedding_for_sidx(self, sidx: int) -> np.ndarray | None:
-        return self.emb_sparse.get(sidx)
-
-    def set_embedding_for_sidx(self, sidx: int, hotkey_idx: int, embedding: np.ndarray):
-        if sidx not in self.emb_sparse:
-            self.emb_sparse[sidx] = np.zeros((self.hotkeys, self.dim), dtype=np.float16)
-        existing_tensor = self.emb_sparse[sidx]
-        if existing_tensor.shape[0] < self.hotkeys:
-            padded_tensor = np.zeros((self.hotkeys, self.dim), dtype=np.float16)
-            padded_tensor[:existing_tensor.shape[0], :] = existing_tensor
-            self.emb_sparse[sidx] = padded_tensor
-        if hotkey_idx < self.hotkeys and len(embedding) == self.dim:
-            self.emb_sparse[sidx][hotkey_idx, :] = embedding
-
-    def prune_hotkeys(self, old_indices_to_keep: List[int]):
-        new_hotkey_count = len(old_indices_to_keep)
-        if not self.emb_sparse:
-            self.hotkeys = new_hotkey_count
-            return
-        pruned_emb_sparse: Dict[int, np.ndarray] = {}
-        for sidx, embeddings in self.emb_sparse.items():
-            pruned_embeddings = np.zeros((new_hotkey_count, self.dim), dtype=np.float16)
-            for new_row, old_row in enumerate(old_indices_to_keep):
-                if 0 <= old_row < embeddings.shape[0]:
-                    pruned_embeddings[new_row, :] = embeddings[old_row, :]
-            pruned_emb_sparse[sidx] = pruned_embeddings
-        self.emb_sparse = pruned_emb_sparse
-        self.hotkeys = new_hotkey_count
-
-@dataclass
-class ChallengeDataset:
-    challenges: List[ChallengeData] = field(default_factory=list)
-
-    @classmethod
-    def generate_dummy(
-        cls,
-        *,
-        days: int = 0,
-        embed_dims: List[int] = None,
-        hotkeys: int | List[int] = 0,
-    ) -> "ChallengeDataset":
-        if embed_dims is None:
-            embed_dims = []
-        if isinstance(hotkeys, int) and embed_dims:
-            hotkeys = [hotkeys] * len(embed_dims)
-        challenges: List[ChallengeData] = []
-        for dim, hk in zip(embed_dims, hotkeys):
-            challenges.append(ChallengeData(emb_sparse={}, hotkeys=hk, dim=dim))
-        return cls(challenges)
-
-    def to_npz_dict(self) -> Dict[str, np.ndarray]:
-        pack: Dict[str, np.ndarray] = {}
-        for idx, ch in enumerate(self.challenges):
-            if not ch.emb_sparse:
-                continue
-            p = f"c{idx}_"
-            sorted_items = sorted(ch.emb_sparse.items())
-            sindices = np.array([item[0] for item in sorted_items], dtype=np.int64)
-            embeddings = np.array([item[1] for item in sorted_items], dtype=np.float16)
-            pack[p + "sindices"] = sindices
-            pack[p + "embeddings"] = embeddings
-            pack[p + "hotkeys"] = np.array(ch.hotkeys, dtype=np.int32)
-            pack[p + "dim"] = np.array(ch.dim, dtype=np.int32)
-        return pack
+SAMPLE_EVERY = config.SAMPLE_EVERY
 
 DRAND_API = "https://api.drand.sh/v2"
 DRAND_BEACON_ID = "quicknet"
@@ -105,411 +18,265 @@ DRAND_PUBLIC_KEY = (
     "5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a"
 )
 
+DRAND_SIGNATURE_RETRIES = 3
+DRAND_SIGNATURE_RETRY_DELAY = 1.0
 
-class MultiAssetLedger:
-    """Hotkey-centric, sparse ledger backed by dictionary-based ChallengeDataset objects."""
+@dataclass
+class ChallengeData:
+    dim: int
+    blocks_ahead: int
+    sidx: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+    def set_price(self, sidx: int, price: float):
+        d = self.sidx.setdefault(sidx, {"hotkeys": [], "price": None, "emb": {}})
+        d["price"] = float(price)
+    def set_emb(self, sidx: int, hk: str, vec: List[float]):
+        d = self.sidx.setdefault(sidx, {"hotkeys": [], "price": None, "emb": {}})
+        d["emb"][hk] = np.array(vec, dtype=np.float16)
+        if hk not in d["hotkeys"]:
+            d["hotkeys"].append(hk)
 
+class DataLog:
     def __init__(self):
         self.blocks: List[int] = []
-        self.asset_prices: List[Dict[str, float]] = []
+        self.challenges = {c["ticker"]: ChallengeData(c["dim"], c["blocks_ahead"]) for c in config.CHALLENGES}
         self.raw_payloads: Dict[int, Dict[str, bytes]] = {}
-        
-        self.datasets: Dict[str, ChallengeDataset] = {
-            asset: ChallengeDataset.generate_dummy(
-                embed_dims=[config.ASSET_EMBEDDING_DIMS[asset]], 
-                hotkeys=[0]
-            )
-            for asset in config.ASSETS
-        }
-
-        self.live_hotkeys: List[str] = []
-        self.hk2idx: Dict[str, int] = {}
-        self.uid_age_in_blocks: Dict[int, int] = {}
-
         self.tlock = Timelock(DRAND_PUBLIC_KEY)
         self._lock = asyncio.Lock()
+        # Cache Drand round -> signature bytes so multiple payloads don't re-fetch over the network.
+        self._drand_cache: Dict[int, bytes] = {}
 
-    def __getstate__(self):
-        """Support pickling by removing non-picklable members."""
-        state = self.__dict__.copy()
-        if "_lock" in state:
-            del state["_lock"]
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        self._lock = asyncio.Lock()
-
-    def _ensure_hotkey(self, hk: str):
-        if hk in self.hk2idx:
-            return
-        idx = len(self.live_hotkeys)
-        self.live_hotkeys.append(hk)
-        self.hk2idx[hk] = idx
-        for ds in self.datasets.values():
-            ds.challenges[0].hotkeys = len(self.live_hotkeys)
-
-    def prune_hotkeys(self, active_hotkeys: List[str]):
-        """Remove hotkeys that are no longer in the metagraph from the sparse embeddings."""
-        active_set = set(active_hotkeys)
-        to_remove = {hk for hk in self.live_hotkeys if hk not in active_set}
-        if not to_remove:
-            return
-        
-        logger.info(f"Pruning {len(to_remove)} inactive hotkeys.")
-        
-        new_live_hotkeys = [hk for hk in self.live_hotkeys if hk not in to_remove]
-        old_indices_to_keep = [self.hk2idx[hk] for hk in new_live_hotkeys]
-        
-        self.live_hotkeys = new_live_hotkeys
-        self.hk2idx = {hk: i for i, hk in enumerate(self.live_hotkeys)}
-        
-        for ds in self.datasets.values():
-            ds.challenges[0].prune_hotkeys(old_indices_to_keep)
-
-    def _zero_vecs(self) -> Dict[str, List[float]]:
-        return {
-            asset: [0.0] * config.ASSET_EMBEDDING_DIMS[asset] for asset in config.ASSETS
-        }
-
-    async def append_step(self, block: int, prices: Dict[str, float], payloads: Dict[str, bytes], metagraph: bt.metagraph):
-        """Add one network sample, using the metagraph as the ground truth for active hotkeys."""
+    async def append_step(self, block: int, prices: Dict[str, float], payloads: Dict[str, bytes], mg: bt.metagraph):
         async with self._lock:
             self.blocks.append(block)
-            self.asset_prices.append(prices)
             ts = len(self.blocks) - 1
             self.raw_payloads[ts] = {}
-            
-            active_hotkeys = metagraph.hotkeys
-            logger.info(f"[Ledger] Appending step for block {block}. Received {len(payloads)} payloads for {len(active_hotkeys)} active hotkeys.")
+            sidx = block // SAMPLE_EVERY
+            for t, ch in self.challenges.items():
+                p = prices.get(t)
+                if p is not None:
+                    ch.set_price(sidx, p)
+            for hk in mg.hotkeys:
+                ct = payloads.get(hk)
+                self.raw_payloads[ts][hk] = json.dumps(ct).encode() if ct else b"{}"
 
-            for hk in active_hotkeys:
-                self._ensure_hotkey(hk)
-                ct_dict = payloads.get(hk)
-                ct_bytes = json.dumps(ct_dict).encode('utf-8') if ct_dict else b"{}"
-                self.raw_payloads[ts][hk] = ct_bytes
-
-            if self.uid_age_in_blocks:
-                for uid in self.uid_age_in_blocks:
-                    self.uid_age_in_blocks[uid] += 1
-
-    async def _get_drand_signature(self, round_num: int) -> bytes | None:
+    async def _get_drand_signature(self, round_num: int, session: aiohttp.ClientSession | None = None) -> bytes | None:
+        cached = self._drand_cache.get(round_num)
+        if cached:
+            return cached
         try:
-            await asyncio.sleep(0.02)
-            url = f"{DRAND_API}/beacons/{DRAND_BEACON_ID}/rounds/{round_num}"
-            async with aiohttp.ClientSession() as sess:
-                async with sess.get(url, timeout=10) as resp:
+            if session is None:
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.get(f"{DRAND_API}/beacons/{DRAND_BEACON_ID}/rounds/{round_num}", timeout=10) as resp:
+                        if resp.status == 200:
+                            sig = bytes.fromhex((await resp.json())["signature"])
+                            if sig:
+                                self._drand_cache[round_num] = sig
+                            return sig
+            else:
+                async with session.get(f"{DRAND_API}/beacons/{DRAND_BEACON_ID}/rounds/{round_num}", timeout=10) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
-                        return bytes.fromhex(data["signature"])
+                        sig = bytes.fromhex((await resp.json())["signature"])
+                        if sig:
+                            self._drand_cache[round_num] = sig
+                        return sig
         except Exception:
-            pass
+            return None
         return None
+
+    def _zero_vecs(self):
+        return {c["ticker"]: [0.0] * c["dim"] for c in config.CHALLENGES}
+
+    def _validate_submission(self, sub: Any) -> Dict[str, List[float]]:
+        if not isinstance(sub, list) or len(sub) != len(config.CHALLENGES):
+            return self._zero_vecs()
+        out = {}
+        for vec, c in zip(sub, config.CHALLENGES):
+            d = c["dim"]
+            if isinstance(vec, list) and len(vec) == d and all(isinstance(v, (int, float)) and -1 <= v <= 1 for v in vec):
+                out[c["ticker"]] = vec
+            else:
+                out[c["ticker"]] = [0.0] * d
+        return out
 
     async def process_pending_payloads(self):
         async with self._lock:
-            payloads_copy = copy.deepcopy(self.raw_payloads)
-            current_block = self.blocks[-1] if self.blocks else 0
-
-        if not payloads_copy:
+            payloads = copy.deepcopy(self.raw_payloads)
+            blocks = list(self.blocks)
+        if not payloads:
             return
-
-        rounds: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-        mature_payload_keys = set()
-        
-        for ts, by_hk in payloads_copy.items():
-            if current_block - self.blocks[ts] >= 300:
+        current_block = blocks[-1]
+        rounds = defaultdict(list)
+        mature = set()
+        for ts, by_hk in payloads.items():
+            if current_block - blocks[ts] >= 300:
                 for hk, raw in by_hk.items():
-                    mature_payload_keys.add((ts, hk))
+                    mature.add((ts, hk))
                     try:
-                        payload_dict = json.loads(raw.decode("utf-8")) if raw else {}
-                        rnd = payload_dict.get("round", 0)
-                        ct_hex = payload_dict.get("ciphertext", "")
-                        rounds[rnd].append({"ts": ts, "hk": hk, "ct": ct_hex})
+                        d = json.loads(raw.decode()) if raw else {}
+                        rounds[d.get("round", 0)].append((ts, hk, d.get("ciphertext", "")))
                     except Exception:
-                        rounds[0].append({"ts": ts, "hk": hk, "ct": ""})
-
-        if not mature_payload_keys:
+                        rounds[0].append((ts, hk, ""))
+        if not mature:
             return
-        
-        decrypted_cache = {}
-
-        async def _work(rnd, items):
-            sig = await self._get_drand_signature(rnd) if rnd > 0 else None
-            for item in items:
-                ts, hk, ct_hex = item["ts"], item["hk"], item["ct"]
+        dec = {}
+        stats = {
+            "payloads": 0,
+            "decrypt_failures": 0,
+            "signature_fetch_attempts": 0,
+            "signature_fetch_failures": 0,
+        }
+        async def _work(rnd, items, sess: aiohttp.ClientSession):
+            sig = None
+            if rnd > 0:
+                stats["signature_fetch_attempts"] += 1
+                attempts = 0
+                while attempts < DRAND_SIGNATURE_RETRIES and not sig:
+                    sig = await self._get_drand_signature(rnd, sess)
+                    if sig:
+                        break
+                    attempts += 1
+                    if attempts < DRAND_SIGNATURE_RETRIES:
+                        await asyncio.sleep(DRAND_SIGNATURE_RETRY_DELAY)
+                if not sig and items:
+                    logger.warning("Failed to fetch Drand signature for round %s after %d attempts", rnd, DRAND_SIGNATURE_RETRIES)
+                    stats["signature_fetch_failures"] += 1
+            for ts, hk, ct_hex in items:
                 vecs = self._zero_vecs()
                 if sig and ct_hex:
+                    stats["payloads"] += 1
                     try:
-                        if (
-                            not isinstance(ct_hex, str)
-                            or len(ct_hex) > config.MAX_CIPHERTEXT_HEX_LEN
-                            or len(ct_hex) % 2 != 0
-                            or not re.fullmatch(r"[0-9a-fA-F]*", ct_hex)
-                        ):
-                            raise ValueError("invalid ciphertext")
-                        pt = self.tlock.tld(bytes.fromhex(ct_hex), sig).decode("utf-8")
+                        pt = self.tlock.tld(bytes.fromhex(ct_hex), sig).decode()
                         emb_str, hk_in = pt.rsplit(":::", 1)
-                        if hk_in != hk:
-                            raise ValueError("hotkey mismatch")
-                        submission = json.loads(emb_str)
-                        vecs = self._validate_submission(submission)
+                        if hk_in == hk:
+                            vecs = self._validate_submission(json.loads(emb_str))
                     except Exception:
+                        stats["decrypt_failures"] += 1
                         pass
-                decrypted_cache.setdefault(ts, {})[hk] = vecs
-        
+                dec.setdefault(ts, {})[hk] = vecs
+
         ROUND_BATCH = 16
         round_items = list(rounds.items())
-        for i in range(0, len(round_items), ROUND_BATCH):
-            batch = round_items[i:i+ROUND_BATCH]
-            await asyncio.gather(*(_work(r, items) for r, items in batch))
-            await asyncio.sleep(0.1)
-
+        async with aiohttp.ClientSession() as sess:
+            for i in range(0, len(round_items), ROUND_BATCH):
+                batch = round_items[i:i + ROUND_BATCH]
+                await asyncio.gather(*(_work(r, items, sess) for r, items in batch))
+                await asyncio.sleep(0.1)
         async with self._lock:
-            for ts, by_hk in decrypted_cache.items():
-                if ts >= len(self.blocks): continue
-                block_val = self.blocks[ts]
-                if block_val % config.SAMPLE_EVERY == 0:
-                    sidx = block_val // config.SAMPLE_EVERY
-                    for hk, vecs in by_hk.items():
-                        hk_idx = self.hk2idx.get(hk)
-                        if hk_idx is None: continue
-                        for asset, vec in vecs.items():
-                            if any(v != 0.0 for v in vec):
-                                ch = self.datasets[asset].challenges[0]
-                                ch.set_embedding_for_sidx(sidx, hk_idx, np.array(vec, dtype=np.float16))
-            
-            for ts, hk in mature_payload_keys:
-                if ts in self.raw_payloads and hk in self.raw_payloads[ts]:
-                    del self.raw_payloads[ts][hk]
-                    if not self.raw_payloads[ts]:
-                        del self.raw_payloads[ts]
+            for ts, by_hk in dec.items():
+                block = blocks[ts]
+                if block % SAMPLE_EVERY: continue
+                sidx = block // SAMPLE_EVERY
+                for hk, vecs in by_hk.items():
+                    for t, vec in vecs.items():
+                        if any(v != 0.0 for v in vec):
+                            self.challenges[t].set_emb(sidx, hk, vec)
+            for ts, hk in mature:
+                self.raw_payloads.get(ts, {}).pop(hk, None)
+                if ts in self.raw_payloads and not self.raw_payloads[ts]:
+                    del self.raw_payloads[ts]
 
-    def _validate_submission(self, submission: Any) -> Dict[str, List[float]]:
-        if not isinstance(submission, list) or len(submission) != len(config.ASSETS):
-            return self._zero_vecs()
-        out = {}
-        for i, asset in enumerate(config.ASSETS):
-            vec = submission[i]
-            dim = config.ASSET_EMBEDDING_DIMS[asset]
-            if (isinstance(vec, list) and len(vec) == dim and
-                    all(isinstance(v, (int, float)) and -1.0 <= v <= 1.0 for v in vec)):
-                out[asset] = vec
-            else:
-                out[asset] = [0.0] * dim
-        return out
-    
+        total_payloads = stats["payloads"]
+        if total_payloads > 0:
+            pct = 100.0 * stats["decrypt_failures"] / total_payloads
+            logger.info(
+                "Payload decryption failures: %s/%s (%.2f%%)",
+                stats["decrypt_failures"],
+                total_payloads,
+                pct,
+            )
+        fetch_attempts = stats["signature_fetch_attempts"]
+        if fetch_attempts > 0:
+            pct_sig = 100.0 * stats["signature_fetch_failures"] / fetch_attempts
+            logger.info(
+                "Drand signature fetch failures: %s/%s rounds (%.2f%%)",
+                stats["signature_fetch_failures"],
+                fetch_attempts,
+                pct_sig,
+            )
+
+    def prune_hotkeys(self, active: List[str]):
+        active_set = set(active)
+        for ch in self.challenges.values():
+            for d in ch.sidx.values():
+                d["emb"] = {hk: v for hk, v in d["emb"].items() if hk in active_set}
+                d["hotkeys"] = [hk for hk in d["hotkeys"] if hk in active_set]
+
     def get_training_data_sync(self, max_block_number: int | None = None) -> dict:
-        TARGET_BLOCK_DIFF = 300 
-        logger.info(f"Generating training data up to block {max_block_number}...")
-        
-        slice_idx = len(self.blocks)
-        if max_block_number is not None:
-            slice_idx = next((i for i, b in enumerate(self.blocks) if b > max_block_number), len(self.blocks))
-        
-        if slice_idx == 0:
-            logger.warning("No blocks available for training data generation.")
-            return {}
+        res = {}
+        for t, ch in self.challenges.items():
+            ahead = ch.blocks_ahead // SAMPLE_EVERY
+            all_hks = sorted({hk for d in ch.sidx.values() for hk in d["emb"].keys()})
+            if not all_hks: continue
+            hk2idx = {hk: i for i, hk in enumerate(all_hks)}
+            X, y = [], []
+            # Track consecutive unchanged price streak for this asset
+            prev_price = None
+            unchanged_streak = 0
+            max_unchanged = int(getattr(config, "MAX_UNCHANGED_TIMESTEPS", 0) or 0)
+            for sidx, data in sorted(ch.sidx.items()):
+                block = sidx * SAMPLE_EVERY
+                if max_block_number and block > max_block_number: break
+                future = ch.sidx.get(sidx + ahead)
+                price_now = data.get("price")
+                price_fut = future.get("price") if future else None
 
-        effective_blocks = self.blocks[:slice_idx]
-        effective_prices = self.asset_prices[:slice_idx]
-        block_to_idx = {b: i for i, b in enumerate(self.blocks)}
-        
-        result = {}
-        for asset in config.ASSETS:
-            dim = config.ASSET_EMBEDDING_DIMS[asset]
-            ch = self.datasets[asset].challenges[0]
-            num_hks = ch.hotkeys
-
-            X_rows, y_rows = [], []
-
-            price_series = [p.get(asset, np.nan) if p else np.nan for p in effective_prices]
-            n = len(price_series)
-            keep_mask = [True] * n
-
-            def _finalize_run(start_idx: int, end_idx: int, last_val):
-                run_len = end_idx - start_idx
-                if run_len > 5 and np.isfinite(last_val):
-                    for k in range(start_idx, end_idx):
-                        keep_mask[k] = False
-
-            last_price = np.nan
-            run_start = 0
-            for idx in range(n):
-                price = price_series[idx]
-                if idx == 0:
-                    last_price = price
-                    run_start = 0
-                    continue
-                if not (np.isfinite(price) and np.isfinite(last_price)) or price != last_price:
-                    _finalize_run(run_start, idx, last_price)
-                    run_start = idx
-                last_price = price
-            _finalize_run(run_start, n, last_price)
-
-            kept_indices = [i for i, keep in enumerate(keep_mask) if keep]
-
-            for i_orig in kept_indices:
-                p0_block = effective_blocks[i_orig]
-                p1_block = p0_block + TARGET_BLOCK_DIFF
-                j = block_to_idx.get(p1_block)
-                if j is None or j >= len(self.asset_prices):
-                    continue
-                if j >= slice_idx or (j < len(keep_mask) and not keep_mask[j]):
-                    continue
-
-                sidx = p0_block // config.SAMPLE_EVERY
-                embedding_tensor = ch.get_embedding_for_sidx(sidx)
-                if embedding_tensor is None:
-                    continue
-
-                p0 = self.asset_prices[i_orig].get(asset, np.nan)
-                p1 = self.asset_prices[j].get(asset, np.nan)
-
-                if not (np.isnan(p0) or np.isnan(p1) or p0 <= 0 or p1 == 0):
-                    if embedding_tensor.shape[0] < num_hks:
-                        padded_tensor = np.zeros((num_hks, dim), dtype=np.float16)
-                        padded_tensor[:embedding_tensor.shape[0], :] = embedding_tensor
-                        X_rows.append(padded_tensor.flatten())
+                # Update unchanged streak only when current price is available
+                if price_now is not None:
+                    if prev_price is None or price_now != prev_price:
+                        prev_price = price_now
+                        unchanged_streak = 0
                     else:
-                        X_rows.append(embedding_tensor.flatten())
-                    y_rows.append((p1 - p0) / p0)
+                        unchanged_streak += 1
 
-            if not X_rows:
-                logger.warning(f"No valid training samples for {asset} after checking for embeddings.")
-                continue
+                # Drop if price unchanged beyond threshold for this asset
+                if max_unchanged > 0 and unchanged_streak > max_unchanged:
+                    continue
 
-            logger.info(f"Generated {len(y_rows)} valid training samples for {asset}.")
-            
-            X = np.array(X_rows, dtype=np.float16)
-            y = np.array(y_rows, dtype=np.float32)
+                # Require both current and future prices and they must be > 0.0
+                if (not future) or (price_now is None) or (price_fut is None):
+                    continue
+                try:
+                    if float(price_now) <= 0.0 or float(price_fut) <= 0.0:
+                        continue
+                except Exception:
+                    continue
+                # Drop rows where embeddings dict is empty or all embeddings are zeros
+                if not data["emb"]:
+                    continue
 
-            hist = (X, self.hk2idx)
-            result[asset] = (hist, y)
-
-        logger.info(f"Training data generated for {len(result)} assets.")
-        return result if result else {}
-
-    async def get_training_data(self, max_block_number: int | None = None) -> dict:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self.get_training_data_sync, max_block_number)
+                mat = np.zeros((len(all_hks), ch.dim), dtype=np.float16)
+                any_nonzero = False
+                for hk, vec in data["emb"].items():
+                    arr = np.asarray(vec, dtype=np.float16)
+                    if not any_nonzero and (arr != 0).any():
+                        any_nonzero = True
+                    mat[hk2idx[hk]] = arr
+                if not any_nonzero:
+                    continue
+                X.append(mat.flatten())
+                p0, p1 = price_now, price_fut
+                y.append((p1 - p0) / p0 if p0 else 0.0)
+            if X:
+                res[t] = ((np.array(X, dtype=np.float16), hk2idx), np.array(y, dtype=np.float32))
+        return res
 
     async def save(self, path: str):
-        """Persist the ledger using pickle (.pkl or .pkl.gz)."""
         async with self._lock:
-            ledger_ref = self
-
-        await asyncio.to_thread(self._deepcopy_and_save, ledger_ref, path)
-
-    @staticmethod
-    def _deepcopy_and_save(ledger_ref: "MultiAssetLedger", path: str):
-        ledger_copy = copy.deepcopy(ledger_ref)
-        MultiAssetLedger._save_pickle(ledger_copy, path)
+            with (gzip.open if path.endswith('.gz') else open)(path, 'wb') as f:
+                pickle.dump(self, f, pickle.HIGHEST_PROTOCOL)
 
     @staticmethod
-    def _save_pickle(ledger_obj: "MultiAssetLedger", path: str):
-        dir_name = os.path.dirname(path) or "."
-        os.makedirs(dir_name, exist_ok=True)
-
-        temp_path = f"{path}.tmp.{os.getpid()}"
-        try:
-            if path.endswith(".gz"):
-                with gzip.open(temp_path, "wb") as f:
-                    pickle.dump(ledger_obj, f, protocol=pickle.HIGHEST_PROTOCOL)
-            else:
-                with open(temp_path, "wb") as f:
-                    pickle.dump(ledger_obj, f, protocol=pickle.HIGHEST_PROTOCOL)
-            os.replace(temp_path, path)
-        finally:
-            if os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except Exception:
-                    pass
-
-        try:
-            st = os.stat(path)
-            logger.info(
-                "Ledger saved → %s (size=%d bytes, mtime=%d)",
-                path,
-                st.st_size,
-                int(st.st_mtime),
-            )
-        except Exception:
-            logger.info("Ledger saved → %s", path)
-
-    @staticmethod
-    def load(path: str) -> "MultiAssetLedger":
-        """Load a ledger from pickle by default, falling back to legacy .npz."""
+    def load(path: str) -> "DataLog":
         if not os.path.exists(path):
-            logger.info("No ledger file found, creating a new one.")
-            return MultiAssetLedger()
-
-        logger.info("Loading ledger from %s", path)
-
-        _, ext = os.path.splitext(path)
-
-        def _load_pickle(p: str) -> MultiAssetLedger:
-            try:
-                if p.endswith(".gz"):
-                    with gzip.open(p, "rb") as f:
-                        return pickle.load(f)
-                else:
-                    with open(p, "rb") as f:
-                        return pickle.load(f)
-            except Exception as e:
-                raise e
-
-        def _load_legacy_npz(p: str) -> MultiAssetLedger:
-            try:
-                data = np.load(p, allow_pickle=True)
-            except (zipfile.BadZipFile, ValueError, OSError) as e:
-                raise e
-
-            ledger = MultiAssetLedger()
-            ledger.blocks = data["blocks"].tolist()
-            ledger.asset_prices = json.loads(data["asset_prices"].tobytes().decode("utf-8"))
-            ledger.live_hotkeys = data["live_hotkeys"].tolist()
-            ledger.hk2idx = {hk: i for i, hk in enumerate(ledger.live_hotkeys)}
-
-            if "uid_age_in_blocks" in data:
-                uid_ages_str = data["uid_age_in_blocks"].tobytes().decode("utf-8")
-                ledger.uid_age_in_blocks = {int(k): v for k, v in json.loads(uid_ages_str).items()}
-
-            for asset in config.ASSETS:
-                prefix = f"{asset}_"
-                asset_specific_data = {k[len(prefix):]: v for k, v in data.items() if k.startswith(prefix)}
-                if asset_specific_data:
-                    logger.warning("Legacy NPZ import is no longer supported for challenge data; starting empty dataset for %s", asset)
-                    ledger.datasets[asset] = ChallengeDataset.generate_dummy(embed_dims=[config.ASSET_EMBEDDING_DIMS[asset]], hotkeys=[len(ledger.live_hotkeys)])
-                if not ledger.datasets[asset].challenges:
-                    ledger.datasets[asset].challenges.append(ChallengeData(
-                        hotkeys=len(ledger.live_hotkeys),
-                        dim=config.ASSET_EMBEDDING_DIMS[asset],
-                        emb_sparse={},
-                    ))
-                else:
-                    ledger.datasets[asset].challenges[0].hotkeys = len(ledger.live_hotkeys)
-
-            logger.info("Ledger loaded (legacy .npz) ← %s", p)
-            return ledger
-
+            return DataLog()
         try:
-            if ext == ".npz":
-                return _load_legacy_npz(path)
-            return _load_pickle(path)
+            with (gzip.open if path.endswith('.gz') else open)(path, 'rb') as f:
+                obj = pickle.load(f)
+                obj._lock = asyncio.Lock()
+                if not hasattr(obj, "_drand_cache"):
+                    obj._drand_cache = {}
+                return obj
         except Exception:
-            try:
-                return _load_legacy_npz(path)
-            except Exception as e2:
-                logger.error("Failed to load ledger from %s: %s", path, e2)
-                try:
-                    corrupt_path = f"{path}.corrupt.{int(time.time())}"
-                    os.replace(path, corrupt_path)
-                    logger.warning("Renamed unreadable ledger to %s", corrupt_path)
-                except Exception:
-                    logger.warning("Could not rename unreadable ledger file at %s", path)
-                logger.info("Starting with a new, empty ledger.")
-                return MultiAssetLedger()
+            return DataLog()
 
-DataLog = MultiAssetLedger
+

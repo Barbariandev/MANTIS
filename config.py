@@ -34,19 +34,83 @@ NETUID = 123
 
 NUM_UIDS = 256
 
-ASSETS = ["BTC", "ETH", "EURUSD", "GBPUSD", "CADUSD", "NZDUSD", "CHFUSD", "XAUUSD", "XAGUSD"]
+CHALLENGES = [
+    {
+        "name": "BTC-1H-BINARY",
+        "ticker": "BTC",
+        "dim": 100,
+        "blocks_ahead": 300,
+        "loss_func": "binary",
+        "weight": 1,
+    },
+    {
+        "name": "ETH-1H-BINARY",
+        "ticker": "ETH",
+        "dim": 2,
+        "blocks_ahead": 300,
+        "loss_func": "binary",
+        "weight": 1,
+    },
+    {
+        "name": "EURUSD-1H-BINARY",
+        "ticker": "EURUSD",
+        "dim": 2,
+        "blocks_ahead": 300,
+        "loss_func": "binary",
+        "weight": 1,
+    },
+    {
+        "name": "GBPUSD-1H-BINARY",
+        "ticker": "GBPUSD",
+        "dim": 2,
+        "blocks_ahead": 300,
+        "loss_func": "binary",
+        "weight": 1,
+    },
+    {
+        "name": "CADUSD-1H-BINARY",
+        "ticker": "CADUSD",
+        "dim": 2,
+        "blocks_ahead": 300,
+        "loss_func": "binary",
+        "weight": 1,
+    },
+    {
+        "name": "NZDUSD-1H-BINARY",
+        "ticker": "NZDUSD",
+        "dim": 2,
+        "blocks_ahead": 300,
+        "loss_func": "binary",
+        "weight": 1,
+    },
+    {
+        "name": "CHFUSD-1H-BINARY",
+        "ticker": "CHFUSD",
+        "dim": 2,
+        "blocks_ahead": 300,
+        "loss_func": "binary",
+        "weight": 1,
+    },
+    {
+        "name": "XAUUSD-1H-BINARY",
+        "ticker": "XAUUSD",
+        "dim": 2,
+        "blocks_ahead": 300,
+        "loss_func": "binary",
+        "weight": 1,
+    },
+    {
+        "name": "XAGUSD-1H-BINARY",
+        "ticker": "XAGUSD",
+        "dim": 2,
+        "blocks_ahead": 300,
+        "loss_func": "binary",
+        "weight": 1,
+    },
+]
+CHALLENGE_MAP = {c["ticker"]: c for c in CHALLENGES}
 
-ASSET_EMBEDDING_DIMS = {
-    "BTC": 100,
-    "ETH": 2,
-    "EURUSD": 2,
-    "GBPUSD": 2,
-    "CADUSD": 2,
-    "NZDUSD": 2,
-    "CHFUSD": 2,
-    "XAUUSD": 2,
-    "XAGUSD": 2,
-}
+ASSET_EMBEDDING_DIMS = {c["ticker"]: c["dim"] for c in CHALLENGES}
 
 MAX_UNCHANGED_TIMESTEPS = 15
 
@@ -57,10 +121,14 @@ SEED = 42
 
 SAMPLE_EVERY = 5
 
-MAX_CIPHERTEXT_HEX_LEN = 64 * 1024 * 1024
-
-
 LAG = 60
 
 TASK_INTERVAL = 500 
+
+
+
+
+
+
+
 

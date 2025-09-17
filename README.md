@@ -1,124 +1,101 @@
 # MANTIS
 
 ## Purpose
-
-Incentivize the production of any information that has predictive power for the next 1-hour returns of a diverse basket of financial assets, including cryptocurrencies and forex pairs.
-
-The validator's core responsibilities are to:
-
-1.  **Collect** encrypted data payloads from all active miners at regular intervals.
-2.  **Securely Decrypt** the payloads using time-lock encryption (`tlock`) and verify the embedded hotkey of the submitting miner.
-3.  **Calculate Salience** by training a predictive model and using permutation importance to measure the marginal value of each miner's data.
-4.  **Set Weights** on the Bittensor blockchain, rewarding miners in proportion to the salience of their historical contributions.
+MANTIS is a Bittensor subnet (netuid 123) that rewards miners for signals which help predict the next-hour return of several financial instruments. Each challenge specifies a ticker, embedding dimension and a fixed 300‑block horizon. Validators collect encrypted embeddings, align them with price moves and assign weights based on salience.
 
 ---
 
 ## Minimal Architecture Diagram
-
 ```mermaid
 graph TD
-    subgraph "validator.py (Orchestrator)"
+    subgraph "validator.py (orchestrator)"
         direction LR
-        A[On Sampled Block] --> B[cycle.py];
-        B -->|Encrypted Payloads| C["datalog.append_step()"];
-        A --> D[Periodic Checks];
+        A[On sampled block] --> B[cycle.py];
+        B -->|payloads| C["datalog.append_step()"];
+        A --> D[Periodic checks];
         D --> E["datalog.process_pending_payloads()"];
         D --> F["datalog.get_training_data()"];
         F --> G["model.salience()"];
-        G --> H["sub.set_weights()"];
-    end
-    
-    subgraph "storage.py (State)"
-        I[DataLog Object]
+        G --> H["subtensor.set_weights()"];
     end
 
-    subgraph "External Services"
-        J["Miners (via HTTP)"]
-        K[Drand Beacon]
-        L[Bittensor Subtensor]
+    subgraph "ledger.py (state)"
+        I[DataLog]
+    end
+
+    subgraph "External"
+        J[Miners]
+        K[Drand beacon]
+        L[Subtensor]
     end
 
     C --> I;
     E --> I;
-    F -- Reads from --> I;
-    B -- Downloads from --> J;
-    E -- Fetches Signatures --> K;
-    H -- Writes to --> L;
-    B -- Reads Commitments --> L;
+    F -- reads --> I;
+    B -- downloads --> J;
+    E -- fetches --> K;
+    H -- writes --> L;
+    B -- reads commits --> L;
 ```
 
-## Core Modules
+---
 
-1.  **`config.py`** – A single source of truth for tunable constants like `NETUID`, the list of `ASSETS`, their `ASSET_EMBEDDING_DIMS`, and the `LAG` for return calculations.
-2.  **`validator.py`** – The top-level orchestrator. It runs an infinite loop that is driven by the blockchain's block height, orchestrating all data collection, processing, and weight-setting tasks at their specified intervals.
-3.  **`storage.py`** – The heart of the system. It contains the `DataLog` class, which manages all historical state, including multi-asset prices, decrypted embeddings, and the queue of raw encrypted payloads. It is responsible for data integrity, persistence, and the entire `tlock` decryption and hotkey verification workflow.
-4.  **`cycle.py`** – A stateless utility responsible for fetching the current set of miner commitments from the subtensor and downloading their corresponding raw payloads via HTTP.
-5.  **`model.py`** – An XGBoost-based model used to compute per-miner salience via permutation importance, a robust method for evaluating feature value.
-6.  **`comms.py`** – Handles all asynchronous network download operations and local caching.
+## Core Modules
+1. **`config.py`** – Defines network constants and the `CHALLENGES` list.
+2. **`ledger.py`** – Contains the `DataLog` and per‑challenge `ChallengeData` structures. It stores prices, decrypted embeddings and raw payloads and handles decryption & validation.
+3. **`validator.py`** – Orchestrates block sampling, payload collection, decryption, model training and weight setting.
+4. **`model.py`** – Computes per‑hotkey salience using an XGBoost model and permutation importance.
+5. **`cycle.py`** – Downloads miner payloads and validates commit URLs.
+6. **`comms.py`** – Performs asynchronous HTTP downloads with caching.
 
 ---
 
 ## Data Structure
-
-The validator's entire state is encapsulated within the `DataLog` object, defined in `storage.py`. This makes the system portable and easy to manage.
-
 ```python
-class DataLog:
-    # Timestamps and multi-asset reference prices
-    blocks:         List[int]
-    asset_prices:   List[Dict[str, float]]
-    
-    # Decrypted, model-ready multi-asset data
-    plaintext_cache: List[Dict[int, Dict[str, List[float]]]]
-    
-    # Queue of unprocessed encrypted payloads
-    raw_payloads:   Dict[int, Dict[int, dict]]
+@dataclass
+class ChallengeData:
+    dim: int
+    blocks_ahead: int
+    sidx: Dict[int, Dict[str, Any]]
 
-    # For tracking miner ownership and wiping history on hotkey changes
-    uid_owner:      Dict[int, str]
+class DataLog:
+    blocks: List[int]
+    challenges: Dict[str, ChallengeData]
+    raw_payloads: Dict[int, Dict[str, bytes]]
 ```
+Each challenge maps sample indices to prices and hotkey embeddings. The `DataLog` holds the per‑block payload queue and the challenge data.
 
 ---
 
-## End-to-End Workflow
-
-1.  **Initialisation** – On startup, `validator.py` initializes a `DataLog` object. By default, it attempts to bootstrap its state by downloading an archive from the public URL in `config.py`. The `--no_download_datalog` flag can be used to start with a fresh, empty log.
-2.  **Collection (every `SAMPLE_STEP` blocks)** – `validator.py` calls `cycle.py` to fetch all miner payloads and appends the new encrypted data and current asset prices to the `DataLog`.
-3.  **Metagraph & Miner Sync (every 100 blocks)** – The validator syncs the Bittensor metagraph and immediately calls `datalog.sync_miners()` to handle any UID-hotkey changes, wiping the history for any UID that has changed ownership.
-4.  **Decryption (runs continuously)** – A background loop in `validator.py` constantly calls `datalog.process_pending_payloads()`. This finds all payloads that are now old enough to be unlocked, fetches the required Drand signatures, decrypts them, and verifies the embedded hotkeys.
-5.  **Evaluation (every `TASK_INTERVAL` blocks)** – A background thread calls `datalog.get_training_data()` to get the latest model-ready data, computes salience scores using the XGBoost model, normalizes them, and submits the new weights to the subtensor.
+## End‑to‑End Workflow
+1. **Initialise** – `validator.py` loads or creates a `DataLog` and syncs the metagraph.
+2. **Collect** – Every `SAMPLE_EVERY` blocks the validator downloads encrypted payloads and current prices and appends them via `datalog.append_step`.
+3. **Decrypt** – `datalog.process_pending_payloads` obtains Drand signatures once the 300‑block delay has elapsed, decrypts payloads, validates structure and stores embeddings.
+4. **Prune** – Periodically, inactive hotkeys are removed from challenge data via `datalog.prune_hotkeys`.
+5. **Evaluate** – Every `TASK_INTERVAL` blocks the validator builds training data, computes salience scores and normalises weights on‑chain.
 
 ---
 
 ## Security Highlights
-
--   **Time-lock Encryption:** Uses `tlock` and the public Drand randomness beacon to prevent miners from submitting predictions after observing the future price.
--   **Embedded Hotkey Verification:** The plaintext of every payload must contain the miner's hotkey (`embeddings:::hotkey`). During decryption, the validator verifies that this embedded hotkey matches the one registered in the metagraph for that UID, preventing payload spoofing.
--   **Commit Validation:** The validator verifies that the filename in a miner's commit URL matches their hotkey, preventing one miner from pointing to another's data.
--   **Data Validation:** All decrypted payloads are strictly validated. Any data that is malformed (wrong structure, values out of range) is safely discarded and replaced with a neutral zero vector.
--   **Payload Size Limits:** `comms.py` enforces a maximum download size to mitigate denial-of-service attacks.
--   **Stagnant Price Filtering:** The system automatically identifies and nullifies periods where an asset's price has not changed, ensuring the model is not trained on stale or corrupt data.
+- **Time‑lock encryption** prevents miners from seeing future prices before submitting.
+- **Embedded hotkey checks** ensure decrypted payloads belong to the committing miner.
+- **Payload validation** replaces malformed data with zero vectors.
+- **Download size limits** mitigate denial‑of‑service attacks.
 
 ---
 
 ## Dependencies
-
-The system's core dependencies are managed in `requirements.txt`. Key libraries include:
--   `bittensor`
--   `xgboost`
--   `timelock`
--   `requests`, `aiohttp`
+The main dependencies are listed in `requirements.txt` and include `bittensor`, `xgboost`, `timelock`, `requests` and `aiohttp`.
 
 ---
 
 ## Extensibility
-
--   Swap in an alternative salience algorithm by editing **`model.py`** only.
--   Change the data storage and processing logic by editing **`storage.py`**.
--   Modify the list of tracked assets or their embedding dimensions in `config.py`.
+- Swap out the salience algorithm by editing **`model.py`**.
+- Adjust challenges or hyperparameters in **`config.py`**.
+- Modify storage or decryption logic in **`ledger.py`**.
 
 ---
 
 ## License
+Released under the MIT License © 2024 MANTIS.
 
-Released under the MIT License © 2024 MANTIS. 
