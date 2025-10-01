@@ -27,7 +27,10 @@ import json
 import asyncio
 import botocore
 from typing import Dict, List
-from aiobotocore.session import get_session
+try:
+    from aiobotocore.session import get_session
+except ImportError:
+    get_session = None
 import aiohttp, email.utils
 import base64
 from pathlib import Path
@@ -72,7 +75,7 @@ def load_r2_write_secret_access_key() -> str | None:
     return _cached_env("R2_WRITE_SECRET_ACCESS_KEY")
 
 CLIENT_CONFIG = botocore.config.Config(max_pool_connections=256)
-session = get_session()
+session = get_session() if get_session else None
 
 
 def _r2_client_kwargs():
@@ -92,7 +95,9 @@ def _r2_client_kwargs():
 
 def _r2_client():
     kwargs = _r2_client_kwargs()
-    return session.create_client("s3", **kwargs) if kwargs else None
+    if not (session and kwargs):
+        return None
+    return session.create_client("s3", **kwargs)
 
 
 def get_local_path(bucket: str, filename: str) -> str:
@@ -146,6 +151,20 @@ async def _object_size(url: str, session: aiohttp.ClientSession, timeout: int = 
         return None
     return None
 
+def _is_v1_payload(d: dict) -> bool:
+    return set(d.keys()) == {"round", "ciphertext"} and isinstance(d.get("round"), int) and isinstance(d.get("ciphertext"), str)
+
+
+def _is_v2_payload(d: dict) -> bool:
+    need = {"v", "round", "hk", "owner_pk", "C", "W_owner", "W_time", "binding", "alg"}
+    return (
+        isinstance(d, dict)
+        and d.get("v") == 2
+        and isinstance(d.get("round"), int)
+        and need.issubset(d.keys())
+    )
+
+
 async def download(url: str, max_size_bytes: int | None = None):
     path = await _local_path_from_url(url)
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -162,16 +181,13 @@ async def download(url: str, max_size_bytes: int | None = None):
             r.raise_for_status()
             body = await r.read()
     try:
-        data = json.loads(body.decode('utf-8'))
-        if not isinstance(data, dict):
-            raise ValueError("Payload is not a JSON object.")
-        expected_keys = {"round", "ciphertext"}
-        if set(data.keys()) != expected_keys:
-            raise ValueError(f"Payload keys must be exactly {expected_keys}")
-        if not isinstance(data['round'], int) or data['round'] < 0:
-            raise ValueError("'round' must be a non-negative integer.")
-        if not isinstance(data['ciphertext'], str):
-            raise ValueError("'ciphertext' must be a string.")
+        data = json.loads(body.decode("utf-8"))
+        if _is_v1_payload(data):
+            pass
+        elif _is_v2_payload(data):
+            pass
+        else:
+            raise ValueError("Payload is neither v1 nor v2 JSON object.")
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
         logger.warning(f"Invalid payload from {url}: {e}")
         raise ValueError("Invalid payload format") from e
