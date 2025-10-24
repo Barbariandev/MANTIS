@@ -103,7 +103,6 @@ def _decrypt_v2_payload(payload: dict, sig: bytes | None, tlock: Timelock) -> by
         shared = X25519PrivateKey.from_private_bytes(ske).exchange(X25519PublicKey.from_public_bytes(owner_pk))
         k1, _ = _hkdf_key_nonce(shared, info=b"mantis-owner-wrap")
         nonce = bytes.fromhex(payload["W_owner"]["nonce"])
-        # nonce is random per-payload
         wrapped = ChaCha20Poly1305(k1).decrypt(nonce, bytes.fromhex(payload["W_owner"]["ct"]), binding)
         if wrapped != key:
             return None
@@ -144,7 +143,9 @@ class DataLog:
             self.raw_payloads[ts] = {}
             sidx = block // SAMPLE_EVERY
             for t, ch in self.challenges.items():
-                p = prices.get(t)
+                spec = config.CHALLENGE_MAP.get(t)
+                price_key = spec.get("price_key") if spec and spec.get("price_key") else t
+                p = prices.get(price_key)
                 if p is not None:
                     ch.set_price(sidx, p)
             for hk in mg.hotkeys:
@@ -191,15 +192,42 @@ class DataLog:
         return {c["ticker"]: [0.0] * c["dim"] for c in config.CHALLENGES}
 
     def _validate_submission(self, sub: Any) -> Dict[str, List[float]]:
+        def _sanitize_lbfgs_vec(vec: List[float]) -> List[float]:
+            # Preserve zero vector (non-activation)
+            if not any((float(v) != 0.0) for v in vec):
+                return [0.0] * 17
+            arr = np.asarray(vec, dtype=float).copy()
+            if arr.shape != (17,):
+                return [0.0] * 17
+            # p[0:5]: clamp to (1e-6, 1-1e-6) then renormalize
+            p = np.clip(arr[0:5], 1e-6, 1.0 - 1e-6)
+            s = float(np.sum(p))
+            if s <= 0:
+                p[:] = 1.0 / 5.0
+            else:
+                p = p / s
+            # Q slices: clamp to (1e-6, 1-1e-6)
+            q = arr[5:17]
+            q = np.clip(q, 1e-6, 1.0 - 1e-6)
+            out = np.concatenate([p, q]).astype(float)
+            return out.tolist()
+
         if isinstance(sub, list) and len(sub) == len(config.CHALLENGES):
             out = {}
             for vec, c in zip(sub, config.CHALLENGES):
                 dim = c["dim"]
-                if isinstance(vec, list) and len(vec) == dim and all(isinstance(v, (int, float)) and -1 <= v <= 1 for v in vec):
-                    out[c["ticker"]] = vec
+                ticker = c["ticker"]
+                spec = config.CHALLENGE_MAP.get(ticker)
+                if isinstance(vec, list) and len(vec) == dim:
+                    if spec and spec.get("loss_func") == "lbfgs":
+                        out[ticker] = _sanitize_lbfgs_vec(vec) if dim == 17 else [0.0] * dim
+                    else:
+                        ok = all(isinstance(v, (int, float)) and -1 <= v <= 1 for v in vec)
+                        out[ticker] = [float(v) for v in vec] if ok else [0.0] * dim
                 else:
-                    out[c["ticker"]] = [0.0] * dim
+                    out[ticker] = [0.0] * dim
             return out
+
         if isinstance(sub, dict):
             out = self._zero_vecs()
             for key, vec in sub.items():
@@ -211,9 +239,13 @@ class DataLog:
                 dim = config.ASSET_EMBEDDING_DIMS.get(ticker)
                 if not isinstance(vec, list) or len(vec) != dim:
                     continue
-                if not all(isinstance(v, (int, float)) and -1 <= v <= 1 for v in vec):
-                    continue
-                out[ticker] = [float(v) for v in vec]
+                spec = config.CHALLENGE_MAP.get(ticker)
+                if spec and spec.get("loss_func") == "lbfgs" and dim == 17:
+                    out[ticker] = _sanitize_lbfgs_vec(vec)
+                else:
+                    if not all(isinstance(v, (int, float)) and -1 <= v <= 1 for v in vec):
+                        continue
+                    out[ticker] = [float(v) for v in vec]
             return out
         return self._zero_vecs()
 
@@ -231,10 +263,9 @@ class DataLog:
             "decrypt_failures": 0,
             "signature_fetch_attempts": 0,
             "signature_fetch_failures": 0,
-            "v1": 0,
             "v2": 0,
-            "v1_fail": 0,
             "v2_fail": 0,
+            "unsupported": 0,
         }
         for ts, by_hk in payloads.items():
             if current_block - blocks[ts] >= 300:
@@ -244,17 +275,16 @@ class DataLog:
                         data = json.loads(raw.decode()) if raw else {}
                     except Exception:
                         data = {}
-                    version = 2 if isinstance(data, dict) and data.get("v") == 2 else 1 if isinstance(data, dict) and "ciphertext" in data else 0
-                    if version == 1:
-                        stats["v1"] += 1
-                    elif version == 2:
+                    version = 2 if isinstance(data, dict) and data.get("v") == 2 else 0
+                    if version == 2:
                         stats["v2"] += 1
-                    if version:
                         try:
                             rnd_key = int(data.get("round", 0))
                         except (TypeError, ValueError):
                             rnd_key = 0
                         rounds[rnd_key].append((ts, hk, data, version))
+                    else:
+                        stats["unsupported"] += 1
         if not mature:
             return
         dec = {}
@@ -278,17 +308,7 @@ class DataLog:
                 if not sig:
                     dec.setdefault(ts, {})[hk] = vecs
                     continue
-                if version == 1 and isinstance(data.get("ciphertext"), str):
-                    stats["payloads"] += 1
-                    try:
-                        pt = self.tlock.tld(bytes.fromhex(data["ciphertext"]), sig).decode()
-                        emb_str, hk_in = pt.rsplit(":::", 1)
-                        if hk_in == hk:
-                            vecs = self._validate_submission(json.loads(emb_str.replace("'", '"')))
-                    except Exception:
-                        stats["decrypt_failures"] += 1
-                        stats["v1_fail"] += 1
-                elif version == 2:
+                if version == 2:
                     stats["payloads"] += 1
                     pt_bytes = _decrypt_v2_payload(data, sig, self.tlock)
                     if not pt_bytes:
@@ -334,26 +354,22 @@ class DataLog:
                 total_payloads,
                 pct,
             )
-        version_total = stats["v1"] + stats["v2"]
+        version_total = stats["v2"] + stats["unsupported"]
         if version_total:
             v2_pct = 100.0 * stats["v2"] / version_total
-            v1_pct = 100.0 * stats["v1"] / version_total
+            unsupported_pct = 100.0 * stats["unsupported"] / version_total
             v2_fail_pct = (100.0 * stats["v2_fail"] / stats["v2"]) if stats["v2"] else 0.0
-            v1_fail_pct = (100.0 * stats["v1_fail"] / stats["v1"]) if stats["v1"] else 0.0
             logger.info(
-                "Payload mix (matured): V2 %d/%d (%.1f%%), V1 %d/%d (%.1f%%); failures — V2 %d/%d (%.1f%%), V1 %d/%d (%.1f%%)",
+                "Payload mix (matured): V2 %d/%d (%.1f%%), unsupported %d/%d (%.1f%%); V2 failures %d/%d (%.1f%%)",
                 stats["v2"],
                 version_total,
                 v2_pct,
-                stats["v1"],
+                stats["unsupported"],
                 version_total,
-                v1_pct,
+                unsupported_pct,
                 stats["v2_fail"],
                 stats["v2"],
                 v2_fail_pct,
-                stats["v1_fail"],
-                stats["v1"],
-                v1_fail_pct,
             )
         fetch_attempts = stats["signature_fetch_attempts"]
         if fetch_attempts > 0:
@@ -372,9 +388,67 @@ class DataLog:
                 d["emb"] = {hk: v for hk, v in d["emb"].items() if hk in active_set}
                 d["hotkeys"] = [hk for hk in d["hotkeys"] if hk in active_set]
 
+    def _build_lbfgs_training_entry(
+        self, ticker: str, ch: "ChallengeData", max_block_number: int | None
+    ) -> dict | None:
+        spec = config.CHALLENGE_MAP.get(ticker)
+        if not spec:
+            return None
+        all_hks = sorted({hk for d in ch.sidx.values() for hk in d["emb"].keys()})
+        if not all_hks:
+            return None
+        hk2idx = {hk: i for i, hk in enumerate(all_hks)}
+        D = int(ch.dim)
+        rows: list[np.ndarray] = []
+        prices: list[float] = []
+        sidx_list: list[int] = []
+        for sidx, data in sorted(ch.sidx.items()):
+            block = int(sidx) * SAMPLE_EVERY
+            if max_block_number and block > max_block_number:
+                break
+            price_val = data.get("price")
+            try:
+                price = float(price_val) if price_val is not None else float("nan")
+            except Exception:
+                price = float("nan")
+            if not np.isfinite(price) or price <= 0:
+                continue
+            row = np.zeros((len(all_hks), D), dtype=np.float32)
+            for hk, vec in data["emb"].items():
+                idx = hk2idx.get(hk)
+                if idx is None:
+                    continue
+                arr = np.asarray(vec, dtype=np.float32)
+                if arr.shape != (D,):
+                    try:
+                        arr = arr.reshape(D)
+                    except Exception:
+                        continue
+                row[idx] = arr
+            rows.append(row.reshape(-1))
+            prices.append(price)
+            sidx_list.append(int(sidx))
+        if not rows:
+            return None
+        X = np.stack(rows, axis=0)
+        price_arr = np.asarray(prices, dtype=np.float64)
+        sidx_arr = np.asarray(sidx_list, dtype=np.int64)
+        return {
+            "hist": (X, hk2idx),
+            "price": price_arr,
+            "sidx": sidx_arr,
+            "blocks_ahead": int(ch.blocks_ahead),
+        }
+
     def get_training_data_sync(self, max_block_number: int | None = None) -> dict:
         res = {}
         for t, ch in self.challenges.items():
+            spec = config.CHALLENGE_MAP.get(t)
+            if spec and spec.get("loss_func") == "lbfgs":
+                entry = self._build_lbfgs_training_entry(t, ch, max_block_number)
+                if entry:
+                    res[t] = entry
+                continue
             ahead = ch.blocks_ahead // SAMPLE_EVERY
             all_hks = sorted({hk for d in ch.sidx.values() for hk in d["emb"].keys()})
             if not all_hks: continue
