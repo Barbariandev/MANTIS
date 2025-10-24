@@ -100,14 +100,6 @@ def _prepare_v2_plaintext(hotkey: str, payload_text: Optional[str], embeddings: 
     return obj
 
 
-def generate_v1(hotkey: str, lock_seconds: int, plaintext: Optional[str], embeddings: List[List[float]]):
-    plain = plaintext if plaintext is not None else f"{embeddings}:::{hotkey}"
-    round_num = _target_round(lock_seconds)
-    tlock = Timelock(config.DRAND_PUBLIC_KEY)
-    ciphertext = tlock.tle(round_num, plain, secrets.token_bytes(32))
-    return {"round": round_num, "ciphertext": ciphertext.hex()}
-
-
 def generate_v2(hotkey: str, lock_seconds: int, owner_pk_hex: str, payload_text: Optional[str], embeddings: List[List[float]]):
     if not owner_pk_hex:
         raise ValueError("OWNER_HPKE_PUBLIC_KEY_HEX is required for v2 payloads")
@@ -142,9 +134,8 @@ def generate_v2(hotkey: str, lock_seconds: int, owner_pk_hex: str, payload_text:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Generate legacy (v1) or dual-path (v2) payloads.")
+    parser = argparse.ArgumentParser(description="Generate MANTIS v2 payloads.")
     parser.add_argument("--hotkey", required=True)
-    parser.add_argument("--version", type=int, choices=[1, 2], default=2)
     parser.add_argument("--lock-seconds", type=int, default=config.TLOCK_DEFAULT_LOCK_SECONDS)
     parser.add_argument("--owner-pk-hex", default=config.OWNER_HPKE_PUBLIC_KEY_HEX)
     parser.add_argument("--payload", help="Optional plaintext override. For v2 expects JSON.")
@@ -160,10 +151,7 @@ def main() -> int:
     embeddings = generate_multi_asset_embeddings()
 
     try:
-        if args.version == 1:
-            payload = generate_v1(args.hotkey, args.lock_seconds, payload_text, embeddings)
-        else:
-            payload = generate_v2(args.hotkey, args.lock_seconds, args.owner_pk_hex, payload_text, embeddings)
+        payload = generate_v2(args.hotkey, args.lock_seconds, args.owner_pk_hex, payload_text, embeddings)
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
