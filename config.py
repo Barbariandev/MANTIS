@@ -54,6 +54,15 @@ CHALLENGES = [
         "weight": 1,
     },
     {
+        "name": "ETH-LBFGS",
+        "ticker": "ETHLBFGS",
+        "price_key": "ETH",
+        "dim": 17,
+        "blocks_ahead": 300,
+        "loss_func": "lbfgs",
+        "weight": 3.5,
+    },
+    {
         "name": "EURUSD-1H-BINARY",
         "ticker": "EURUSD",
         "dim": 2,
@@ -126,6 +135,9 @@ SAMPLE_EVERY = 5
 LAG = 60
 
 TASK_INTERVAL = 500
+
+WEIGHT_CALC_INTERVAL = 1000
+WEIGHT_SET_INTERVAL = 360
 
 OWNER_HPKE_PUBLIC_KEY_HEX="fbfe185ded7a4e6865effceb23cbac32894170587674e751ac237a06f72b3067"
 TLOCK_DEFAULT_LOCK_SECONDS = int(os.getenv("TLOCK_DEFAULT_LOCK_SECONDS", "30"))
