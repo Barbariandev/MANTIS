@@ -1,3 +1,6 @@
+# MIT License
+# Copyright (c) 2024 MANTIS
+
 from __future__ import annotations
 import logging
 import os
@@ -12,6 +15,7 @@ from sklearn.metrics import roc_auc_score
 import xgboost as xgb
 
 import config
+from lbfgs import compute_lbfgs_salience, compute_q_path_salience
 
 
 LAST_DEBUG: dict = {}
@@ -114,11 +118,10 @@ def salience_binary_prediction(
     CHUNK_SIZE = 2000
     LAG = int(config.LAG)
     EMBARGO_IDX = LAG
-    TOP_K = 20 # 20 hotkeys selected
-    WINDOWS_HALF_LIFE = 10 # 10 days
+    TOP_K = 20
+    WINDOWS_HALF_LIFE = 10
     recency_gamma = float(0.5 ** (1.0 / max(1, WINDOWS_HALF_LIFE)))
 
-    # check inputs ok
     if not isinstance(hist, tuple) or len(hist) != 2:
         logger.warning(f"[{ticker}] Invalid hist format; expected (X, hk2idx)")
         return {}
@@ -135,7 +138,6 @@ def salience_binary_prediction(
         logger.info(f"[{ticker}] No hotkeys present; skipping.")
         return {}
 
-    # ensure arrays
     try:
         X_flat = np.asarray(X_flat, dtype=np.float32)
     except Exception:
@@ -156,16 +158,13 @@ def salience_binary_prediction(
         logger.warning(f"[{ticker}] Inconsistent shape {X_flat.shape} for dim={dim}")
         return {}
 
-    # make labels binary
     y_bin = (y > 0).astype(np.float32)
     if len(np.unique(y_bin)) < 2:
         logger.info(f"[{ticker}] y has <2 classes; skipping.")
         return {}
 
-    # reshape features
     X = _reshape_X_to_hotkey_dim(X_flat, H, dim)
 
-    # find first idx each hk sends nonzero emb
     first_nz_idx = np.full(H, T, dtype=np.int32)
     for j in range(H):
         row_j = X[:, j, :]
@@ -174,7 +173,6 @@ def salience_binary_prediction(
         if nz_idx.size > 0:
             first_nz_idx[j] = int(nz_idx[0])
 
-    # build walk fwd chunks train_start to val_end with lag
     indices: List[Tuple[int, int, int]] = []
     start = 0
     while True:
@@ -220,12 +218,10 @@ def salience_binary_prediction(
         sel_eval_end = train_end
         sel_eval_start = max(0, sel_eval_end - CHUNK_SIZE)
         sel_fit_end = max(0, sel_eval_start - EMBARGO_IDX)
-        # use sel_fit_end for training 0 to sel_fit_end then check sel_eval_start to sel_eval_end
         if sel_fit_end < 50:
             pbar.update(1)
             continue
 
-        # train logisic 0..sel_fit_end ints eval sel_eval_start..sel_eval_end pick for val_start..val_end
         sel_auc = np.zeros(H, dtype=np.float32)
         for j in range(H):
             if first_nz_idx[j] >= sel_fit_end:
@@ -256,7 +252,6 @@ def salience_binary_prediction(
             except Exception:
                 sel_auc[j] = 0.5
 
-        # choose top hotkeys
         top_k = min(TOP_K, H)
         selected_idx = np.argsort(-sel_auc)[:top_k]
         selected_idx.sort()
@@ -269,13 +264,11 @@ def salience_binary_prediction(
             pbar.update(1)
             continue
 
-        # linregs learn 0..fit_end_pred ints and feed xgb for val_start..val_end
         X_train_sel = np.zeros((fit_end_pred, selected_idx.size), dtype=np.float32)
         X_val_sel = np.zeros((val_end - val_start, selected_idx.size), dtype=np.float32)
 
         oos_segments: List[Tuple[int, int, int]] = []
         start_oos = 0
-        # make oos chunks so linreg fits 0..tr_fit_end_oos and predicts oos_val_start..oos_val_end
         while True:
             val_start_oos = start_oos + LAG
             if val_start_oos >= fit_end_pred:
@@ -291,7 +284,6 @@ def salience_binary_prediction(
                 continue
             Xi_all = X[:, j, :].astype(np.float32, copy=False)
 
-            # logisic trains 0..tr_fit_end_oos ints to fill scores oos_val_start..oos_val_end
 
             for (oos_train_start, oos_val_start, oos_val_end) in oos_segments:
                 tr_fit_end_oos = max(0, oos_val_start - LAG)
@@ -331,14 +323,12 @@ def salience_binary_prediction(
                     random_state=config.SEED,
                 )
                 clf_val.fit(Xi_fit, yi_fit)
-                # logisic for infrence uses val_start..val_end
                 X_val_sel[:, col_idx] = clf_val.decision_function(Xi_all[val_start:val_end])
             except Exception:
                 continue
 
         y_train_head = y_bin[:fit_end_pred]
 
-        # xgb learns 0..fit_end_pred ints and predicts val_start..val_end
         try:
             dtrain = xgb.DMatrix(X_train_sel, label=y_train_head)
             bst = xgb.train(xgb_params, dtrain, num_boost_round=xgb_rounds, verbose_eval=False)
@@ -357,7 +347,6 @@ def salience_binary_prediction(
             except Exception:
                 pass
 
-        # permute each hk col and see auc drop for salince
         window_imp = np.zeros(H, dtype=np.float32)
         for local_col, j in enumerate(selected_idx):
             col = X_val_sel[:, local_col].copy()
@@ -396,7 +385,6 @@ def salience_binary_prediction(
     if total_weight <= 0:
         return {}
 
-    # normlize scores
     norm_imp = (total_hk_imp / total_weight).tolist()
     imp_map: Dict[str, float] = {}
     for j, score in enumerate(norm_imp):
@@ -409,14 +397,81 @@ def salience_binary_prediction(
 def multi_salience(
     training_data: Dict[str, Tuple[Tuple[np.ndarray, Dict[str, int]], np.ndarray]]
 ) -> Dict[str, float]:
+    def _is_uniform_salience(s: Dict[str, float]) -> bool:
+        if not s:
+            return True
+        vals = list(s.values())
+        if not vals:
+            return True
+        total = float(sum(vals))
+        if total <= 0.0:
+            return True
+        v0 = vals[0]
+        return all(abs(v - v0) <= 1e-12 for v in vals)
     per_challenge: List[Tuple[Dict[str, float], float]] = []
     total_w = 0.0
-    for ticker, (hist, y) in training_data.items():
+    for ticker, payload in training_data.items():
         spec = config.CHALLENGE_MAP.get(ticker)
-        if not spec or spec.get("loss_func") != "binary":
+        if not spec:
             continue
-        s = salience_binary_prediction(hist, y, ticker)
+        loss_type = spec.get("loss_func")
+        s: Dict[str, float] = {}
+        if loss_type == "binary":
+            if not isinstance(payload, tuple) or len(payload) != 2:
+                continue
+            hist, y = payload
+            s = salience_binary_prediction(hist, y, ticker)
+        elif loss_type == "lbfgs":
+            if not isinstance(payload, dict):
+                continue
+            hist = payload.get("hist")
+            price = payload.get("price")
+            blocks_ahead = int(payload.get("blocks_ahead", spec.get("blocks_ahead", 0) or 0))
+            if (
+                not isinstance(hist, tuple)
+                or len(hist) != 2
+                or price is None
+                or blocks_ahead <= 0
+            ):
+                continue
+            # Classifier (p-only) salience
+            s_cls = compute_lbfgs_salience(
+                hist,
+                price,
+                blocks_ahead=blocks_ahead,
+                sample_every=int(config.SAMPLE_EVERY),
+            )
+            # Q-only salience 
+            try:
+                s_q = compute_q_path_salience(
+                    hist,
+                    price,
+                    blocks_ahead=blocks_ahead,
+                    sample_every=int(config.SAMPLE_EVERY),
+                )
+            except Exception:
+                s_q = {}
+            # Treat uniform fallbacks as empty (skip challenge instead of equal weights)
+            if _is_uniform_salience(s_cls):
+                s_cls = {}
+            if _is_uniform_salience(s_q):
+                s_q = {}
+            # 50/50 combine within this challenge
+            keys = set(s_cls.keys()) | set(s_q.keys())
+            s = {}
+            for hk in keys:
+                v = 0.5 * float(s_cls.get(hk, 0.0)) + 0.5 * float(s_q.get(hk, 0.0))
+                if v > 0.0:
+                    s[hk] = v
+            tot = float(sum(s.values()))
+            if tot > 0:
+                s = {k: (v / tot) for k, v in s.items()}
+        else:
+            continue
         if s:
+            total_challenge_score = float(sum(s.values()))
+            if total_challenge_score <= 0:
+                continue
             w = float(spec.get("weight", 1.0))
             per_challenge.append((s, w))
             total_w += w
