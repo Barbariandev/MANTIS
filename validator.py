@@ -1,24 +1,5 @@
 # MIT License
-#
 # Copyright (c) 2024 MANTIS
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-# THE SOFTWARE.
 
 from __future__ import annotations
 
@@ -37,6 +18,7 @@ import aiohttp
 from dotenv import load_dotenv
 import requests
 import numpy as np
+import pickle
 
 import config
 from cycle import get_miner_payloads
@@ -68,7 +50,26 @@ load_dotenv()
 
 os.makedirs(config.STORAGE_DIR, exist_ok=True)
 DATALOG_PATH = os.path.join(config.STORAGE_DIR, "mantis_datalog.pkl")
+WEIGHTS_PATH = os.path.join(config.STORAGE_DIR, "saved_weights.pkl")
 SAVE_INTERVAL = 480
+
+
+def save_weights(weights_tensor: torch.Tensor, uids: list[int], block: int):
+    weights_data = {
+        "weights": weights_tensor,
+        "uids": uids,
+        "block": block,
+    }
+    with open(WEIGHTS_PATH, "wb") as f:
+        pickle.dump(weights_data, f)
+    logging.info(f"Saved weights calculated at block {block} to {WEIGHTS_PATH}")
+
+
+def load_weights() -> dict | None:
+    if not os.path.exists(WEIGHTS_PATH):
+        return None
+    with open(WEIGHTS_PATH, "rb") as f:
+        return pickle.load(f)
 
 
 async def _fetch_price_source(session, url, parse_json=True):
@@ -93,8 +94,8 @@ async def _get_price_from_sources(session, source_list):
 
 
 async def get_asset_prices(session: aiohttp.ClientSession) -> dict[str, float] | None:
-    tickers = [c["ticker"] for c in config.CHALLENGES]
-    base = {t: 0.0 for t in tickers}
+    specs = list(config.CHALLENGES)
+    base = {spec["ticker"]: 0.0 for spec in specs}
     try:
         async with session.get(config.PRICE_DATA_URL) as resp:
             resp.raise_for_status()
@@ -102,12 +103,14 @@ async def get_asset_prices(session: aiohttp.ClientSession) -> dict[str, float] |
             data = json.loads(text)
             fetched = data.get("prices", {}) or {}
             out = dict(base)
-            for t in tickers:
-                v = fetched.get(t)
+            for spec in specs:
+                ticker = spec["ticker"]
+                price_key = spec.get("price_key", ticker)
+                v = fetched.get(price_key)
                 try:
                     fv = float(v)
                     if 0 < fv < float('inf'):
-                        out[t] = fv
+                        out[ticker] = fv
                 except Exception:
                     pass
             logging.info(f"Fetched prices, filled zeros where missing: {out}")
@@ -292,15 +295,14 @@ async def run_main_loop(
                 logging.info(f"Retrieved {len(payloads)} payloads from miners. Hotkey sample: {list(payloads.keys())[:3]}")
                 await datalog.append_step(current_block, asset_prices, payloads, mg)
 
-
                 if (
-                    current_block % config.TASK_INTERVAL == 0
+                    current_block % config.WEIGHT_CALC_INTERVAL == 0
                     and (weight_thread is None or not weight_thread.is_alive())
                     and len(datalog.blocks) >= config.LAG * 2 + 1
                 ):
                     datalog_clone = copy.deepcopy(datalog)
 
-                    def worker(dlog, block_snapshot, metagraph, cli_args):
+                    def calc_worker(dlog, block_snapshot, metagraph, cli_args):
                         training_data = dlog.get_training_data_sync(
                             max_block_number=block_snapshot - config.TASK_INTERVAL
                         )
@@ -383,29 +385,40 @@ async def run_main_loop(
                         
                         weights_to_log = {uid: f"{weight:.8f}" for uid, weight in normalized_weights.items() if uid in uids and weight > 0}
                         weights_logger.info(f"Normalized weights for block {block_snapshot}: {json.dumps(weights_to_log)}")
-                        weights_logger.info(f"Final tensor sum before setting weights: {final_w.sum().item()}")
+                        weights_logger.info(f"Final tensor sum: {final_w.sum().item()}")
                         
-                        try:
-                            thread_sub = bt.subtensor(network=cli_args.network)
-                            thread_wallet = bt.wallet(
-                                name=getattr(cli_args, "wallet.name"), 
-                                hotkey=getattr(cli_args, "wallet.hotkey")
-                            )
-                            thread_sub.set_weights(
-                                netuid=cli_args.netuid, wallet=thread_wallet,
-                                uids=metagraph.uids, weights=final_w,
-                                wait_for_inclusion=False,
-                            )
-                            weights_logger.info(f"Weights set at block {block_snapshot} (max={final_w.max():.4f})")
-                        except Exception as e:
-                            weights_logger.error(f"Failed to set weights: {e}", exc_info=True)
+                        save_weights(final_w, uids, block_snapshot)
+                        weights_logger.info(f"Weights calculated and saved at block {block_snapshot} (max={final_w.max():.4f})")
 
                     weight_thread = threading.Thread(
-                        target=worker,
+                        target=calc_worker,
                         args=(datalog_clone, current_block, copy.deepcopy(mg), copy.deepcopy(args)),
                         daemon=True,
                     )
                     weight_thread.start()
+                
+                if current_block % config.WEIGHT_SET_INTERVAL == 0:
+                    weights_data = load_weights()
+                    if weights_data is None:
+                        logging.info(f"No saved weights found at block {current_block}, skipping weight setting.")
+                    else:
+                        calc_block = weights_data.get("block", "unknown")
+                        final_w = weights_data["weights"]
+                        saved_uids = weights_data["uids"]
+                        
+                        weights_logger.info(f"Setting weights from saved array (calculated at block {calc_block})")
+                        
+                        if list(saved_uids) != mg.uids.tolist():
+                            weights_logger.warning("UID mismatch between saved weights and current metagraph, skipping.")
+                        else:
+                            sub.set_weights(
+                                netuid=args.netuid,
+                                wallet=wallet,
+                                uids=mg.uids,
+                                weights=final_w,
+                                wait_for_inclusion=False,
+                            )
+                            weights_logger.info(f"Weights set at block {current_block} (from block {calc_block}, max={final_w.max():.4f})")
 
             except KeyboardInterrupt:
                 stop_event.set()
