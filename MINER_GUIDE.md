@@ -6,7 +6,7 @@ A quick reference for setting up your MANTIS miner. This guide details how to ge
 
 - **Python Environment:** Python 3.8 or newer.
 - **Registered Hotkey:** Your hotkey must be registered on the subnet. Without this, you cannot commit your data URL.
-- **Publicly Accessible URL:** You need a stable URL (e.g., from a Cloudflare R2 bucket, a personal server, or a gist) where you can host your payload file. The validator will download your submission from this URL.
+- **R2 Bucket** to contain the file containing your payloads.
 
 ## 2. Setup
 
@@ -22,9 +22,12 @@ It is also recommended to use a tool like `boto3` and `python-dotenv` if you are
 
 The core mining loop involves creating data, encrypting it for a future time, uploading it to your public URL, and ensuring the network knows where to find it.
 
+For the LBFGS challenge (17-dim per bar, p/Q format), see `lbfgs_guide.md` for the exact embedding layout and scoring rules (50/50 classifier/Q within challenge).
+
 ### Step 1: Build Your Multi-Asset Embeddings
 
 You must submit embeddings for all configured challenges. Each challenge has a required embedding dimension defined in the network's configuration.
+For LBFGS challenges specifically, one embedding per bar per hotkey must be 17 floats in the order documented in `lbfgs_guide.md`.
 
 All values in your embeddings must be between -1.0 and 1.0. The task for all assets is a binary prediction of the price change over the next 1 hour.
 
@@ -39,65 +42,47 @@ multi_asset_embedding = [
 ]
 ```
 
-### Step 2: Timelock-Encrypt Your Payload
+### Step 2: Timelock-Encrypt Your Payload (V2 Only)
 
-To ensure security and prove ownership, you must bundle your hotkey with your embeddings before encryption. The system uses a `:::` delimiter to separate the data from the signature.
+The validator accepts only V2 JSON payloads. You can call the helper script or embed the logic directly in your miner.
+
+**CLI helper (recommended)**
+
+```bash
+python generate_and_encrypt.py --hotkey "$MY_HOTKEY" --lock-seconds 30 --out "$MY_HOTKEY"
+```
+
+The script uses the owner public key and Drand parameters from `config.py`, targets a round roughly 30 seconds ahead, and writes a JSON payload whose filename matches your hotkey.
+
+**Inline Python example**
 
 ```python
 import json
-import time
-import secrets
-import requests
-from timelock import Timelock
+from generate_and_encrypt import generate_v2, generate_multi_asset_embeddings
+from config import OWNER_HPKE_PUBLIC_KEY_HEX
 
-# Your Bittensor hotkey
-my_hotkey = "5D..." # <-- REPLACE WITH YOUR HOTKEY
-
-# Drand beacon configuration (do not change)
-DRAND_API = "https://api.drand.sh/v2"
-DRAND_BEACON_ID = "quicknet"
-DRAND_PUBLIC_KEY = (
-    "83cf0f2896adee7eb8b5f01fcad3912212c437e0073e911fb90022d3e760183c"
-    "8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb"
-    "5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a"
+embeddings = generate_multi_asset_embeddings()
+payload = generate_v2(
+    hotkey=my_hotkey,
+    lock_seconds=30,
+    owner_pk_hex=OWNER_HPKE_PUBLIC_KEY_HEX,
+    payload_text=None,
+    embeddings=embeddings,
 )
 
-# Fetch beacon info to calculate a future round
-info = requests.get(f"{DRAND_API}/beacons/{DRAND_BEACON_ID}/info", timeout=10).json()
-future_time = time.time() + 30  # Target a round ~30 seconds in the future
-target_round = int((future_time - info["genesis_time"]) // info["period"])
-
-# Create the plaintext by joining embeddings and the hotkey
-plaintext = f"{str(multi_asset_embedding)}:::{my_hotkey}"
-
-# Encrypt the plaintext for the target round
-tlock = Timelock(DRAND_PUBLIC_KEY)
-salt = secrets.token_bytes(32)
-ciphertext_hex = tlock.tle(target_round, plaintext, salt).hex()
+with open(my_hotkey, "w", encoding="utf-8") as fh:
+    json.dump(payload, fh, indent=2)
 ```
 
-### Step 3: Create and Save the Payload File
-The payload is a JSON object containing the `round` and `ciphertext`. It's recommended to name the file after your hotkey for easy management.
+The resulting JSON contains fields such as `v`, `round`, `hk`, `owner_pk`, `C`, `W_owner`, `W_time`, `binding`, and `alg`. Do not modify or strip these fields; the validator verifies them when decrypting the payload.
 
-```python
-# The filename can be anything, but using the hotkey is good practice.
-filename = my_hotkey 
-payload = {
-    "round": target_round,
-    "ciphertext": ciphertext_hex,
-}
-
-with open(filename, "w") as f:
-    json.dump(payload, f)
-```
-
-### Step 4: Upload to Your Public URL
+### Step 3: Upload to Your Public URL
 Upload the generated payload file to your public hosting solution (e.g., R2, personal server). The file must be publicly accessible via a direct download link.
 
 **Important**: The validator expects the filename in the commit URL to match your hotkey. For example, if your hotkey is `5D...`, a valid commit URL would be `https://myserver.com/5D...`.
 
 ### Step 5: Commit the URL to the Subnet
-Finally, you must commit the public URL of your payload file to the subtensor. **You only need to do this once**, unless your URL changes. After the initial commit, you just need to update the file at that URL (Steps 1-4).
+Finally, you must commit the public URL of your payload file to the subtensor. **You only need to do this once**, unless your URL changes. After the initial commit, you just need to update the file at that URL (Steps 1-3).
 
 ```python
 import bittensor as bt
@@ -122,9 +107,8 @@ subtensor.commit(wallet=wallet, netuid=123, data=public_url) # Use the correct n
 
 **Frequently (e.g., every minute):**
 1.  Generate new multi-asset embeddings (Step 1).
-2.  Encrypt them with your hotkey for a future round (Step 2).
-3.  Save the payload file (Step 3).
-4.  Upload the new file to your public URL, overwriting the old one (Step 4).
+2.  Encrypt and write the V2 payload (Step 2).
+3.  Upload the new file to your public URL, overwriting the old one (Step 3).
 
 ## 5. Scoring and Rewards
 
