@@ -151,10 +151,6 @@ async def _object_size(url: str, session: aiohttp.ClientSession, timeout: int = 
         return None
     return None
 
-def _is_v1_payload(d: dict) -> bool:
-    return set(d.keys()) == {"round", "ciphertext"} and isinstance(d.get("round"), int) and isinstance(d.get("ciphertext"), str)
-
-
 def _is_v2_payload(d: dict) -> bool:
     need = {"v", "round", "hk", "owner_pk", "C", "W_owner", "W_time", "binding", "alg"}
     return (
@@ -182,12 +178,8 @@ async def download(url: str, max_size_bytes: int | None = None):
             body = await r.read()
     try:
         data = json.loads(body.decode("utf-8"))
-        if _is_v1_payload(data):
-            pass
-        elif _is_v2_payload(data):
-            pass
-        else:
-            raise ValueError("Payload is neither v1 nor v2 JSON object.")
+        if not _is_v2_payload(data):
+            raise ValueError("Payload must be a v2 JSON object.")
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
         logger.warning(f"Invalid payload from {url}: {e}")
         raise ValueError("Invalid payload format") from e
