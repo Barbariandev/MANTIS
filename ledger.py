@@ -515,6 +515,14 @@ class DataLog:
                 obj._lock = asyncio.Lock()
                 if not hasattr(obj, "_drand_cache"):
                     obj._drand_cache = {}
+                if not hasattr(obj, "challenges") or obj.challenges is None:
+                    obj.challenges = {}
+                for c in config.CHALLENGES:
+                    t = c["ticker"]
+                    if t not in obj.challenges:
+                        logger.info(f"Adding new challenge: {t}")
+                        obj.challenges[t] = ChallengeData(c["dim"], c["blocks_ahead"])
+                        logging.info(f"Added new challenge: {t}")
                 return obj
         except Exception:
             return DataLog()
