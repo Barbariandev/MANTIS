@@ -66,11 +66,8 @@ def _xgb_params() -> Dict[str, object]:
         "verbosity": 0,
         "tree_method": "hist",
         "seed": config.SEED,
+        "nthread": os.cpu_count(),
     }
-    if DEVICE == "cuda":
-        params.update({"device": "cuda", "tree_method": "gpu_hist", "predictor": "gpu_predictor"})
-    else:
-        params["nthread"] = os.cpu_count()
     return params
 
 
@@ -434,14 +431,15 @@ def multi_salience(
                 or blocks_ahead <= 0
             ):
                 continue
-            # Classifier (p-only) salience
-            s_cls = compute_lbfgs_salience(
-                hist,
-                price,
-                blocks_ahead=blocks_ahead,
-                sample_every=int(config.SAMPLE_EVERY),
-            )
-            # Q-only salience 
+            try:
+                s_cls = compute_lbfgs_salience(
+                    hist,
+                    price,
+                    blocks_ahead=blocks_ahead,
+                    sample_every=int(config.SAMPLE_EVERY),
+                )
+            except Exception:
+                s_cls = {}
             try:
                 s_q = compute_q_path_salience(
                     hist,
@@ -451,12 +449,10 @@ def multi_salience(
                 )
             except Exception:
                 s_q = {}
-            # Treat uniform fallbacks as empty (skip challenge instead of equal weights)
             if _is_uniform_salience(s_cls):
                 s_cls = {}
             if _is_uniform_salience(s_q):
                 s_q = {}
-            # 50/50 combine within this challenge
             keys = set(s_cls.keys()) | set(s_q.keys())
             s = {}
             for hk in keys:
