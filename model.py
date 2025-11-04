@@ -1,3 +1,4 @@
+
 # MIT License
 # Copyright (c) 2024 MANTIS
 
@@ -26,6 +27,12 @@ logger = logging.getLogger(__name__)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info("Salience computations will run on %s", DEVICE)
 
+
+MAX_DAYS: int = int(getattr(config, "MAX_DAYS", 30))
+INDICES_PER_DAY: int = int(getattr(config, "INDICES_PER_DAY", 1440))
+BLOCKS_PER_DAY: int = int(getattr(config, "BLOCKS_PER_DAY", 7200))
+MAX_INDEX_HISTORY: int = int(MAX_DAYS * INDICES_PER_DAY)
+MAX_BLOCK_HISTORY: int = int(MAX_DAYS * BLOCKS_PER_DAY)
 
 try:
     _NUM_CPU = max(1, os.cpu_count() or 1)
@@ -171,6 +178,10 @@ def salience_binary_prediction(
     y = np.asarray(challenge_returns, dtype=np.float32)
     if X_flat.shape[0] != y.shape[0]:
         return {}
+
+    if MAX_INDEX_HISTORY > 0 and X_flat.shape[0] > MAX_INDEX_HISTORY:
+        X_flat = X_flat[-MAX_INDEX_HISTORY:]
+        y = y[-MAX_INDEX_HISTORY:]
 
     T = int(X_flat.shape[0])
     if T < 500:
@@ -427,6 +438,21 @@ def multi_salience(
                 or blocks_ahead <= 0
             ):
                 continue
+            X_blk, hk2idx = hist
+            X_blk = np.asarray(X_blk, dtype=np.float32)
+            price_arr = np.asarray(price)
+            if MAX_BLOCK_HISTORY > 0:
+                if X_blk.shape[0] > MAX_BLOCK_HISTORY:
+                    X_blk = X_blk[-MAX_BLOCK_HISTORY:]
+                if price_arr.shape[0] > MAX_BLOCK_HISTORY:
+                    price_arr = price_arr[-MAX_BLOCK_HISTORY:]
+                L = int(min(X_blk.shape[0], price_arr.shape[0]))
+                if L <= 0:
+                    continue
+                X_blk = X_blk[-L:]
+                price_arr = price_arr[-L:]
+            hist = (X_blk, hk2idx)
+            price = price_arr
             try:
                 s_cls = compute_lbfgs_salience(
                     hist,
@@ -476,3 +502,5 @@ def multi_salience(
     }
     total = float(sum(avg.values()))
     return {hk: (v / total) for hk, v in avg.items()} if total > 0 else {}
+
+
