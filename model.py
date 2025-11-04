@@ -142,7 +142,7 @@ def salience_binary_prediction(
     ticker: str,
 ) -> Dict[str, float]:
     LAG = int(getattr(config, "LAG", 1))
-    CHUNK_SIZE = int(getattr(config, "CHUNK_SIZE", 2000))
+    CHUNK_SIZE = int(getattr(config, "CHUNK_SIZE", 6000))
     TOP_K = int(getattr(config, "TOP_K", 20))
     WINDOWS_HALF_LIFE = int(getattr(config, "WINDOWS_HALF_LIFE", 10))
     recency_gamma = float(0.5 ** (1.0 / max(1, WINDOWS_HALF_LIFE)))
