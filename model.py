@@ -95,12 +95,15 @@ def _fit_base_logistic(
 ) -> LogisticRegression | None:
     if X_fit.shape[0] < 2 or len(np.unique(y_fit)) < 2:
         return None
+    n_features = int(X_fit.shape[1]) if X_fit.ndim == 2 else 0
+    solver = "liblinear" if n_features <= 4 else "lbfgs"
     clf = LogisticRegression(
         penalty="l2",
         C=0.5,
         class_weight="balanced",
-        solver="lbfgs",
-        max_iter=200,
+        solver=solver,
+        max_iter=100,
+        tol=1e-3,
         random_state=seed,
     )
     clf.fit(X_fit, y_fit)
@@ -149,7 +152,7 @@ def salience_binary_prediction(
     ticker: str,
 ) -> Dict[str, float]:
     LAG = int(getattr(config, "LAG", 1))
-    CHUNK_SIZE = int(getattr(config, "CHUNK_SIZE", 6000))
+    CHUNK_SIZE = int(getattr(config, "CHUNK_SIZE", 4000))
     TOP_K = int(getattr(config, "TOP_K", 20))
     WINDOWS_HALF_LIFE = int(getattr(config, "WINDOWS_HALF_LIFE", 10))
     recency_gamma = float(0.5 ** (1.0 / max(1, WINDOWS_HALF_LIFE)))
@@ -160,6 +163,7 @@ def salience_binary_prediction(
     META_MAX_ITER = int(getattr(config, "META_MAX_ITER", 2000))
     META_CLASS_WEIGHT = getattr(config, "META_CLASS_WEIGHT", "balanced")
     SEED = int(getattr(config, "SEED", 0))
+    rng = np.random.default_rng(SEED)
 
     if not isinstance(hist, tuple) or len(hist) != 2:
         return {}
@@ -353,7 +357,7 @@ def salience_binary_prediction(
         base_auc = float(roc_auc_score(y_val, base_probs))
 
         window_imp = np.zeros(H, dtype=np.float32)
-        X_val_perm = X_val_filled.copy()
+        coef_vec = np.asarray(meta_clf.coef_, dtype=np.float64).ravel()
         for local_col, j in enumerate(selected_idx):
             col_vals = X_val_sel[:, local_col]
             mask = ~np.isnan(col_vals)
@@ -361,14 +365,8 @@ def salience_binary_prediction(
             if nn <= 1:
                 window_imp[j] = 0.0
                 continue
-            saved_vals = X_val_perm[mask, local_col].copy()
-            perm = np.random.default_rng(SEED).permutation(nn)
-            X_val_perm[mask, local_col] = saved_vals[perm]
-            perm_probs = meta_clf.predict_proba(X_val_perm)[:, 1]
-            perm_auc = float(roc_auc_score(y_val, perm_probs))
-            delta = base_auc - perm_auc
-            window_imp[j] = delta if delta > 0.0 else 0.0
-            X_val_perm[mask, local_col] = saved_vals
+            imp = float(abs(coef_vec[local_col]))
+            window_imp[j] = imp if imp > 0.0 else 0.0
 
         scale = max((base_auc - 0.5) / 0.5, 0.0)
         if scale > 0:
@@ -502,5 +500,4 @@ def multi_salience(
     }
     total = float(sum(avg.values()))
     return {hk: (v / total) for hk, v in avg.items()} if total > 0 else {}
-
 
