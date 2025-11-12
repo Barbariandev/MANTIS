@@ -321,7 +321,8 @@ async def run_main_loop(
                         sal = {uid: score for uid, score in general_sal.items() if uid != -1}
 
                         if not sal:
-                            weights_logger.info("Salience is empty. Assigning weights only to young UIDs if any.")
+                            weights_logger.warning("Salience is empty. Cannot calculate weights - insufficient training data.")
+                            return  # don't proceed with empty salience
                         
                         uids = metagraph.uids.tolist()
 
@@ -376,6 +377,14 @@ async def run_main_loop(
                         normalized_weights = {uid: w / total_weight for uid, w in final_weights.items()}
 
                         w = torch.tensor([normalized_weights.get(uid, 0.0) for uid in uids], dtype=torch.float32)
+                        
+                        # Check for uniform weights (bug indicator)
+                        non_zero_count = (w > 0).sum().item()
+                        if non_zero_count > 0:
+                            unique_values = torch.unique(w[w > 0])
+                            if len(unique_values) == 1:
+                                weights_logger.error(f"BUG DETECTED: All {non_zero_count} non-zero weights are identical ({unique_values[0]:.8f}). This indicates uniform fallback. Skipping weight set.")
+                                return
                         
                         if w.sum() > 0:
                             final_w = w / w.sum()

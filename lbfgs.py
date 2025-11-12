@@ -484,11 +484,7 @@ def progressive_saliences(hist: Tuple[np.ndarray, Dict[str, int]], price_data: n
     if H == 0 or HD % H != 0:
         raise ValueError("X_flat second dim must be divisible by number of hotkeys")
     if T < MIN_REQUIRED_SAMPLES:
-        out = _zero_salience(hk2idx)
-        if H > 0:
-            for k in list(hk2idx.keys()):
-                out[k] = 1.0 / H
-        return out
+        return {}  # Signal insufficient samples
     D = HD // H
     if D != 17:
         raise ValueError(f"Expected per-expert embedding D=17; got D={D}")
@@ -496,11 +492,7 @@ def progressive_saliences(hist: Tuple[np.ndarray, Dict[str, int]], price_data: n
     hotkey_starts = _compute_hotkey_start_indices(X_flat, H, D)
     min_train = horizon + vol_window + 1
     if min_train >= T:
-        out = _zero_salience(hk2idx)
-        if H > 0:
-            for k in list(hk2idx.keys()):
-                out[k] = 1.0 / H
-        return out
+        return {}  # Signal insufficient samples
 
     k = int(np.ceil(min_train / step))
     salience_exp_accum = np.zeros(H, dtype=float)
@@ -545,9 +537,7 @@ def progressive_saliences(hist: Tuple[np.ndarray, Dict[str, int]], price_data: n
         for idx in range(H):
             out[inv_map[idx]] = float(salience_exp_accum[idx] / exp_sum)
     else:
-        if H > 0:
-            for idx in range(H):
-                out[inv_map[idx]] = 1.0 / H
+        out = {}    # Signal insufficient samples
     return out
 
 
@@ -571,11 +561,9 @@ def compute_lbfgs_salience(hist: Tuple[np.ndarray, Dict[str, int]], price_data: 
     if price_arr.size < required:
         logger.info("LBFGS salience requires %d samples (%.1f days); only %d available.",
                     required, min_days, price_arr.size)
-        out = _zero_salience(hk2idx)
-        if len(hk2idx) > 0:
-            for k in list(hk2idx.keys()):
-                out[k] = 1.0 / len(hk2idx)
-        return out
+        # Return empty dict instead of uniform weights
+        # Let upstream handle the empty case
+        return {}
 
     horizon_steps = max(1, int(round(blocks_ahead / max(1, sample_every))))
     vol_window = max(required, MIN_REQUIRED_SAMPLES)
@@ -596,11 +584,9 @@ def compute_lbfgs_salience(hist: Tuple[np.ndarray, Dict[str, int]], price_data: 
         )
     except Exception as exc:
         logger.exception("LBFGS salience computation failed: %s", exc)
-        out = _zero_salience(hk2idx)
-        if len(hk2idx) > 0:
-            for k in list(hk2idx.keys()):
-                out[k] = 1.0 / len(hk2idx)
-        return out
+        # Return empty dict instead of uniform weights
+        # Let upstream handle the empty case
+        return {}
     return {hk: float(max(0.0, score)) for hk, score in sal.items()}
 
 
@@ -734,7 +720,7 @@ class QPathCalibrator:
         if total > 0.0:
             return {inv_map[i]: float(contrib[i] / total) for i in range(H)}
         else:
-            return {inv_map[i]: 1.0 / H for i in range(H)}
+            return {}  # Signal zero contribution
 
 
 def progressive_q_saliences(
@@ -914,8 +900,7 @@ def compute_q_path_salience(
     if price.size < required or X_flat.shape[0] < required:
         logger.info("Q path salience requires %d samples (%.1f days); only %d available.",
                     required, min_days, price.size)
-        inv = {hk: 1.0 / max(1, len(hk2idx)) for hk in hk2idx}
-        return inv
+        return {}  # Signal insufficient data
 
     horizon_steps = max(1, int(round(blocks_ahead / max(1, sample_every))))
     step = samples_per_day

@@ -408,8 +408,19 @@ def multi_salience(
         total = float(sum(vals))
         if total <= 0.0:
             return True
-        v0 = vals[0]
-        return all(abs(v - v0) <= 1e-12 for v in vals)
+        
+        # Reason: This catches uniform distributions even with floating-point noise.
+        # Check if all values are within 1% of each other (more robust)
+        v_min = min(vals)
+        v_max = max(vals)
+        v_mean = total / len(vals)
+        
+        # If max deviation from mean is < 1%, consider uniform
+        if v_mean > 0:
+            relative_deviation = (v_max - v_min) / v_mean
+            return relative_deviation < 0.01  # 1% threshold
+        
+        return True
     per_challenge: List[Tuple[Dict[str, float], float]] = []
     total_w = 0.0
     for ticker, payload in training_data.items():
