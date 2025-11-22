@@ -102,7 +102,7 @@ def _fit_base_logistic(
         C=0.5,
         class_weight="balanced",
         solver=solver,
-        max_iter=100,
+        max_iter=2000,
         tol=1e-3,
         random_state=seed,
     )
