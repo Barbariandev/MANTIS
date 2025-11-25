@@ -484,6 +484,12 @@ def multi_salience(
                 s_cls = {}
             if _is_uniform_salience(s_q):
                 s_q = {}
+            
+            # Filter out uniform distribution fallback from LBFGS classifier
+            # If s_cls is uniform, it means the model failed to beat the baseline.
+            if s_cls and _is_uniform_salience(s_cls):
+                s_cls = {}
+
             keys = set(s_cls.keys()) | set(s_q.keys())
             s = {}
             for hk in keys:
@@ -511,4 +517,5 @@ def multi_salience(
     }
     total = float(sum(avg.values()))
     return {hk: (v / total) for hk, v in avg.items()} if total > 0 else {}
+
 
