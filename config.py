@@ -38,14 +38,6 @@ NUM_UIDS = 256
 
 CHALLENGES = [
     {
-        "name": "BTC-1H-BINARY",
-        "ticker": "BTC",
-        "dim": 100,
-        "blocks_ahead": 300,
-        "loss_func": "binary",
-        "weight": 1,
-    },
-    {
         "name": "ETH-1H-BINARY",
         "ticker": "ETH",
         "dim": 2,
@@ -61,6 +53,15 @@ CHALLENGES = [
         "blocks_ahead": 300,
         "loss_func": "lbfgs",
         "weight": 3.5,
+    },
+    {
+        "name": "BTC-LBFGS-6H",
+        "ticker": "BTCLBFGS",
+        "price_key": "BTC",
+        "dim": 17,
+        "blocks_ahead": 1800,
+        "loss_func": "lbfgs",
+        "weight": 2.875,
     },
     {
         "name": "EURUSD-1H-BINARY",
@@ -152,7 +153,5 @@ DRAND_PUBLIC_KEY = (
     "8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb"
     "5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a"
 )
-
-
 
 
