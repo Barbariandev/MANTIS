@@ -381,11 +381,25 @@ async def run_main_loop(
                         # Check for uniform weights (bug indicator)
                         non_zero_count = (w > 0).sum().item()
                         if non_zero_count > 0:
+                            # Filter out degenerate distributions where all active uids have exactly the same weight
+                            # This usually indicates a fallback/failure mode in the model
                             unique_values = torch.unique(w[w > 0])
+                            
+                            # Check if all non-zero weights are identical (within tolerance)
+                            # This catches both uniform distributions and "uniform subset" fallbacks
                             if len(unique_values) == 1:
-                                weights_logger.error(f"BUG DETECTED: All {non_zero_count} non-zero weights are identical ({unique_values[0]:.8f}). This indicates uniform fallback. Skipping weight set.")
+                                weights_logger.warning(f"Detected degenerate uniform weights ({unique_values[0]:.6f}). Skipping set to allow averaging with other challenges.")
                                 return
-                        
+                            
+                            # Also check for near-uniformity (variance threshold)
+                            # If standard deviation is extremely low relative to mean
+                            if non_zero_count > 1:
+                                mean_val = w[w > 0].mean()
+                                std_val = w[w > 0].std()
+                                if mean_val > 0 and (std_val / mean_val) < 0.001:
+                                    weights_logger.warning(f"Detected near-uniform weights (CV < 0.1%). Skipping set.")
+                                    return
+
                         if w.sum() > 0:
                             final_w = w / w.sum()
                         else:
@@ -443,10 +457,6 @@ async def run_main_loop(
 
 if __name__ == "__main__":
     main()
-
-
-
-
 
 
 
