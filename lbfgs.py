@@ -1,3 +1,4 @@
+ 
 
 from __future__ import annotations
 import logging
@@ -109,7 +110,8 @@ def _project_simplex(v: np.ndarray) -> np.ndarray:
 def progressive_saliences(hist: Tuple[np.ndarray, Dict[str, int]], price_data: np.ndarray, step: int = 1440,
                           embargo: int = 60, horizon: int = 1, vol_window: int = 7200, class_prior_smoothing: float = 1.0,
                           l2_reg: float = 1e-3, init_scale: float = 0.0, lbfgs_cfg: Optional[any] = None,
-                          half_life_days: float = 5.0, samples_per_day: float = 1440.0, use_class_weights: bool = True) -> Dict[str, float]:
+                          half_life_days: float = 5.0, samples_per_day: float = 1440.0, use_class_weights: bool = True,
+                          top_k_miners: int = 25) -> Dict[str, float]:
     """
     Out-of-sample expert salience using Log-Linear Pooling optimized via L-BFGS-B.
     Model: Logit(k) = sum_h(w_h * log(p_{h,k})) + b_k
@@ -544,6 +546,3 @@ def compute_q_path_salience(
         samples_per_day=float(samples_per_day),
         gating_classes=gating_classes,
     )
-
-
-
