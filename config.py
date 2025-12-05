@@ -46,6 +46,15 @@ CHALLENGES = [
         "weight": 1,
     },
     {
+        "name": "ETH-HITFIRST-100M",
+        "ticker": "ETHHITFIRST",
+        "price_key": "ETH",
+        "dim": 3,
+        "blocks_ahead": 500,
+        "loss_func": "hitfirst",
+        "weight": 2.5,
+    },
+    {
         "name": "ETH-LBFGS",
         "ticker": "ETHLBFGS",
         "price_key": "ETH",
