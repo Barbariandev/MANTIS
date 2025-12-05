@@ -143,9 +143,9 @@ class DataLog:
             self.raw_payloads[ts] = {}
             sidx = block // SAMPLE_EVERY
             for t, ch in self.challenges.items():
-                spec = config.CHALLENGE_MAP.get(t)
-                price_key = spec.get("price_key") if spec and spec.get("price_key") else t
-                p = prices.get(price_key)
+                # Prices dict is keyed by challenge ticker; each challenge already
+                # receives the appropriate underlying price in get_asset_prices.
+                p = prices.get(t)
                 if p is not None:
                     ch.set_price(sidx, p)
             for hk in mg.hotkeys:
@@ -394,6 +394,9 @@ class DataLog:
         spec = config.CHALLENGE_MAP.get(ticker)
         if not spec:
             return None
+        loss_type = spec.get("loss_func")
+        if loss_type not in ("lbfgs", "hitfirst"):
+            return None
         all_hks = sorted({hk for d in ch.sidx.values() for hk in d["emb"].keys()})
         if not all_hks:
             return None
@@ -444,7 +447,7 @@ class DataLog:
         res = {}
         for t, ch in self.challenges.items():
             spec = config.CHALLENGE_MAP.get(t)
-            if spec and spec.get("loss_func") == "lbfgs":
+            if spec and spec.get("loss_func") in ("lbfgs", "hitfirst"):
                 entry = self._build_lbfgs_training_entry(t, ch, max_block_number)
                 if entry:
                     res[t] = entry
