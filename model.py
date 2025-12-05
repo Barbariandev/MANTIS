@@ -15,7 +15,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
 import config
-from lbfgs import compute_lbfgs_salience, compute_q_path_salience
+from lbfgs import compute_lbfgs_salience, compute_q_path_salience, compute_hitfirst_salience
 
 
 LAST_DEBUG: dict = {}
@@ -499,6 +499,40 @@ def multi_salience(
             tot = float(sum(s.values()))
             if tot > 0:
                 s = {k: (v / tot) for k, v in s.items()}
+        elif loss_type == "hitfirst":
+            if not isinstance(payload, dict):
+                continue
+            hist = payload.get("hist")
+            price = payload.get("price")
+            blocks_ahead = int(payload.get("blocks_ahead", spec.get("blocks_ahead", 0) or 0))
+            if (
+                not isinstance(hist, tuple)
+                or len(hist) != 2
+                or price is None
+                or blocks_ahead <= 0
+            ):
+                continue
+            X_blk, hk2idx = hist
+            X_blk = np.asarray(X_blk, dtype=np.float32)
+            price_arr = np.asarray(price)
+            if MAX_BLOCK_HISTORY > 0:
+                if X_blk.shape[0] > MAX_BLOCK_HISTORY:
+                    X_blk = X_blk[-MAX_BLOCK_HISTORY:]
+                if price_arr.shape[0] > MAX_BLOCK_HISTORY:
+                    price_arr = price_arr[-MAX_BLOCK_HISTORY:]
+                L = int(min(X_blk.shape[0], price_arr.shape[0]))
+                if L <= 0:
+                    continue
+                X_blk = X_blk[-L:]
+                price_arr = price_arr[-L:]
+            hist = (X_blk, hk2idx)
+            price = price_arr
+            s = compute_hitfirst_salience(
+                hist,
+                price,
+                blocks_ahead=blocks_ahead,
+                sample_every=int(config.SAMPLE_EVERY),
+            )
         else:
             continue
         if s:
