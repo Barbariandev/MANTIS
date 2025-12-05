@@ -1,18 +1,21 @@
- 
 
 from __future__ import annotations
 import logging
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Iterable
+from typing import Dict, Optional, Tuple, Iterable, List
 import numpy as np
-from scipy.optimize import minimize
-from scipy.special import logsumexp
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
 logger = logging.getLogger(__name__)
 __all__ = (
-    "progressive_saliences", "compute_lbfgs_salience",
-    "QCalibConfig", "QPathCalibrator",
-    "progressive_q_saliences", "compute_q_path_salience",
+    "compute_lbfgs_salience",
+    "QCalibConfig",
+    "QPathCalibrator",
+    "progressive_q_saliences",
+    "compute_q_path_salience",
+    "compute_hitfirst_salience",
 )
 
 _LN2, _EPS = np.log(2.0), 1e-12
@@ -107,174 +110,211 @@ def _project_simplex(v: np.ndarray) -> np.ndarray:
     return w if s > 0 else np.full(n, 1.0 / n, dtype=float)
 
 
-def progressive_saliences(hist: Tuple[np.ndarray, Dict[str, int]], price_data: np.ndarray, step: int = 1440,
-                          embargo: int = 60, horizon: int = 1, vol_window: int = 7200, class_prior_smoothing: float = 1.0,
-                          l2_reg: float = 1e-3, init_scale: float = 0.0, lbfgs_cfg: Optional[any] = None,
-                          half_life_days: float = 5.0, samples_per_day: float = 1440.0, use_class_weights: bool = True,
-                          top_k_miners: int = 25) -> Dict[str, float]:
+class LinearEnsembleOptimizer(nn.Module):
     """
-    Out-of-sample expert salience using Log-Linear Pooling optimized via L-BFGS-B.
-    Model: Logit(k) = sum_h(w_h * log(p_{h,k})) + b_k
-    Constraints: w_h >= 0 (Non-negative weights)
+    A Linear Regression based ensemble (Logistic Regression in classification context).
+    It learns a weighted average of miner predictions to form the final prediction.
     """
-    X_flat_raw, hk2idx = hist
-    X_flat = np.asarray(X_flat_raw, dtype=float)
-    price = np.asarray(price_data, dtype=float)
-    T, HD = X_flat.shape
-    H = len(hk2idx)
-    if H == 0 or HD % H != 0:
-        raise ValueError("X_flat second dim must be divisible by number of hotkeys")
-    if T < MIN_REQUIRED_SAMPLES:
-        return {}
-    D = HD // H
-    if D != 17:
-        raise ValueError(f"Expected per-expert embedding D=17; got D={D}")
 
-    min_train = horizon + vol_window + 1
-    if min_train >= T:
-        return {}
+    def __init__(self, num_miners: int, num_buckets: int = 5):
+        super().__init__()
+        self.num_miners = num_miners
+        self.num_buckets = num_buckets
 
-    # Prepare features: X_log is (T, H, 5) containing log probabilities
-    X_reshaped = X_flat.reshape(T, H, D)
-    p_probs = np.clip(X_reshaped[:, :, :5], _EPS, 1.0 - _EPS)
-    p_probs /= p_probs.sum(axis=2, keepdims=True) # Ensure valid pmf
-    X_log = np.log(p_probs) # (T, H, 5)
+        self.miner_weights = nn.Parameter(torch.ones(num_miners) / num_miners)
+        self.bias = nn.Parameter(torch.zeros(num_buckets))
+        self.criterion = nn.CrossEntropyLoss()
 
-    y_all, valid_idx_all = _make_bins_from_price(price, horizon=horizon, vol_window=vol_window)
-    y_full = np.full(T, -1, dtype=int)
-    y_full[valid_idx_all] = y_all
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size = x.shape[0]
+        x_reshaped = x.view(batch_size, self.num_miners, -1)
+        miner_probs = x_reshaped[:, :, :5]
 
-    k = int(np.ceil(min_train / step))
-    salience_exp_accum = np.zeros(H, dtype=float)
+        miner_probs = torch.clamp(miner_probs, 1e-6, 1.0)
+        miner_probs = miner_probs / miner_probs.sum(dim=2, keepdim=True)
 
-    while True:
-        train_end = k * step
-        if train_end >= T: break
-        eval_start = train_end + embargo
-        if eval_start >= T: break
-        eval_end = min(eval_start + step, T)
+        weights = torch.softmax(self.miner_weights, dim=0)
+        weighted_probs = torch.einsum("bmc,m->bc", miner_probs, weights)
 
-        train_mask = (y_full[:train_end] != -1)
-        if not train_mask.any():
-            k += 1
-            continue
-        
-        X_tr = X_log[:train_end][train_mask] # (N, H, 5)
-        y_tr = y_full[:train_end][train_mask] # (N,)
-        
-        valid_train_idx = np.arange(train_end)[train_mask]
-        w_tr = _exp_half_life_weights(valid_train_idx, half_life_days, samples_per_day)
-        
-        if use_class_weights:
-            classes, counts = np.unique(y_tr, return_counts=True)
-            cw_map = {c: len(y_tr) / (5 * cnt) for c, cnt in zip(classes, counts)}
-            w_tr *= np.array([cw_map.get(yi, 1.0) for yi in y_tr])
+        ensemble_logits = torch.log(weighted_probs + 1e-9) + self.bias
+        return ensemble_logits
 
-        # Optimization: Minimize Negative Log Likelihood
-        # Params: [w_0, ..., w_{H-1}, b_0, ..., b_4]
-        # w_h >= 0 to prevent betting against miners
-        
-        def nll_loss(theta):
-            w_h = theta[:H]
-            b_k = theta[H:]
-            # Logits: (N, 5) = sum_h (w_h * X_tr[:, h, :]) + b
-            logits = np.dot(X_tr, w_h) + b_k
-            # LogSoftmax
-            lse = logsumexp(logits, axis=1)
-            log_probs = logits - lse[:, None]
-            # Select correct class
-            selected = log_probs[np.arange(len(y_tr)), y_tr]
-            return -np.sum(selected * w_tr) + 0.5 * l2_reg * np.sum(w_h**2)
+    def fit(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        epochs: int = 100,
+        lr: float = 0.05,
+        batch_size: int = 1024,
+        device: str = "cpu",
+        verbose: bool = False,
+        class_weights: Optional[np.ndarray] = None,
+    ):
+        self.to(device)
 
-        def nll_grad(theta):
-            w_h = theta[:H]
-            b_k = theta[H:]
-            logits = np.dot(X_tr, w_h) + b_k
-            probs = np.exp(logits - logsumexp(logits, axis=1, keepdims=True))
-            
-            # Gradient wrt logits: probs - one_hot
-            # But weighted by sample weights w_tr
-            d_logits = probs.copy()
-            d_logits[np.arange(len(y_tr)), y_tr] -= 1.0
-            d_logits *= w_tr[:, None] # (N, 5)
-            
-            # Grads
-            # d_w_h = sum_n sum_k d_logit[n,k] * X[n,h,k]
-            d_w = np.einsum('nk,nhk->h', d_logits, X_tr) + l2_reg * w_h
-            d_b = np.sum(d_logits, axis=0)
-            return np.concatenate([d_w, d_b])
+        split_idx = int(len(X) * 0.8)
+        X_tr = torch.FloatTensor(X[:split_idx]).to(device)
+        y_tr = torch.LongTensor(y[:split_idx]).to(device)
+        X_val = torch.FloatTensor(X[split_idx:]).to(device)
+        y_val = torch.LongTensor(y[split_idx:]).to(device)
 
-        try:
-            # Initialize uniform weights
-            x0 = np.concatenate([np.ones(H) / H, np.zeros(5)])
-            bounds = [(0.0, None)] * H + [(None, None)] * 5
-            
-            res = minimize(nll_loss, x0, jac=nll_grad, method='L-BFGS-B', bounds=bounds, 
-                          options={'maxiter': 200, 'ftol': 1e-6})
-            
-            if res.success or res.message:
-                best_w = res.x[:H]
-                # Accumulate salience (magnitude of weight)
-                salience_exp_accum += best_w
-                
-        except Exception as exc:
-            logger.debug(f"Optimizer failed at k={k}: {exc}")
-        
-        k += 1
-        if eval_end >= T: break
+        if class_weights is not None:
+            w = torch.as_tensor(class_weights, dtype=torch.float32, device=device)
+            self.criterion = nn.CrossEntropyLoss(weight=w)
+        else:
+            self.criterion = nn.CrossEntropyLoss()
 
-    inv_map = {idx: hk for hk, idx in hk2idx.items()}
-    out: Dict[str, float] = {}
-    exp_sum = float(np.sum(salience_exp_accum))
-    if exp_sum > 0.0:
-        for idx in range(H):
-            out[inv_map[idx]] = float(salience_exp_accum[idx] / exp_sum)
-    else:
-        out = {}
-    return out
+        dataset = torch.utils.data.TensorDataset(X_tr, y_tr)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+        optimizer = optim.Adam(self.parameters(), lr=lr)
+
+        # No L1 penalty: we let the softmax over miner_weights and data decide
+        # the effective sparsity; this keeps the objective purely cross-entropy.
+        l1_lambda = 0.0
+
+        best_val_loss = float("inf")
+        best_state = None
+        patience = 0
+
+        for epoch in range(epochs):
+            self.train()
+            train_loss = 0.0
+            for xb, yb in loader:
+                optimizer.zero_grad()
+                logits = self(xb)
+                ce_loss = self.criterion(logits, yb)
+                l1_loss = l1_lambda * torch.sum(torch.abs(self.miner_weights))
+                loss = ce_loss + l1_loss
+                loss.backward()
+                optimizer.step()
+                train_loss += float(loss.item())
+
+            avg_train_loss = train_loss / max(len(loader), 1)
+
+            self.eval()
+            with torch.no_grad():
+                val_logits = self(X_val)
+                val_loss = float(self.criterion(val_logits, y_val).item())
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_state = {k: v.detach().cpu().clone() for k, v in self.state_dict().items()}
+                patience = 0
+            else:
+                patience += 1
+
+            if verbose and (epoch % 10 == 0):
+                logger.info("LinearEnsemble epoch %d | train=%.4f val=%.4f", epoch, avg_train_loss, val_loss)
+
+            if patience > 15:
+                break
+
+        if best_state is not None:
+            self.load_state_dict(best_state)
+
+        return self
 
 
-def compute_lbfgs_salience(hist: Tuple[np.ndarray, Dict[str, int]], price_data: np.ndarray, blocks_ahead: int,
-                           sample_every: int, lbfgs_cfg: Optional[any] = None, min_days: float = 5.0,
-                           half_life_days: float = 5.0,
-                           use_class_weights: bool = True) -> Dict[str, float]:
-    if not isinstance(hist, tuple) or len(hist) != 2:
-        return {}
-    _hist_matrix, hk2idx = hist
-    if not isinstance(hk2idx, dict):
-        return {}
+def compute_linear_salience(
+    hist: Tuple[np.ndarray, Dict[str, int]],
+    price_data: np.ndarray,
+    blocks_ahead: int,
+    sample_every: int,
+    epochs: int = 100,
+    device: str = "cpu",
+) -> Dict[str, float]:
+    X_flat, hk2idx = hist
     price_arr = np.asarray(price_data, dtype=float)
-    if price_arr.ndim != 1:
+
+    if len(hk2idx) == 0:
         return {}
 
     samples_per_day = int((24 * 60 * 60) // (12 * max(1, sample_every)))
-    required = int(max(MIN_REQUIRED_SAMPLES, np.ceil(samples_per_day * min_days)))
-    if price_arr.size < required:
-        logger.info("LBFGS salience requires %d samples; only %d available.", required, price_arr.size)
+    required = max(MIN_REQUIRED_SAMPLES, 100)
+
+    if price_arr.size < required or X_flat.shape[0] < required:
         return {}
 
     horizon_steps = max(1, int(round(blocks_ahead / max(1, sample_every))))
-    vol_window = max(required, MIN_REQUIRED_SAMPLES)
-    try:
-        sal = progressive_saliences(
-            hist, price_arr,
-            step=samples_per_day,
-            embargo=max(60, horizon_steps),
-            horizon=horizon_steps,
-            vol_window=vol_window,
-            class_prior_smoothing=1.0,
-            l2_reg=1e-3,
-            init_scale=0.0,
-            lbfgs_cfg=lbfgs_cfg,
-            half_life_days=half_life_days,
-            samples_per_day=float(samples_per_day),
-            use_class_weights=use_class_weights,
-            top_k_miners=25,
-        )
-    except Exception as exc:
-        logger.exception("LBFGS salience computation failed: %s", exc)
+
+    vol_window = max(required // 2, 1000)
+    y_all, valid_idx = _make_bins_from_price(price_arr, horizon=horizon_steps, vol_window=vol_window)
+
+    if valid_idx.size < required:
         return {}
-    return {hk: float(max(0.0, score)) for hk, score in sal.items()}
+
+    X_train = X_flat[valid_idx]
+    y_train = y_all
+
+    if X_train.shape[0] != y_train.shape[0]:
+        return {}
+
+    classes, counts = np.unique(y_train, return_counts=True)
+    K = int(classes.max() + 1) if classes.size > 0 else 0
+    if K <= 0:
+        return {}
+    class_weights = np.ones(K, dtype=np.float32)
+    for c, cnt in zip(classes, counts):
+        class_weights[int(c)] = float(len(y_train)) / (K * float(cnt))
+
+    num_miners = len(hk2idx)
+    model = LinearEnsembleOptimizer(num_miners=num_miners, num_buckets=5)
+
+    if device == "cpu" and torch.cuda.is_available():
+        device = "cuda"
+
+    model.fit(X_train, y_train, epochs=epochs, device=device, class_weights=class_weights)
+
+    model.eval()
+    with torch.no_grad():
+        miner_weights = torch.softmax(model.miner_weights, dim=0).cpu().numpy()
+
+    # Hard top-K truncation (default K=25): keep only the K largest weights,
+    # zero out the rest, and renormalise so the kept weights sum to 1.
+    K = 25
+    num_miners = miner_weights.shape[0]
+    if K is not None and num_miners > K:
+        order = np.argsort(-miner_weights)
+        keep_idx = order[:K]
+        kept = miner_weights[keep_idx]
+        s = float(kept.sum())
+        if s > 0.0:
+            kept = kept / s
+        pruned = np.zeros_like(miner_weights)
+        pruned[keep_idx] = kept
+        miner_weights = pruned
+
+    inv_map = {idx: hk for hk, idx in hk2idx.items()}
+    salience: Dict[str, float] = {}
+    for idx, weight in enumerate(miner_weights):
+        hk = inv_map.get(idx)
+        if hk and weight > 0.0:
+            salience[hk] = float(weight)
+    return salience
+
+
+def compute_lbfgs_salience(
+    hist: Tuple[np.ndarray, Dict[str, int]],
+    price_data: np.ndarray,
+    blocks_ahead: int,
+    sample_every: int,
+    lbfgs_cfg: Optional[any] = None,
+    min_days: float = 5.0,
+    half_life_days: float = 5.0,
+    use_class_weights: bool = True,
+) -> Dict[str, float]:
+    """
+    Delegate LBFGS classifier salience to the in-module linear ensemble
+    implementation (a constrained mixture over miner probability vectors
+    trained to minimise cross-entropy / NLL).
+    """
+    return compute_linear_salience(
+        hist,
+        price_data,
+        blocks_ahead=blocks_ahead,
+        sample_every=sample_every,
+    )
 
 
 @dataclass
@@ -546,3 +586,160 @@ def compute_q_path_salience(
         samples_per_day=float(samples_per_day),
         gating_classes=gating_classes,
     )
+
+
+def compute_hitfirst_salience(
+    hist: Tuple[np.ndarray, Dict[str, int]],
+    price_data: np.ndarray,
+    blocks_ahead: int,
+    sample_every: int,
+    min_days: float = 5.0,
+    half_life_days: float = 5.0,
+) -> Dict[str, float]:
+    X_flat, hk2idx = hist
+    price = np.asarray(price_data, dtype=float)
+    if price.ndim != 1:
+        return {}
+    if not isinstance(hk2idx, dict):
+        return {}
+
+    T, HD = X_flat.shape
+    H = len(hk2idx)
+    if H == 0 or HD % H != 0:
+        return {}
+    D = HD // H
+    if D != 3:
+        return {}
+
+    samples_per_day = int((24 * 60 * 60) // (12 * max(1, sample_every)))
+    required = int(max(MIN_REQUIRED_SAMPLES, np.ceil(samples_per_day * min_days)))
+    if price.size < required or X_flat.shape[0] < required:
+        logger.info("Hit-first salience requires %d samples; only %d available.", required, price.size)
+        return {}
+
+    horizon_steps = max(1, int(round(blocks_ahead / max(1, sample_every))))
+    len_r = max(0, price.shape[0] - horizon_steps)
+    if len_r <= 0:
+        return {}
+
+    r_h = np.log(price[horizon_steps:] + _EPS) - np.log(price[:-horizon_steps] + _EPS)
+    vol_window = int(max(required, MIN_REQUIRED_SAMPLES))
+    if r_h.size < vol_window:
+        return {}
+    sig_raw = _rolling_std_fast(r_h, vol_window)
+    sig = np.full(len_r, np.nan)
+    if sig_raw.size > 0:
+        sig[vol_window - 1:] = sig_raw
+
+    log_price = np.log(price + _EPS)
+    labels = np.full(len_r, -1, dtype=int)
+    for t in range(len_r):
+        sigma_t = sig[t]
+        if not np.isfinite(sigma_t) or sigma_t <= 0.0:
+            continue
+        base_lp = log_price[t]
+        seg = log_price[t + 1 : t + 1 + horizon_steps] - base_lp
+        idx_up_candidates = np.where(seg >= sigma_t)[0]
+        idx_dn_candidates = np.where(seg <= -sigma_t)[0]
+        has_up = idx_up_candidates.size > 0
+        has_dn = idx_dn_candidates.size > 0
+        if not has_up and not has_dn:
+            labels[t] = 2
+            continue
+        if has_up:
+            i_up = int(idx_up_candidates[0])
+        else:
+            i_up = horizon_steps + 1
+        if has_dn:
+            i_dn = int(idx_dn_candidates[0])
+        else:
+            i_dn = horizon_steps + 1
+        if i_up < i_dn:
+            labels[t] = 0
+        elif i_dn < i_up:
+            labels[t] = 1
+        else:
+            labels[t] = 2
+
+    valid_mask = labels >= 0
+    valid_idx = np.where(valid_mask)[0]
+    if valid_idx.size < required:
+        return {}
+
+    inv_map = {idx: hk for hk, idx in hk2idx.items()}
+
+    from sklearn.linear_model import LogisticRegression
+
+    X_valid = X_flat[:len_r][valid_mask]
+    X_valid = np.asarray(X_valid, dtype=float)
+    X_valid = X_valid.reshape(X_valid.shape[0], H, D)
+
+    probs = np.clip(X_valid, _EPS, 1.0 - _EPS)
+    sums = probs.sum(axis=2, keepdims=True)
+    sums[sums <= 0.0] = 1.0
+    probs /= sums
+
+    up_scores = _logit(probs[:, :, 0])
+    down_scores = _logit(probs[:, :, 1])
+    up_scores = np.nan_to_num(up_scores, nan=0.0, posinf=0.0, neginf=0.0)
+    down_scores = np.nan_to_num(down_scores, nan=0.0, posinf=0.0, neginf=0.0)
+
+    y_up = (labels[valid_mask] == 0).astype(int)
+    y_dn = (labels[valid_mask] == 1).astype(int)
+
+    n_samples = up_scores.shape[0]
+    split = int(max(1, np.floor(0.7 * n_samples)))
+
+    X_up_train = up_scores[:split]
+    y_up_train = y_up[:split]
+    X_up_test = up_scores[split:]
+    y_up_test = y_up[split:]
+
+    X_dn_train = down_scores[:split]
+    y_dn_train = y_dn[:split]
+    X_dn_test = down_scores[split:]
+    y_dn_test = y_dn[split:]
+
+    importance = np.zeros(H, dtype=float)
+
+    if np.unique(y_up_train).size == 2 and X_up_train.shape[0] > 0:
+        clf_up = LogisticRegression(
+            penalty="l2",
+            C=1.0,
+            solver="lbfgs",
+            class_weight="balanced",
+            max_iter=500,
+            tol=1e-4,
+        )
+        clf_up.fit(X_up_train, y_up_train)
+        coef_up = np.asarray(clf_up.coef_, dtype=float).ravel()
+        scale_up = np.mean(np.abs(X_up_test), axis=0) if X_up_test.shape[0] > 0 else np.ones(H, dtype=float)
+        importance += np.abs(coef_up) * scale_up
+
+    if np.unique(y_dn_train).size == 2 and X_dn_train.shape[0] > 0:
+        clf_dn = LogisticRegression(
+            penalty="l2",
+            C=1.0,
+            solver="lbfgs",
+            class_weight="balanced",
+            max_iter=500,
+            tol=1e-4,
+        )
+        clf_dn.fit(X_dn_train, y_dn_train)
+        coef_dn = np.asarray(clf_dn.coef_, dtype=float).ravel()
+        scale_dn = np.mean(np.abs(X_dn_test), axis=0) if X_dn_test.shape[0] > 0 else np.ones(H, dtype=float)
+        importance += np.abs(coef_dn) * scale_dn
+
+    total = float(np.sum(importance))
+    if total <= 0.0:
+        return {}
+
+    sal: Dict[str, float] = {}
+    for idx in range(H):
+        hk = inv_map.get(idx)
+        if hk is not None:
+            sal[hk] = float(importance[idx] / total)
+    return sal
+
+
+
