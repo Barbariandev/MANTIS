@@ -44,6 +44,38 @@ DRAND_SIGNATURE_RETRIES = 3
 DRAND_SIGNATURE_RETRY_DELAY = 1.0
 
 
+def ensure_datalog(path: str) -> str:
+    alt = path + ".gz"
+    if os.path.exists(path):
+        return path
+    if os.path.exists(alt):
+        return alt
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    r = requests.get(config.DATALOG_ARCHIVE_URL, timeout=600, stream=True)
+    if r.status_code != 200:
+        raise SystemExit(f"Failed to download datalog: HTTP {r.status_code}")
+
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        for chunk in r.iter_content(chunk_size=8192):
+            if chunk:
+                f.write(chunk)
+    os.replace(tmp, path)
+    return path
+
+
+def load_datalog(path: str) -> "DataLog":
+    # Keep this as a thin wrapper so scripts can depend on ledger.py for all datalog I/O.
+    return DataLog.load(path)
+
+
+def save_datalog(path: str, datalog: "DataLog") -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with (gzip.open if path.endswith(".gz") else open)(path, "wb") as f:
+        pickle.dump(datalog, f, pickle.HIGHEST_PROTOCOL)
+
+
 def _sha256(*parts: bytes) -> bytes:
     h = hashlib.sha256()
     for part in parts:
@@ -526,6 +558,15 @@ class DataLog:
                         logger.info(f"Adding new challenge: {t}")
                         obj.challenges[t] = ChallengeData(c["dim"], c["blocks_ahead"])
                         logging.info(f"Added new challenge: {t}")
+                    else:
+                        # Keep challenge metadata consistent with the active config.
+                        obj.challenges[t].dim = int(c["dim"])
+                        obj.challenges[t].blocks_ahead = int(c["blocks_ahead"])
+                # Prune any challenges that are no longer in the active config.
+                allowed = {c["ticker"] for c in config.CHALLENGES}
+                extra = [t for t in list(obj.challenges.keys()) if t not in allowed]
+                for t in extra:
+                    del obj.challenges[t]
                 return obj
         except Exception:
             return DataLog()
