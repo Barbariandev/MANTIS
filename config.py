@@ -73,22 +73,6 @@ CHALLENGES = [
         "weight": 2.875,
     },
     {
-        "name": "EURUSD-1H-BINARY",
-        "ticker": "EURUSD",
-        "dim": 2,
-        "blocks_ahead": 300,
-        "loss_func": "binary",
-        "weight": 1,
-    },
-    {
-        "name": "GBPUSD-1H-BINARY",
-        "ticker": "GBPUSD",
-        "dim": 2,
-        "blocks_ahead": 300,
-        "loss_func": "binary",
-        "weight": 1,
-    },
-    {
         "name": "CADUSD-1H-BINARY",
         "ticker": "CADUSD",
         "dim": 2,
@@ -107,14 +91,6 @@ CHALLENGES = [
     {
         "name": "CHFUSD-1H-BINARY",
         "ticker": "CHFUSD",
-        "dim": 2,
-        "blocks_ahead": 300,
-        "loss_func": "binary",
-        "weight": 1,
-    },
-    {
-        "name": "XAUUSD-1H-BINARY",
-        "ticker": "XAUUSD",
         "dim": 2,
         "blocks_ahead": 300,
         "loss_func": "binary",
