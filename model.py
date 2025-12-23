@@ -15,10 +15,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
 import config
-from lbfgs import compute_lbfgs_salience, compute_q_path_salience, compute_hitfirst_salience
-
-
-LAST_DEBUG: dict = {}
+from bucket_forecast import compute_lbfgs_salience, compute_q_path_salience
+from hitfirst import compute_hitfirst_salience
 
 
 logger = logging.getLogger(__name__)
@@ -397,35 +395,54 @@ def salience_binary_prediction(
 
 
 def multi_salience(
-    training_data: Dict[str, Tuple[Tuple[np.ndarray, Dict[str, int]], np.ndarray]]
-) -> Dict[str, float]:
+    training_data: Dict[str, object],
+    *,
+    return_breakdown: bool = False,
+) -> Dict[str, float] | tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
     def _is_uniform_salience(s: Dict[str, float]) -> bool:
         if not s:
             return True
-        vals = list(s.values())
-        if not vals:
-            return True
-        total = float(sum(vals))
+        vals = np.asarray(list(s.values()), dtype=float)
+        total = float(vals.sum())
         if total <= 0.0:
             return True
-        
-        # Reason: This catches uniform distributions even with floating-point noise.
-        # Check if all values are within 1% of each other (more robust)
-        v_min = min(vals)
-        v_max = max(vals)
-        v_mean = total / len(vals)
-        
-        # If max deviation from mean is < 1%, consider uniform
-        if v_mean > 0:
-            relative_deviation = (v_max - v_min) / v_mean
-            return relative_deviation < 0.01  # 1% threshold
-        
-        return True
-    per_challenge: List[Tuple[Dict[str, float], float]] = []
+        mean = total / float(vals.size)
+        return False if mean <= 0.0 else ((float(vals.max()) - float(vals.min())) / mean) < 0.01
+
+    def _topk_renorm(s: Dict[str, float], k: int) -> Dict[str, float]:
+        if not s:
+            return {}
+        items = sorted(((hk, float(v)) for hk, v in s.items() if float(v) > 0.0), key=lambda kv: -kv[1])[: int(k)]
+        if not items:
+            return {}
+        tot = float(sum(v for _hk, v in items))
+        if tot <= 0.0:
+            return {}
+        return {hk: (v / tot) for hk, v in items}
+
+    def _trim_hist_price(
+        hist_in: tuple[np.ndarray, Dict[str, int]], price_in: object
+    ) -> tuple[tuple[np.ndarray, Dict[str, int]] | None, np.ndarray | None]:
+        X_blk, hk2idx = hist_in
+        X_blk = np.asarray(X_blk, dtype=np.float32)
+        price_arr = np.asarray(price_in)
+        if MAX_BLOCK_HISTORY > 0:
+            if X_blk.shape[0] > MAX_BLOCK_HISTORY:
+                X_blk = X_blk[-MAX_BLOCK_HISTORY:]
+            if price_arr.shape[0] > MAX_BLOCK_HISTORY:
+                price_arr = price_arr[-MAX_BLOCK_HISTORY:]
+        L = int(min(X_blk.shape[0], price_arr.shape[0]))
+        if L <= 0:
+            return None, None
+        return (X_blk[-L:], hk2idx), price_arr[-L:]
+
+    per_challenge: List[Tuple[str, Dict[str, float], float]] = []
+    breakdown: Dict[str, Dict[str, float]] = {}
     total_w = 0.0
-    for ticker, payload in training_data.items():
-        spec = config.CHALLENGE_MAP.get(ticker)
-        if not spec:
+    for spec in config.CHALLENGES:
+        ticker = spec["ticker"]
+        payload = training_data.get(ticker)
+        if payload is None:
             continue
         loss_type = spec.get("loss_func")
         s: Dict[str, float] = {}
@@ -438,57 +455,39 @@ def multi_salience(
             if not isinstance(payload, dict):
                 continue
             hist = payload.get("hist")
-            price = payload.get("price")
-            blocks_ahead = int(payload.get("blocks_ahead", spec.get("blocks_ahead", 0) or 0))
+            price_raw = payload.get("price")
+            blocks_ahead = int(spec.get("blocks_ahead", 0) or 0)
             if (
                 not isinstance(hist, tuple)
                 or len(hist) != 2
-                or price is None
+                or price_raw is None
                 or blocks_ahead <= 0
             ):
                 continue
-            X_blk, hk2idx = hist
-            X_blk = np.asarray(X_blk, dtype=np.float32)
-            price_arr = np.asarray(price)
-            if MAX_BLOCK_HISTORY > 0:
-                if X_blk.shape[0] > MAX_BLOCK_HISTORY:
-                    X_blk = X_blk[-MAX_BLOCK_HISTORY:]
-                if price_arr.shape[0] > MAX_BLOCK_HISTORY:
-                    price_arr = price_arr[-MAX_BLOCK_HISTORY:]
-                L = int(min(X_blk.shape[0], price_arr.shape[0]))
-                if L <= 0:
-                    continue
-                X_blk = X_blk[-L:]
-                price_arr = price_arr[-L:]
-            hist = (X_blk, hk2idx)
-            price = price_arr
-            try:
-                s_cls = compute_lbfgs_salience(
-                    hist,
-                    price,
-                    blocks_ahead=blocks_ahead,
-                    sample_every=int(config.SAMPLE_EVERY),
-                )
-            except Exception:
-                s_cls = {}
-            try:
-                s_q = compute_q_path_salience(
-                    hist,
-                    price,
-                    blocks_ahead=blocks_ahead,
-                    sample_every=int(config.SAMPLE_EVERY),
-                )
-            except Exception:
-                s_q = {}
+            hist_price = _trim_hist_price(hist, price_raw)
+            if hist_price[0] is None:
+                continue
+            hist, price = hist_price
+            s_cls = compute_lbfgs_salience(
+                hist,
+                price,
+                blocks_ahead=blocks_ahead,
+                sample_every=int(config.SAMPLE_EVERY),
+            )
+            s_q = compute_q_path_salience(
+                hist,
+                price,
+                blocks_ahead=blocks_ahead,
+                sample_every=int(config.SAMPLE_EVERY),
+            )
             if _is_uniform_salience(s_cls):
                 s_cls = {}
             if _is_uniform_salience(s_q):
                 s_q = {}
-            
-            # Filter out uniform distribution fallback from LBFGS classifier
-            # If s_cls is uniform, it means the model failed to beat the baseline.
-            if s_cls and _is_uniform_salience(s_cls):
-                s_cls = {}
+
+            # Keep only top-10 from each salience stream, renormalised to sum to 1.
+            s_cls = _topk_renorm(s_cls, 10)
+            s_q = _topk_renorm(s_q, 10)
 
             keys = set(s_cls.keys()) | set(s_q.keys())
             s = {}
@@ -503,30 +502,19 @@ def multi_salience(
             if not isinstance(payload, dict):
                 continue
             hist = payload.get("hist")
-            price = payload.get("price")
-            blocks_ahead = int(payload.get("blocks_ahead", spec.get("blocks_ahead", 0) or 0))
+            price_raw = payload.get("price")
+            blocks_ahead = int(spec.get("blocks_ahead", 0) or 0)
             if (
                 not isinstance(hist, tuple)
                 or len(hist) != 2
-                or price is None
+                or price_raw is None
                 or blocks_ahead <= 0
             ):
                 continue
-            X_blk, hk2idx = hist
-            X_blk = np.asarray(X_blk, dtype=np.float32)
-            price_arr = np.asarray(price)
-            if MAX_BLOCK_HISTORY > 0:
-                if X_blk.shape[0] > MAX_BLOCK_HISTORY:
-                    X_blk = X_blk[-MAX_BLOCK_HISTORY:]
-                if price_arr.shape[0] > MAX_BLOCK_HISTORY:
-                    price_arr = price_arr[-MAX_BLOCK_HISTORY:]
-                L = int(min(X_blk.shape[0], price_arr.shape[0]))
-                if L <= 0:
-                    continue
-                X_blk = X_blk[-L:]
-                price_arr = price_arr[-L:]
-            hist = (X_blk, hk2idx)
-            price = price_arr
+            hist_price = _trim_hist_price(hist, price_raw)
+            if hist_price[0] is None:
+                continue
+            hist, price = hist_price
             s = compute_hitfirst_salience(
                 hist,
                 price,
@@ -540,16 +528,18 @@ def multi_salience(
             if total_challenge_score <= 0:
                 continue
             w = float(spec.get("weight", 1.0))
-            per_challenge.append((s, w))
+            breakdown[ticker] = dict(s)
+            per_challenge.append((ticker, s, w))
             total_w += w
     if not per_challenge or total_w <= 0:
-        return {}
-    all_hotkeys = set().union(*(s.keys() for s, _ in per_challenge))
+        return ({}, {}) if return_breakdown else {}
+    all_hotkeys = set().union(*(s.keys() for _t, s, _w in per_challenge))
     avg = {
-        hk: float(sum(s.get(hk, 0.0) * w for s, w in per_challenge)) / total_w
+        hk: float(sum(s.get(hk, 0.0) * w for _t, s, w in per_challenge)) / total_w
         for hk in all_hotkeys
     }
     total = float(sum(avg.values()))
-    return {hk: (v / total) for hk, v in avg.items()} if total > 0 else {}
+    out = {hk: (v / total) for hk, v in avg.items()} if total > 0 else {}
+    return (out, breakdown) if return_breakdown else out
 
 
