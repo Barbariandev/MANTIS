@@ -16,14 +16,13 @@ import bittensor as bt
 import torch
 import aiohttp
 from dotenv import load_dotenv
-import requests
 import numpy as np
 import pickle
 
 import config
 from cycle import get_miner_payloads
 from model import multi_salience as sal_fn
-from ledger import DataLog
+from ledger import DataLog, ensure_datalog
 
 LOG_DIR = os.path.join(os.getcwd(), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -41,6 +40,11 @@ weights_logger = logging.getLogger("weights")
 weights_logger.setLevel(logging.DEBUG)
 weights_logger.addHandler(
     logging.FileHandler(os.path.join(LOG_DIR, "weights.log"), mode="a")
+)
+per_challenge_logger = logging.getLogger("per_challenge_weights")
+per_challenge_logger.setLevel(logging.DEBUG)
+per_challenge_logger.addHandler(
+    logging.FileHandler(os.path.join(LOG_DIR, "per_challenge_weights.log"), mode="a")
 )
 
 for noisy in ("websockets", "aiohttp"):
@@ -70,27 +74,6 @@ def load_weights() -> dict | None:
         return None
     with open(WEIGHTS_PATH, "rb") as f:
         return pickle.load(f)
-
-
-async def _fetch_price_source(session, url, parse_json=True):
-    async with session.get(url, timeout=5) as resp:
-        resp.raise_for_status()
-        if parse_json:
-            return await resp.json()
-        else:
-            return await resp.text()
-
-async def _get_price_from_sources(session, source_list):
-    for name, url, parser in source_list:
-        try:
-            parse_json = not url.endswith("e=csv")
-            data = await _fetch_price_source(session, url, parse_json=parse_json)
-            price = parser(data)
-            if price is not None:
-                return price
-        except Exception:
-            continue
-    return None
 
 
 async def get_asset_prices(session: aiohttp.ClientSession) -> dict[str, float] | None:
@@ -153,15 +136,7 @@ def main():
     if not os.path.exists(DATALOG_PATH):
         try:
             logging.info(f"Attempting to download initial datalog from {config.DATALOG_ARCHIVE_URL} → {DATALOG_PATH}")
-            os.makedirs(os.path.dirname(DATALOG_PATH), exist_ok=True)
-            r = requests.get(config.DATALOG_ARCHIVE_URL, timeout=600, stream=True)
-            r.raise_for_status()
-            tmp = DATALOG_PATH + ".tmp"
-            with open(tmp, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-            os.replace(tmp, DATALOG_PATH)
+            ensure_datalog(DATALOG_PATH)
             logging.info("Downloaded datalog to local storage.")
         except Exception:
             logging.info("Remote datalog unavailable; starting with a new, empty ledger.")
@@ -217,7 +192,7 @@ async def save_loop(datalog: DataLog, do_save: bool, save_every_seconds: int, st
             break
         except Exception:
             logging.exception("An error occurred in the save loop.")
-    logging.info("⏹️ Save loop stopped.")
+    logging.info("Save loop stopped.")
 
 
 subtensor_lock = threading.Lock()
@@ -312,7 +287,34 @@ async def run_main_loop(
                         weights_logger.info(f"=== Starting weight calculation | block {block_snapshot} ===")
                         
                         weights_logger.info("Calculating salience...")
-                        general_sal_hk = sal_fn(training_data) if training_data else {}
+                        if training_data:
+                            general_sal_hk, per_challenge = sal_fn(training_data, return_breakdown=True)
+                        else:
+                            general_sal_hk, per_challenge = {}, {}
+                        if per_challenge:
+                            total_w = float(
+                                sum(float(config.CHALLENGE_MAP.get(t, {}).get("weight", 1.0)) for t in per_challenge.keys())
+                            )
+                            per_challenge_logger.info(
+                                json.dumps(
+                                    {
+                                        "block": int(block_snapshot),
+                                        "total_challenge_weight": total_w,
+                                        "per_challenge": {
+                                            t: {
+                                                "challenge_weight": float(config.CHALLENGE_MAP.get(t, {}).get("weight", 1.0)),
+                                                "salience": s,
+                                                "weighted": {
+                                                    hk: float(v) * float(config.CHALLENGE_MAP.get(t, {}).get("weight", 1.0))
+                                                    for hk, v in s.items()
+                                                },
+                                            }
+                                            for t, s in per_challenge.items()
+                                        },
+                                    },
+                                    sort_keys=True,
+                                )
+                            )
                         if not general_sal_hk:
                             weights_logger.info("Salience computation returned empty.")
 
