@@ -395,10 +395,18 @@ def salience_binary_prediction(
 
 
 def multi_salience(
-    training_data: Dict[str, object],
+    training_data,
     *,
     return_breakdown: bool = False,
 ) -> Dict[str, float] | tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
+    """Compute per-hotkey salience across all challenges.
+
+    ``training_data`` is an iterable of ``(ticker, payload)`` pairs (e.g. the
+    generator returned by ``DataLog.iter_challenge_training_data``).  Each
+    challenge is processed and then its payload is freed before loading the
+    next, keeping peak memory proportional to a single challenge at a time.
+    """
+
     def _is_uniform_salience(s: Dict[str, float]) -> bool:
         if not s:
             return True
@@ -439,24 +447,29 @@ def multi_salience(
     per_challenge: List[Tuple[str, Dict[str, float], float]] = []
     breakdown: Dict[str, Dict[str, float]] = {}
     total_w = 0.0
-    for spec in config.CHALLENGES:
-        ticker = spec["ticker"]
-        payload = training_data.get(ticker)
-        if payload is None:
+    for ticker, payload in training_data:
+        spec = config.CHALLENGE_MAP.get(ticker)
+        if spec is None:
+            del payload
             continue
         loss_type = spec.get("loss_func")
         s: Dict[str, float] = {}
         if loss_type == "binary":
             if not isinstance(payload, tuple) or len(payload) != 2:
+                del payload
                 continue
             hist, y = payload
+            del payload
             s = salience_binary_prediction(hist, y, ticker)
+            del hist, y
         elif loss_type == "lbfgs":
             if not isinstance(payload, dict):
+                del payload
                 continue
             hist = payload.get("hist")
             price_raw = payload.get("price")
             blocks_ahead = int(spec.get("blocks_ahead", 0) or 0)
+            del payload
             if (
                 not isinstance(hist, tuple)
                 or len(hist) != 2
@@ -465,6 +478,7 @@ def multi_salience(
             ):
                 continue
             hist_price = _trim_hist_price(hist, price_raw)
+            del price_raw
             if hist_price[0] is None:
                 continue
             hist, price = hist_price
@@ -480,6 +494,7 @@ def multi_salience(
                 blocks_ahead=blocks_ahead,
                 sample_every=int(config.SAMPLE_EVERY),
             )
+            del hist, price
             if _is_uniform_salience(s_cls):
                 s_cls = {}
             if _is_uniform_salience(s_q):
@@ -500,10 +515,12 @@ def multi_salience(
                 s = {k: (v / tot) for k, v in s.items()}
         elif loss_type == "hitfirst":
             if not isinstance(payload, dict):
+                del payload
                 continue
             hist = payload.get("hist")
             price_raw = payload.get("price")
             blocks_ahead = int(spec.get("blocks_ahead", 0) or 0)
+            del payload
             if (
                 not isinstance(hist, tuple)
                 or len(hist) != 2
@@ -512,6 +529,7 @@ def multi_salience(
             ):
                 continue
             hist_price = _trim_hist_price(hist, price_raw)
+            del price_raw
             if hist_price[0] is None:
                 continue
             hist, price = hist_price
@@ -521,7 +539,12 @@ def multi_salience(
                 blocks_ahead=blocks_ahead,
                 sample_every=int(config.SAMPLE_EVERY),
             )
+            del hist, price
+        elif loss_type == "range_breakout_multi":
+            del payload
+            continue
         else:
+            del payload
             continue
         if s:
             total_challenge_score = float(sum(s.values()))
