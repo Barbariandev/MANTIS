@@ -31,10 +31,6 @@ TOP_K = 25
 
 
 class LinearEnsembleOptimizer(nn.Module):
-    """
-    Learns a weighted mixture over miner 5-bucket probability vectors (p[0:5]).
-    """
-
     def __init__(self, num_miners: int, num_buckets: int = 5):
         super().__init__()
         self.miner_weights = nn.Parameter(torch.ones(num_miners) / max(num_miners, 1))
@@ -58,32 +54,45 @@ class LinearEnsembleOptimizer(nn.Module):
         X: np.ndarray,
         y: np.ndarray,
         *,
-        epochs: int = 20,
+        max_epochs: int = 80,
+        patience: int = 15,
         lr: float = 0.05,
         batch_size: int = 1024,
         device: str = "cpu",
         class_weights: Optional[np.ndarray] = None,
         sample_weights: Optional[np.ndarray] = None,
+        val_split: float = 0.15,
         verbose: bool = False,
     ) -> "LinearEnsembleOptimizer":
         self.to(device)
 
-        X_t = torch.as_tensor(X, dtype=torch.float32, device=device)
-        y_t = torch.as_tensor(y, dtype=torch.long, device=device)
+        n = int(X.shape[0])
+        val_size = int(n * val_split)
+        train_size = n - val_size
+
+        X_train = torch.as_tensor(X[:train_size], dtype=torch.float32, device=device)
+        y_train = torch.as_tensor(y[:train_size], dtype=torch.long, device=device)
+        X_val = torch.as_tensor(X[train_size:], dtype=torch.float32, device=device)
+        y_val = torch.as_tensor(y[train_size:], dtype=torch.long, device=device)
+
         cw_t = torch.as_tensor(class_weights, dtype=torch.float32, device=device) if class_weights is not None else None
 
         if sample_weights is None:
-            sw = np.ones(int(X_t.shape[0]), dtype=np.float32)
+            sw = np.ones(train_size, dtype=np.float32)
         else:
-            sw = np.asarray(sample_weights, dtype=np.float32)
+            sw = np.asarray(sample_weights[:train_size], dtype=np.float32)
         sw_t = torch.as_tensor(sw, dtype=torch.float32, device=device)
 
-        dataset = torch.utils.data.TensorDataset(X_t, y_t, sw_t)
+        dataset = torch.utils.data.TensorDataset(X_train, y_train, sw_t)
         loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
         optimizer = optim.Adam(self.parameters(), lr=lr)
 
-        for epoch in range(int(epochs)):
+        best_val_loss = float("inf")
+        best_state = None
+        epochs_no_improve = 0
+
+        for epoch in range(int(max_epochs)):
             self.train()
             train_loss = 0.0
             for xb, yb, wb in loader:
@@ -96,12 +105,33 @@ class LinearEnsembleOptimizer(nn.Module):
                 optimizer.step()
                 train_loss += float(loss.item())
 
+            self.eval()
+            with torch.no_grad():
+                val_logits = self(X_val)
+                val_loss = float(F.cross_entropy(val_logits, y_val, weight=cw_t).item())
+
+            if val_loss < best_val_loss - 1e-5:
+                best_val_loss = val_loss
+                best_state = {k: v.clone() for k, v in self.state_dict().items()}
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+
             if verbose and (epoch % 10 == 0):
                 logger.info(
-                    "LinearEnsemble epoch %d | train=%.4f",
+                    "LinearEnsemble epoch %d | train=%.4f | val=%.4f",
                     epoch,
                     train_loss / max(len(loader), 1),
+                    val_loss,
                 )
+
+            if epochs_no_improve >= patience:
+                if verbose:
+                    logger.info("Early stopping at epoch %d", epoch)
+                break
+
+        if best_state is not None:
+            self.load_state_dict(best_state)
         return self
 
 
@@ -111,7 +141,7 @@ def compute_linear_salience(
     *,
     blocks_ahead: int,
     sample_every: int,
-    epochs: int = 20,
+    max_epochs: int = 80,
     device: str = "cpu",
 ) -> Dict[str, float]:
     X_flat, hk2idx = hist
@@ -158,9 +188,7 @@ def compute_linear_salience(
 
     num_miners = len(hk2idx)
     model = LinearEnsembleOptimizer(num_miners=num_miners, num_buckets=5)
-    if device == "cpu" and torch.cuda.is_available():
-        device = "cuda"
-    model.fit(X_train, y_train, epochs=epochs, device=device, class_weights=class_weights, sample_weights=sw)
+    model.fit(X_train, y_train, max_epochs=max_epochs, device="cpu", class_weights=class_weights, sample_weights=sw)
 
     model.eval()
     with torch.no_grad():
@@ -249,15 +277,13 @@ def compute_q_path_salience(
     if len_r <= 1:
         return {}
 
-    # Bucket labels (same construction as p-only path).
     vol_window = max(required // 2, 1000)
     y_all, valid_idx = make_bins_from_price(price, horizon_steps=horizon_steps, vol_window=vol_window)
     y_r = np.full(len_r, -1, dtype=int)
     if valid_idx.size > 0:
         y_r[valid_idx] = y_all
 
-    # Sigma for thresholds (rolling std of horizon-step returns).
-    r_h = np.log(price[horizon_steps:] + EPS) - np.log(price[:-horizon_steps] + EPS)  # len_r
+    r_h = np.log(price[horizon_steps:] + EPS) - np.log(price[:-horizon_steps] + EPS)
     vol_window_q = int(max(MIN_REQUIRED_SAMPLES, 10))
     sig_raw = rolling_std_fast(r_h, vol_window_q)
     sigma_h = np.full(len_r, np.nan)
@@ -267,12 +293,11 @@ def compute_q_path_salience(
     logp = np.log(price + EPS)
     from numpy.lib.stride_tricks import sliding_window_view
 
-    win = sliding_window_view(logp, int(horizon_steps) + 1)  # (len_r, horizon_steps+1)
+    win = sliding_window_view(logp, int(horizon_steps) + 1)
     max_lp = win.max(axis=1)
     min_lp = win.min(axis=1)
 
-    # We need t>=1 for base price[t-1].
-    t0 = np.arange(1, len_r, dtype=int)  # actual time indices
+    t0 = np.arange(1, len_r, dtype=int)
     base_lp = logp[t0 - 1]
     up = max_lp[t0] - base_lp
     dn = min_lp[t0] - base_lp
@@ -287,12 +312,11 @@ def compute_q_path_salience(
     hit_up = up[:, None] >= (thr_mult[None, :] * sig[:, None])
     hit_dn = dn[:, None] <= -(thr_mult[None, :] * sig[:, None])
 
-    # Q slices in the 17-dim embedding
     Q_START = {0: 5, 1: 8, 3: 11, 4: 14}
 
     Xr = np.asarray(X_flat[:len_r], dtype=float).reshape(len_r, H, 17)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu"
     lr = 0.05
     epochs = 20
     batch_size = 4096
@@ -319,7 +343,7 @@ def compute_q_path_salience(
         w = (sw * w_cls).astype(np.float32)
         s = float(np.sum(w))
         if s > 0.0:
-            w *= float(N / s)  # mean ~ 1
+            w *= float(N / s)
 
         X_t = torch.as_tensor(x_logits, dtype=torch.float32, device=device)
         y_t = torch.as_tensor(y, dtype=torch.float32, device=device)
@@ -358,7 +382,6 @@ def compute_q_path_salience(
             continue
         t_sel = t0[mask_c]
 
-        # Recency weights are based on the global time index (minute index).
         sw = recent_mass_weights(t_sel.astype(float), recent_samples=RECENT_SAMPLES, recent_mass=RECENT_MASS)
 
         hits = hit_dn[mask_c] if int(c) in (3, 4) else hit_up[mask_c]
@@ -368,7 +391,7 @@ def compute_q_path_salience(
             if y_hit.size < 100 or np.unique(y_hit).size < 2:
                 continue
 
-            q_raw = Xr[t_sel, :, start + j]  # (N,H), zeros mean missing
+            q_raw = Xr[t_sel, :, start + j]
             q = np.asarray(q_raw, dtype=float)
             q[q == 0.0] = 0.5
             q = np.clip(q, EPS, 1.0 - EPS)
@@ -383,7 +406,6 @@ def compute_q_path_salience(
 
     w_avg = np.mean(np.stack(per_model_weights, axis=0), axis=0)
 
-    # Top-K pruning to match p-only output sparsity.
     if w_avg.shape[0] > TOP_K:
         order = np.argsort(-w_avg)
         keep = order[:TOP_K]
@@ -401,5 +423,6 @@ def compute_q_path_salience(
         if hk is not None and float(w_avg[i]) > 0.0:
             sal[hk] = float(w_avg[i])
     return sal
+
 
 
