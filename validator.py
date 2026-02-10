@@ -4,8 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import gc
 import logging
 import os
+
+os.environ.setdefault("MALLOC_ARENA_MAX", "4")
 import threading
 import time
 import asyncio
@@ -53,7 +57,7 @@ for noisy in ("websockets", "aiohttp"):
 load_dotenv()
 
 os.makedirs(config.STORAGE_DIR, exist_ok=True)
-DATALOG_PATH = os.path.join(config.STORAGE_DIR, "mantis_datalog.pkl")
+DATALOG_PATH = os.path.join(config.STORAGE_DIR, "mantis_datalog.db")
 WEIGHTS_PATH = os.path.join(config.STORAGE_DIR, "saved_weights.pkl")
 SAVE_INTERVAL = 480
 
@@ -96,6 +100,11 @@ async def get_asset_prices(session: aiohttp.ClientSession) -> dict[str, float] |
                         out[ticker] = fv
                 except Exception:
                     pass
+            for asset in getattr(config, "BREAKOUT_ASSETS", []):
+                if asset not in out:
+                    v = fetched.get(asset)
+                    if isinstance(v, (int, float)) and 0 < v < float('inf'):
+                        out[asset] = float(v)
             logging.info(f"Fetched prices, filled zeros where missing: {out}")
             return out
     except Exception as e:
@@ -120,13 +129,19 @@ def main():
         default=SAVE_INTERVAL * 12,
         help="How often to save the datalog, in seconds (default: SAVE_INTERVAL blocks * 12s).",
     )
+    p.add_argument(
+        "--skip-set-weights",
+        action="store_true",
+        default=False,
+        help="Skip weight setting on-chain (useful for unregistered keys).",
+    )
     args = p.parse_args()
 
     while True:
         try:
-            sub = bt.subtensor(network=args.network)
-            wallet = bt.wallet(name=getattr(args, "wallet.name"), hotkey=getattr(args, "wallet.hotkey"))
-            mg = bt.metagraph(netuid=args.netuid, network=args.network, sync=True)
+            sub = bt.Subtensor(network=args.network)
+            wallet = bt.Wallet(name=getattr(args, "wallet.name"), hotkey=getattr(args, "wallet.hotkey"))
+            mg = bt.Metagraph(netuid=args.netuid, network=args.network, sync=True)
             break
         except Exception as e:
             logging.exception("Subtensor connect failed")
@@ -198,7 +213,7 @@ async def save_loop(datalog: DataLog, do_save: bool, save_every_seconds: int, st
 subtensor_lock = threading.Lock()
 
 
-async def get_current_block_with_retry(sub: bt.subtensor, lock: threading.Lock, timeout: int = 10) -> int:
+async def get_current_block_with_retry(sub: bt.Subtensor, lock: threading.Lock, timeout: int = 10) -> int:
     retry_delay = 5
     while True:
         try:
@@ -226,9 +241,9 @@ async def get_current_block_with_retry(sub: bt.subtensor, lock: threading.Lock, 
 
 async def run_main_loop(
     args: argparse.Namespace,
-    sub: bt.subtensor,
-    wallet: bt.wallet,
-    mg: bt.metagraph,
+    sub: bt.Subtensor,
+    wallet: bt.Wallet,
+    mg: bt.Metagraph,
     datalog: DataLog,
     stop_event: asyncio.Event,
 ):
@@ -273,24 +288,24 @@ async def run_main_loop(
                 if (
                     current_block % config.WEIGHT_CALC_INTERVAL == 0
                     and (weight_thread is None or not weight_thread.is_alive())
-                    and len(datalog.blocks) >= config.LAG * 2 + 1
+                    and datalog.block_count >= config.LAG * 2 + 1
                 ):
-                    datalog_clone = copy.deepcopy(datalog)
+                    def calc_worker(db_path, block_snapshot, metagraph, cli_args):
+                        _t0 = time.monotonic()
+                        max_block = block_snapshot - config.TASK_INTERVAL
 
-                    def calc_worker(dlog, block_snapshot, metagraph, cli_args):
-                        training_data = dlog.get_training_data_sync(
-                            max_block_number=block_snapshot - config.TASK_INTERVAL
-                        )
-                        if not training_data:
-                            weights_logger.warning("Not enough data for salience, but checking for young UIDs.")
-                        
                         weights_logger.info(f"=== Starting weight calculation | block {block_snapshot} ===")
-                        
-                        weights_logger.info("Calculating salience...")
-                        if training_data:
-                            general_sal_hk, per_challenge = sal_fn(training_data, return_breakdown=True)
-                        else:
-                            general_sal_hk, per_challenge = {}, {}
+                        weights_logger.info("Streaming training data from SQLite (one challenge at a time)...")
+
+                        training_iter = DataLog.iter_challenge_training_data(db_path, max_block_number=max_block)
+
+                        _t1 = time.monotonic()
+                        general_sal_hk, per_challenge = sal_fn(training_iter, return_breakdown=True)
+                        weights_logger.info(
+                            f"Salience took {time.monotonic()-_t1:.1f}s, "
+                            f"hotkeys={len(general_sal_hk)}, "
+                            f"challenges={list(per_challenge.keys())}"
+                        )
                         if per_challenge:
                             total_w = float(
                                 sum(float(config.CHALLENGE_MAP.get(t, {}).get("weight", 1.0)) for t in per_challenge.keys())
@@ -324,18 +339,14 @@ async def run_main_loop(
 
                         if not sal:
                             weights_logger.warning("Salience is empty. Cannot calculate weights - insufficient training data.")
-                            return  # don't proceed with empty salience
-                        
+                            return
+
                         uids = metagraph.uids.tolist()
 
-                        SAMPLE_EVERY = int(config.SAMPLE_EVERY)
                         young_threshold = 36000
-                        hotkey_first_block: dict[str, int] = {}
-                        for ch in dlog.challenges.values():
-                            for sidx, data in ch.sidx.items():
-                                for hk, vec in data["emb"].items():
-                                    if hk not in hotkey_first_block and np.any(vec != 0):
-                                        hotkey_first_block[hk] = int(sidx) * SAMPLE_EVERY
+                        hotkey_first_block = DataLog.get_hotkey_first_blocks_from_db(
+                            db_path, int(config.SAMPLE_EVERY),
+                        )
 
                         young_uids = set()
                         for hk, first_block in hotkey_first_block.items():
@@ -378,23 +389,21 @@ async def run_main_loop(
                         
                         normalized_weights = {uid: w / total_weight for uid, w in final_weights.items()}
 
+                        burn_pct = float(getattr(config, "BURN_PCT", 0.0))
+                        if burn_pct > 0:
+                            for uid in normalized_weights:
+                                normalized_weights[uid] *= (1.0 - burn_pct)
+                            normalized_weights[0] = normalized_weights.get(0, 0.0) + burn_pct
+                            weights_logger.info(f"Reserved {burn_pct*100:.0f}% for UID 0 (burn)")
+
                         w = torch.tensor([normalized_weights.get(uid, 0.0) for uid in uids], dtype=torch.float32)
                         
-                        # Check for uniform weights (bug indicator)
                         non_zero_count = (w > 0).sum().item()
                         if non_zero_count > 0:
-                            # Filter out degenerate distributions where all active uids have exactly the same weight
-                            # This usually indicates a fallback/failure mode in the model
                             unique_values = torch.unique(w[w > 0])
-                            
-                            # Check if all non-zero weights are identical (within tolerance)
-                            # This catches both uniform distributions and "uniform subset" fallbacks
                             if len(unique_values) == 1:
                                 weights_logger.warning(f"Detected degenerate uniform weights ({unique_values[0]:.6f}). Skipping set to allow averaging with other challenges.")
                                 return
-                            
-                            # Also check for near-uniformity (variance threshold)
-                            # If standard deviation is extremely low relative to mean
                             if non_zero_count > 1:
                                 mean_val = w[w > 0].mean()
                                 std_val = w[w > 0].std()
@@ -415,35 +424,47 @@ async def run_main_loop(
                         save_weights(final_w, uids, block_snapshot)
                         weights_logger.info(f"Weights calculated and saved at block {block_snapshot} (max={final_w.max():.4f})")
 
+                        del general_sal_hk, per_challenge, sal
+                        del final_w, normalized_weights, w
+                        gc.collect()
+                        try:
+                            ctypes.CDLL("libc.so.6").malloc_trim(0)
+                        except OSError:
+                            pass
+                        weights_logger.info("Post-calc memory cleanup done.")
+
                     weight_thread = threading.Thread(
                         target=calc_worker,
-                        args=(datalog_clone, current_block, copy.deepcopy(mg), copy.deepcopy(args)),
+                        args=(DATALOG_PATH, current_block, copy.deepcopy(mg), copy.deepcopy(args)),
                         daemon=True,
                     )
                     weight_thread.start()
                 
                 if current_block % config.WEIGHT_SET_INTERVAL == 0:
-                    weights_data = load_weights()
-                    if weights_data is None:
-                        logging.info(f"No saved weights found at block {current_block}, skipping weight setting.")
+                    if args.skip_set_weights:
+                        logging.info(f"Block {current_block}: --skip-set-weights active, not setting weights on-chain.")
                     else:
-                        calc_block = weights_data.get("block", "unknown")
-                        final_w = weights_data["weights"]
-                        saved_uids = weights_data["uids"]
-                        
-                        weights_logger.info(f"Setting weights from saved array (calculated at block {calc_block})")
-                        
-                        if list(saved_uids) != mg.uids.tolist():
-                            weights_logger.warning("UID mismatch between saved weights and current metagraph, skipping.")
+                        weights_data = load_weights()
+                        if weights_data is None:
+                            logging.info(f"No saved weights found at block {current_block}, skipping weight setting.")
                         else:
-                            sub.set_weights(
-                                netuid=args.netuid,
-                                wallet=wallet,
-                                uids=mg.uids,
-                                weights=final_w,
-                                wait_for_inclusion=False,
-                            )
-                            weights_logger.info(f"Weights set at block {current_block} (from block {calc_block}, max={final_w.max():.4f})")
+                            calc_block = weights_data.get("block", "unknown")
+                            final_w = weights_data["weights"]
+                            saved_uids = weights_data["uids"]
+                            
+                            weights_logger.info(f"Setting weights from saved array (calculated at block {calc_block})")
+                            
+                            if list(saved_uids) != mg.uids.tolist():
+                                weights_logger.warning("UID mismatch between saved weights and current metagraph, skipping.")
+                            else:
+                                sub.set_weights(
+                                    netuid=args.netuid,
+                                    wallet=wallet,
+                                    uids=mg.uids,
+                                    weights=final_w,
+                                    wait_for_inclusion=False,
+                                )
+                                weights_logger.info(f"Weights set at block {current_block} (from block {calc_block}, max={final_w.max():.4f})")
 
             except KeyboardInterrupt:
                 stop_event.set()
@@ -459,6 +480,8 @@ async def run_main_loop(
 
 if __name__ == "__main__":
     main()
+
+
 
 
 
