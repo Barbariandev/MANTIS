@@ -133,8 +133,8 @@ if [[ "$PREBUILT" -eq 0 ]]; then
   fi
   # shellcheck disable=SC1090
   source "$HOME/.cargo/env"
-  rustup toolchain install -q stable
-  rustup default -q stable
+  rustup toolchain install stable 2>/dev/null
+  rustup default stable 2>/dev/null
 
   step "Cloning/updating timelock sources"
   if [[ ! -d "$SRC/.git" ]]; then
@@ -146,6 +146,8 @@ if [[ "$PREBUILT" -eq 0 ]]; then
   # Backward-compat fix for ark_std rename (no-op if not needed)
   if [[ -d "$SRC/wasm/src" ]]; then
     sed -i.bak 's|ark_std::rand::rng::OsRng|ark_std::rand::rngs::OsRng|g' "$SRC/wasm/src/"{py,js}.rs || true
+    # Fix Identity::new borrow: upstream changed signature to expect &[u8]
+    sed -i 's|Identity::new(b"", id)|Identity::new(b"", \&id)|g' "$SRC/wasm/src/"{py,js}.rs || true
   fi
 
   step "Building timelock_wasm_wrapper for this interpreter"
@@ -180,6 +182,5 @@ fi
 echo
 ok "Timelock ready in $VENV"
 echo "Activate with:  source \"$VENV/bin/activate\""
-
 
 
