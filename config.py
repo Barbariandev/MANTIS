@@ -105,9 +105,36 @@ CHALLENGES = [
         "weight": 1,
     },
 ]
+
+BREAKOUT_ASSETS = [
+    "BTC", "ETH", "XRP", "SOL", "TRX", "DOGE", "ADA", "BCH", "XMR",
+    "LINK", "LEO", "HYPE", "XLM", "ZEC", "SUI", "LTC", "AVAX", "HBAR", "SHIB",
+    "TON", "CRO", "DOT", "UNI", "MNT", "BGB", "TAO", "AAVE", "PEPE",
+    "NEAR", "ICP", "ETC", "ONDO", "SKY",
+]
+
+MULTI_BREAKOUT_CHALLENGE = {
+    "name": "MULTI-BREAKOUT",
+    "ticker": "MULTIBREAKOUT",
+    "assets": BREAKOUT_ASSETS,
+    "dim": 2,
+    "loss_func": "range_breakout_multi",
+    "range_lookback_blocks": 28800,
+    "barrier_pct": 25.0,
+    "min_range_pct": 1.0,
+    "weight": 5.0,
+    "gate_top_pct": 0.10,
+}
+
+CHALLENGES.append(MULTI_BREAKOUT_CHALLENGE)
+
 CHALLENGE_MAP = {c["ticker"]: c for c in CHALLENGES}
 CHALLENGE_NAME_TO_TICKER = {c["name"]: c["ticker"] for c in CHALLENGES}
 ASSET_EMBEDDING_DIMS = {c["ticker"]: c["dim"] for c in CHALLENGES}
+
+BURN_PCT = 0.30
+
+MAX_DAYS = 60
 
 MAX_UNCHANGED_TIMESTEPS = 15
 
@@ -138,5 +165,6 @@ DRAND_PUBLIC_KEY = (
     "8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb"
     "5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a"
 )
+
 
 
