@@ -29,7 +29,7 @@ from urllib.parse import urlparse
 logger = logging.getLogger(__name__)
 
 NETWORK = "finney"
-sub = bt.subtensor(network=NETWORK)
+sub = bt.Subtensor(network=NETWORK)
 
 MAX_PAYLOAD_BYTES = 25 * 1024 * 1024
 
@@ -44,10 +44,10 @@ def _is_valid_r2_url(url: str) -> bool:
         return False
 
 async def get_miner_payloads(
-    netuid: int = 123, mg: bt.metagraph = None
+    netuid: int = 123, mg: bt.Metagraph = None
 ) -> dict[str, dict]:
     if mg is None:
-        mg = bt.metagraph(netuid=netuid, network=NETWORK, sync=True)
+        mg = bt.Metagraph(netuid=netuid, network=NETWORK, sync=True)
     
     commits = sub.get_all_commitments(netuid)
     uid_to_hotkey = dict(zip(mg.uids.tolist(), mg.hotkeys))
@@ -100,4 +100,5 @@ async def get_miner_payloads(
         await asyncio.sleep(0.1)
 
     return payloads
+
 
