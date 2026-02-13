@@ -44,6 +44,11 @@ SAMPLE_EVERY = config.SAMPLE_EVERY
 DRAND_SIGNATURE_RETRIES = 3
 DRAND_SIGNATURE_RETRY_DELAY = 1.0
 
+# Storage dim for MULTIBREAKOUT: 2 floats per asset, flattened across all BREAKOUT_ASSETS.
+# config.MULTI_BREAKOUT_CHALLENGE["dim"] stays 2 (the per-asset dimension) but storage
+# needs the full vector so per-asset predictions survive the pack/unpack round-trip.
+_MB_STORAGE_DIM = 2 * len(config.BREAKOUT_ASSETS)
+
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS blocks (
     idx INTEGER PRIMARY KEY,
@@ -494,15 +499,17 @@ class DataLog:
         if not self._breakout_trackers:
             return
 
-        latest_emb: Dict[str, np.ndarray] = {}
-        dim = config.ASSET_EMBEDDING_DIMS.get("MULTIBREAKOUT", 2)
+        full_emb: Dict[str, np.ndarray] = {}
+        dim = _MB_STORAGE_DIM
         row = self._conn.execute(
             "SELECT embeddings FROM challenge_data "
             "WHERE ticker='MULTIBREAKOUT' AND embeddings IS NOT NULL AND length(embeddings) > 0 "
             "ORDER BY sidx DESC LIMIT 1"
         ).fetchone()
         if row and row[0]:
-            latest_emb = _unpack_embeddings(row[0], dim)
+            full_emb = _unpack_embeddings(row[0], dim)
+
+        asset_indices = {asset: i for i, asset in enumerate(config.BREAKOUT_ASSETS)}
 
         for asset, tracker in self._breakout_trackers.items():
             p = prices.get(asset)
@@ -514,7 +521,18 @@ class DataLog:
             if not p or p <= 0:
                 continue
             tracker.update_price(sidx, p)
-            tracker.check_trigger(sidx, block, p, latest_emb)
+
+            idx = asset_indices.get(asset)
+            if idx is not None and full_emb:
+                start = idx * 2
+                asset_emb = {}
+                for hk, full_vec in full_emb.items():
+                    if full_vec.shape[0] >= start + 2:
+                        asset_emb[hk] = full_vec[start:start + 2]
+                tracker.check_trigger(sidx, block, p, asset_emb)
+            else:
+                tracker.check_trigger(sidx, block, p, {})
+
             tracker.check_resolutions(block, p)
 
     async def _get_drand_signature(self, round_num: int, session: aiohttp.ClientSession | None = None) -> bytes | None:
@@ -565,7 +583,10 @@ class DataLog:
         return sig
 
     def _zero_vecs(self):
-        return {c["ticker"]: [0.0] * c["dim"] for c in config.CHALLENGES}
+        return {
+            c["ticker"]: [0.0] * (_MB_STORAGE_DIM if c["ticker"] == "MULTIBREAKOUT" else c["dim"])
+            for c in config.CHALLENGES
+        }
 
     def _validate_submission(self, sub: Any) -> Dict[str, List[float]]:
         def _sanitize_lbfgs_vec(vec: List[float]) -> List[float]:
@@ -585,12 +606,26 @@ class DataLog:
             out = np.concatenate([p, q]).astype(float)
             return out.tolist()
 
+        def _flatten_multibreakout_dict(d: dict) -> List[float]:
+            flat: List[float] = []
+            for asset in config.BREAKOUT_ASSETS:
+                pair = d.get(asset)
+                if (isinstance(pair, list) and len(pair) == 2
+                        and all(isinstance(v, (int, float)) and 0 <= v <= 1 for v in pair)):
+                    flat.extend([float(pair[0]), float(pair[1])])
+                else:
+                    flat.extend([0.0, 0.0])
+            return flat
+
         if isinstance(sub, list) and len(sub) == len(config.CHALLENGES):
             out = {}
             for vec, c in zip(sub, config.CHALLENGES):
-                dim = c["dim"]
+                dim = _MB_STORAGE_DIM if c["ticker"] == "MULTIBREAKOUT" else c["dim"]
                 ticker = c["ticker"]
                 spec = config.CHALLENGE_MAP.get(ticker)
+                if ticker == "MULTIBREAKOUT" and isinstance(vec, dict):
+                    out[ticker] = _flatten_multibreakout_dict(vec)
+                    continue
                 if isinstance(vec, list) and len(vec) == dim:
                     if spec and spec.get("loss_func") == "lbfgs":
                         out[ticker] = _sanitize_lbfgs_vec(vec) if dim == 17 else [0.0] * dim
@@ -609,7 +644,10 @@ class DataLog:
                 ticker = key if key in config.CHALLENGE_MAP else config.CHALLENGE_NAME_TO_TICKER.get(key)
                 if not ticker:
                     continue
-                dim = config.ASSET_EMBEDDING_DIMS.get(ticker)
+                if ticker == "MULTIBREAKOUT" and isinstance(vec, dict):
+                    out[ticker] = _flatten_multibreakout_dict(vec)
+                    continue
+                dim = _MB_STORAGE_DIM if ticker == "MULTIBREAKOUT" else config.ASSET_EMBEDDING_DIMS.get(ticker)
                 if not isinstance(vec, list) or len(vec) != dim:
                     continue
                 spec = config.CHALLENGE_MAP.get(ticker)
@@ -733,7 +771,7 @@ class DataLog:
         async with self._lock:
             c = self._conn.cursor()
             for (ticker, sidx), new_embs in emb_updates.items():
-                dim = config.ASSET_EMBEDDING_DIMS.get(ticker, 0)
+                dim = _MB_STORAGE_DIM if ticker == "MULTIBREAKOUT" else config.ASSET_EMBEDDING_DIMS.get(ticker, 0)
                 row = c.execute(
                     "SELECT hotkeys, embeddings FROM challenge_data WHERE ticker=? AND sidx=?",
                     (ticker, sidx),
