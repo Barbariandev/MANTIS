@@ -121,13 +121,14 @@ def main():
         "--do_save",
         action="store_true",
         default=False,
-        help="Whether to save the datalog periodically."
+        help="Enable periodic full save (WAL checkpoint + integrity check). "
+             "Breakout state is always persisted automatically regardless.",
     )
     p.add_argument(
         "--save-every-seconds",
         type=int,
         default=SAVE_INTERVAL * 12,
-        help="How often to save the datalog, in seconds (default: SAVE_INTERVAL blocks * 12s).",
+        help="How often to run a full save when --do_save is set, in seconds.",
     )
     p.add_argument(
         "--skip-set-weights",
@@ -167,11 +168,8 @@ def main():
     finally:
         stop_event.set()
         if args.do_save:
-            try:
-                logging.info("Final save on shutdown...")
-                asyncio.run(datalog.save(DATALOG_PATH))
-            except Exception:
-                logging.exception("Final save failed.")
+            logging.info("Final save on shutdown...")
+            asyncio.run(datalog.save(DATALOG_PATH))
         logging.info("Shutdown complete.")
 
 
@@ -190,23 +188,14 @@ async def decrypt_loop(datalog: DataLog, stop_event: asyncio.Event):
 
 async def save_loop(datalog: DataLog, do_save: bool, save_every_seconds: int, stop_event: asyncio.Event):
     if not do_save:
-        logging.info("DO_SAVE is False, skipping periodic saves.")
         return
-    logging.info("Save loop started.")
-    try:
-        logging.info("Initiating initial datalog save...")
-        await datalog.save(DATALOG_PATH)
-    except Exception:
-        logging.exception("Initial save failed.")
+    logging.info("Save loop started (every %ds).", save_every_seconds)
     while not stop_event.is_set():
-        try:
-            await asyncio.sleep(save_every_seconds)
-            logging.info("Initiating periodic datalog save...")
-            await datalog.save(DATALOG_PATH)
-        except asyncio.CancelledError:
+        await asyncio.sleep(save_every_seconds)
+        if stop_event.is_set():
             break
-        except Exception:
-            logging.exception("An error occurred in the save loop.")
+        logging.info("Periodic full save...")
+        await datalog.save(DATALOG_PATH)
     logging.info("Save loop stopped.")
 
 
@@ -273,8 +262,6 @@ async def run_main_loop(
                     with subtensor_lock:
                         mg.sync(subtensor=sub)
                     logging.info("Metagraph synced.")
-                    async with datalog._lock:
-                        datalog.prune_hotkeys(mg.hotkeys)
 
                 asset_prices = await get_asset_prices(session)
                 if not asset_prices:
@@ -297,7 +284,10 @@ async def run_main_loop(
                         weights_logger.info(f"=== Starting weight calculation | block {block_snapshot} ===")
                         weights_logger.info("Streaming training data from SQLite (one challenge at a time)...")
 
-                        training_iter = DataLog.iter_challenge_training_data(db_path, max_block_number=max_block)
+                        active_hks = set(metagraph.hotkeys)
+                        training_iter = DataLog.iter_challenge_training_data(
+                            db_path, max_block_number=max_block, active_hotkeys=active_hks,
+                        )
 
                         _t1 = time.monotonic()
                         general_sal_hk, per_challenge = sal_fn(training_iter, return_breakdown=True)
