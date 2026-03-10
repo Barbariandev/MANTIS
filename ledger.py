@@ -22,7 +22,7 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 """
-import asyncio, json, logging, os, pickle, gzip, hashlib, sqlite3, time
+import asyncio, json, logging, os, hashlib, sqlite3, time
 import requests
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -48,6 +48,15 @@ DRAND_SIGNATURE_RETRY_DELAY = 1.0
 # config.MULTI_BREAKOUT_CHALLENGE["dim"] stays 2 (the per-asset dimension) but storage
 # needs the full vector so per-asset predictions survive the pack/unpack round-trip.
 _MB_STORAGE_DIM = 2 * len(config.BREAKOUT_ASSETS)
+def _get_storage_dim(ticker: str) -> int:
+    spec = config.CHALLENGE_MAP.get(ticker)
+    if not spec:
+        return config.ASSET_EMBEDDING_DIMS.get(ticker, 0)
+    assets = spec.get("assets")
+    if assets:
+        return spec["dim"] * len(assets)
+    return spec["dim"]
+
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS blocks (
@@ -63,6 +72,7 @@ CREATE TABLE IF NOT EXISTS challenge_data (
     ticker TEXT NOT NULL,
     sidx INTEGER NOT NULL,
     price REAL,
+    price_data TEXT,
     hotkeys TEXT,
     embeddings BLOB,
     PRIMARY KEY (ticker, sidx)
@@ -83,6 +93,13 @@ CREATE TABLE IF NOT EXISTS breakout_state (
 );
 CREATE INDEX IF NOT EXISTS idx_blocks_block ON blocks(block);
 """
+
+
+def _ensure_price_data_col(conn):
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(challenge_data)")}
+    if "price_data" not in cols:
+        conn.execute("ALTER TABLE challenge_data ADD COLUMN price_data TEXT")
+        conn.commit()
 
 
 def _pack_embeddings(emb: Dict[str, np.ndarray]) -> bytes:
@@ -109,30 +126,18 @@ def _unpack_embeddings(blob: bytes, dim: int) -> Dict[str, np.ndarray]:
 def ensure_datalog(path: str) -> str:
     if os.path.exists(path):
         return path
-    base, _ = os.path.splitext(path)
-    for ext in (".db", ".pkl", ".pkl.gz"):
-        candidate = base + ext
-        if candidate != path and os.path.exists(candidate):
-            return candidate
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-
-    pkl_url = config.DATALOG_ARCHIVE_URL
-    db_url = pkl_url.rsplit("/", 1)[0] + "/datalog.db"
-    db_dest = base + ".db"
-    pkl_dest = base + ".pkl"
-
-    for url, dest in [(db_url, db_dest), (pkl_url, pkl_dest)]:
-        r = requests.get(url, timeout=600, stream=True)
-        if r.status_code == 200:
-            tmp = dest + ".tmp"
-            with open(tmp, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-            os.replace(tmp, dest)
-            return dest
-
-    raise SystemExit(f"Failed to download datalog from {db_url} or {pkl_url}")
+    url = config.DATALOG_ARCHIVE_URL
+    r = requests.get(url, timeout=900, stream=True)
+    if r.status_code == 200:
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        os.replace(tmp, path)
+        return path
+    raise SystemExit(f"Failed to download datalog from {url}")
 
 
 def _sha256(*parts: bytes) -> bytes:
@@ -253,6 +258,8 @@ class DataLog:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA_SQL)
 
+        _ensure_price_data_col(self._conn)
+
         for spec in config.CHALLENGES:
             self._conn.execute(
                 "INSERT OR REPLACE INTO challenge_meta (ticker, dim, blocks_ahead) VALUES (?, ?, ?)",
@@ -307,6 +314,7 @@ class DataLog:
                 restored.range_lookback_blocks = mb.get("range_lookback_blocks", restored.range_lookback_blocks)
                 restored.barrier_pct = mb.get("barrier_pct", restored.barrier_pct)
                 restored.min_range_pct = mb.get("min_range_pct", restored.min_range_pct)
+                restored.max_pending_blocks = mb.get("max_pending_blocks", restored.max_pending_blocks)
                 self._breakout_trackers[asset] = restored
 
     @property
@@ -316,153 +324,8 @@ class DataLog:
     @staticmethod
     def load(path: str) -> "DataLog":
         if os.path.exists(path):
-            if path.endswith(".db"):
-                return DataLog(path)
-            return DataLog._load_pickle_to_sqlite(path)
-        base, _ = os.path.splitext(path)
-        for ext in (".db", ".pkl", ".pkl.gz"):
-            candidate = base + ext
-            if os.path.exists(candidate):
-                if candidate.endswith(".db"):
-                    return DataLog(candidate)
-                return DataLog._load_pickle_to_sqlite(candidate)
-        db_path = base + ".db" if not path.endswith(".db") else path
-        return DataLog(db_path)
-
-    @staticmethod
-    def _load_pickle_to_sqlite(pkl_path: str) -> "DataLog":
-        import gc, ctypes
-        logger.info("Converting pickle datalog to SQLite: %s", pkl_path)
-        base, _ = os.path.splitext(pkl_path)
-        db_path = base + ".db"
-        if os.path.exists(db_path):
-            logger.info("SQLite DB already exists at %s, using it directly", db_path)
-            return DataLog(db_path)
-
-        with (gzip.open if pkl_path.endswith(".gz") else open)(pkl_path, "rb") as f:
-            old = pickle.load(f)
-
-        tmp = db_path + ".tmp"
-        conn = sqlite3.connect(tmp)
-        conn.execute("PRAGMA synchronous=OFF")
-        conn.execute("PRAGMA journal_mode=OFF")
-        c = conn.cursor()
-        c.executescript(_SCHEMA_SQL)
-
-        BATCH = 50_000
-
-        blocks = getattr(old, "blocks", [])
-        n_blocks = len(blocks)
-        logger.info("Phase 1/5: writing %d blocks...", n_blocks)
-        for i in range(0, n_blocks, BATCH):
-            c.executemany(
-                "INSERT INTO blocks (idx, block) VALUES (?, ?)",
-                ((j, blocks[j]) for j in range(i, min(i + BATCH, n_blocks))),
-            )
-        conn.commit()
-        del blocks
-        if hasattr(old, "blocks"):
-            old.blocks = []
-        gc.collect()
-        logger.info("Phase 1/5 done: blocks written.")
-
-        challenges = getattr(old, "challenges", {})
-        tickers = list(challenges.keys())
-        logger.info("Phase 2/5: writing %d challenges...", len(tickers))
-        for ticker in tickers:
-            ch = challenges[ticker]
-            c.execute(
-                "INSERT OR REPLACE INTO challenge_meta (ticker, dim, blocks_ahead) VALUES (?, ?, ?)",
-                (ticker, ch.dim, ch.blocks_ahead),
-            )
-            sidx_keys = list(ch.sidx.keys())
-            for i in range(0, len(sidx_keys), BATCH):
-                rows = []
-                for sidx in sidx_keys[i:i + BATCH]:
-                    data = ch.sidx[sidx]
-                    rows.append((
-                        ticker, int(sidx), data.get("price"),
-                        json.dumps(data.get("hotkeys", [])),
-                        _pack_embeddings(data.get("emb", {})),
-                    ))
-                c.executemany(
-                    "INSERT INTO challenge_data (ticker, sidx, price, hotkeys, embeddings) VALUES (?, ?, ?, ?, ?)",
-                    rows,
-                )
-                del rows
-            conn.commit()
-            n_sidx = len(sidx_keys)
-            ch.sidx.clear()
-            del sidx_keys
-            logger.info("  %s: %d samples written.", ticker, n_sidx)
-        del challenges
-        if hasattr(old, "challenges"):
-            old.challenges = {}
-        gc.collect()
-        logger.info("Phase 2/5 done: challenges written.")
-
-        raw_payloads = getattr(old, "raw_payloads", {})
-        logger.info("Phase 3/5: writing raw payloads...")
-        count = 0
-        batch_rows = []
-        for ts, by_hk in raw_payloads.items():
-            for hk, payload in by_hk.items():
-                batch_rows.append((int(ts), hk, payload))
-                count += 1
-                if len(batch_rows) >= BATCH:
-                    c.executemany(
-                        "INSERT INTO raw_payloads (ts, hotkey, payload) VALUES (?, ?, ?)",
-                        batch_rows,
-                    )
-                    batch_rows.clear()
-        if batch_rows:
-            c.executemany(
-                "INSERT INTO raw_payloads (ts, hotkey, payload) VALUES (?, ?, ?)",
-                batch_rows,
-            )
-        conn.commit()
-        del batch_rows, raw_payloads
-        if hasattr(old, "raw_payloads"):
-            old.raw_payloads = {}
-        gc.collect()
-        logger.info("Phase 3/5 done: %d raw payload rows written.", count)
-
-        drand_cache = getattr(old, "_drand_cache", {})
-        logger.info("Phase 4/5: writing %d drand cache entries...", len(drand_cache))
-        if drand_cache:
-            items = list(drand_cache.items())
-            for i in range(0, len(items), BATCH):
-                c.executemany(
-                    "INSERT INTO drand_cache (round, signature) VALUES (?, ?)",
-                    items[i:i + BATCH],
-                )
-            conn.commit()
-            del items
-        del drand_cache
-        if hasattr(old, "_drand_cache"):
-            old._drand_cache = {}
-        gc.collect()
-        logger.info("Phase 4/5 done: drand cache written.")
-
-        breakout_trackers = getattr(old, "_breakout_trackers", {})
-        logger.info("Phase 5/5: writing %d breakout trackers...", len(breakout_trackers))
-        for asset, tracker in breakout_trackers.items():
-            c.execute(
-                "INSERT INTO breakout_state (asset, state_json) VALUES (?, ?)",
-                (asset, json.dumps(tracker.to_dict())),
-            )
-        conn.commit()
-
-        del breakout_trackers, old
-        gc.collect()
-        try:
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except OSError:
-            pass
-
-        conn.close()
-        os.replace(tmp, db_path)
-        logger.info("Pickle converted to SQLite: %s", db_path)
+            return DataLog(path)
+        db_path = path if path.endswith(".db") else os.path.splitext(path)[0] + ".db"
         return DataLog(db_path)
 
     async def append_step(self, block: int, prices: Dict[str, float], payloads: Dict[str, bytes], mg: "bt.Metagraph"):
@@ -475,6 +338,20 @@ class DataLog:
             sidx = block // SAMPLE_EVERY
             for spec in config.CHALLENGES:
                 ticker = spec["ticker"]
+                if ticker == "MULTIXSEC":
+                    pd_map = {}
+                    for a in config.BREAKOUT_ASSETS:
+                        pv = prices.get(a)
+                        if isinstance(pv, (int, float)) and pv > 0:
+                            pd_map[a] = float(pv)
+                    if pd_map:
+                        c.execute(
+                            "INSERT INTO challenge_data (ticker, sidx, price_data, hotkeys, embeddings) "
+                            "VALUES (?, ?, ?, '[]', X'') "
+                            "ON CONFLICT(ticker, sidx) DO UPDATE SET price_data=excluded.price_data",
+                            (ticker, sidx, json.dumps(pd_map)),
+                        )
+                    continue
                 p = prices.get(ticker)
                 if p is not None:
                     c.execute(
@@ -495,21 +372,21 @@ class DataLog:
             self._conn.commit()
             self._update_breakout_trackers(sidx, block, prices)
 
+    def _flush_breakout_state(self):
+        if not self._breakout_trackers:
+            return
+        c = self._conn.cursor()
+        c.execute("DELETE FROM breakout_state")
+        for asset, tracker in self._breakout_trackers.items():
+            c.execute(
+                "INSERT INTO breakout_state (asset, state_json) VALUES (?, ?)",
+                (asset, json.dumps(tracker.to_dict())),
+            )
+        self._conn.commit()
+
     def _update_breakout_trackers(self, sidx: int, block: int, prices: Dict[str, float]):
         if not self._breakout_trackers:
             return
-
-        full_emb: Dict[str, np.ndarray] = {}
-        dim = _MB_STORAGE_DIM
-        row = self._conn.execute(
-            "SELECT embeddings FROM challenge_data "
-            "WHERE ticker='MULTIBREAKOUT' AND embeddings IS NOT NULL AND length(embeddings) > 0 "
-            "ORDER BY sidx DESC LIMIT 1"
-        ).fetchone()
-        if row and row[0]:
-            full_emb = _unpack_embeddings(row[0], dim)
-
-        asset_indices = {asset: i for i, asset in enumerate(config.BREAKOUT_ASSETS)}
 
         for asset, tracker in self._breakout_trackers.items():
             p = prices.get(asset)
@@ -521,19 +398,56 @@ class DataLog:
             if not p or p <= 0:
                 continue
             tracker.update_price(sidx, p)
-
-            idx = asset_indices.get(asset)
-            if idx is not None and full_emb:
-                start = idx * 2
-                asset_emb = {}
-                for hk, full_vec in full_emb.items():
-                    if full_vec.shape[0] >= start + 2:
-                        asset_emb[hk] = full_vec[start:start + 2]
-                tracker.check_trigger(sidx, block, p, asset_emb)
-            else:
-                tracker.check_trigger(sidx, block, p, {})
-
+            tracker.check_trigger(sidx, block, p, {})
             tracker.check_resolutions(block, p)
+        self._flush_breakout_state()
+
+    def _backfill_breakout_embeddings(self):
+        """Attach correct embeddings to any pending or completed breakout
+        that still has empty embeddings, by reading from challenge_data."""
+        if not self._breakout_trackers:
+            return
+        dim = _MB_STORAGE_DIM
+        asset_indices = {asset: i for i, asset in enumerate(config.BREAKOUT_ASSETS)}
+        emb_cache: Dict[int, Dict[str, np.ndarray] | None] = {}
+
+        def _get_emb(sidx: int) -> Dict[str, np.ndarray]:
+            if sidx in emb_cache:
+                return emb_cache[sidx] or {}
+            row = self._conn.execute(
+                "SELECT embeddings FROM challenge_data "
+                "WHERE ticker='MULTIBREAKOUT' AND sidx=?",
+                (sidx,),
+            ).fetchone()
+            result = _unpack_embeddings(row[0], dim) if row and row[0] else {}
+            emb_cache[sidx] = result or None
+            return result
+
+        def _fill(sample, asset: str, start: int):
+            if sample.embeddings:
+                return
+            full_emb = _get_emb(sample.trigger_sidx)
+            if not full_emb:
+                return
+            for hk, full_vec in full_emb.items():
+                if full_vec.shape[0] >= start + 2:
+                    sample.embeddings[hk] = full_vec[start:start + 2]
+            if sample.embeddings:
+                logger.info(
+                    "[%s] Backfilled %d miner embeddings for breakout at sidx=%d",
+                    asset, len(sample.embeddings), sample.trigger_sidx,
+                )
+
+        for asset, tracker in self._breakout_trackers.items():
+            aidx = asset_indices.get(asset)
+            if aidx is None:
+                continue
+            start = aidx * 2
+            for pending in (tracker.pending_high, tracker.pending_low):
+                if pending is not None:
+                    _fill(pending, asset, start)
+            for completed in tracker.completed:
+                _fill(completed, asset, start)
 
     async def _get_drand_signature(self, round_num: int, session: aiohttp.ClientSession | None = None) -> bytes | None:
         cached = self._drand_cache.get(round_num)
@@ -584,7 +498,7 @@ class DataLog:
 
     def _zero_vecs(self):
         return {
-            c["ticker"]: [0.0] * (_MB_STORAGE_DIM if c["ticker"] == "MULTIBREAKOUT" else c["dim"])
+            c["ticker"]: [0.0] * _get_storage_dim(c["ticker"])
             for c in config.CHALLENGES
         }
 
@@ -617,14 +531,29 @@ class DataLog:
                     flat.extend([0.0, 0.0])
             return flat
 
+        def _flatten_xsec_dict(d: dict) -> List[float]:
+            flat: List[float] = []
+            for asset in config.BREAKOUT_ASSETS:
+                val = d.get(asset)
+                if isinstance(val, (int, float)) and -1 <= val <= 1:
+                    flat.append(float(val))
+                elif isinstance(val, list) and len(val) == 1 and isinstance(val[0], (int, float)):
+                    flat.append(float(np.clip(val[0], -1, 1)))
+                else:
+                    flat.append(0.0)
+            return flat
+
         if isinstance(sub, list) and len(sub) == len(config.CHALLENGES):
             out = {}
             for vec, c in zip(sub, config.CHALLENGES):
-                dim = _MB_STORAGE_DIM if c["ticker"] == "MULTIBREAKOUT" else c["dim"]
                 ticker = c["ticker"]
+                dim = _get_storage_dim(ticker)
                 spec = config.CHALLENGE_MAP.get(ticker)
                 if ticker == "MULTIBREAKOUT" and isinstance(vec, dict):
                     out[ticker] = _flatten_multibreakout_dict(vec)
+                    continue
+                if ticker == "MULTIXSEC" and isinstance(vec, dict):
+                    out[ticker] = _flatten_xsec_dict(vec)
                     continue
                 if isinstance(vec, list) and len(vec) == dim:
                     if spec and spec.get("loss_func") == "lbfgs":
@@ -647,7 +576,10 @@ class DataLog:
                 if ticker == "MULTIBREAKOUT" and isinstance(vec, dict):
                     out[ticker] = _flatten_multibreakout_dict(vec)
                     continue
-                dim = _MB_STORAGE_DIM if ticker == "MULTIBREAKOUT" else config.ASSET_EMBEDDING_DIMS.get(ticker)
+                if ticker == "MULTIXSEC" and isinstance(vec, dict):
+                    out[ticker] = _flatten_xsec_dict(vec)
+                    continue
+                dim = _get_storage_dim(ticker)
                 if not isinstance(vec, list) or len(vec) != dim:
                     continue
                 spec = config.CHALLENGE_MAP.get(ticker)
@@ -771,7 +703,7 @@ class DataLog:
         async with self._lock:
             c = self._conn.cursor()
             for (ticker, sidx), new_embs in emb_updates.items():
-                dim = _MB_STORAGE_DIM if ticker == "MULTIBREAKOUT" else config.ASSET_EMBEDDING_DIMS.get(ticker, 0)
+                dim = _get_storage_dim(ticker)
                 row = c.execute(
                     "SELECT hotkeys, embeddings FROM challenge_data WHERE ticker=? AND sidx=?",
                     (ticker, sidx),
@@ -796,6 +728,9 @@ class DataLog:
                     "ON CONFLICT(ticker, sidx) DO UPDATE SET hotkeys=excluded.hotkeys, embeddings=excluded.embeddings",
                     (ticker, sidx, hks_json, emb_blob),
                 )
+
+            self._backfill_breakout_embeddings()
+            self._flush_breakout_state()
 
             c.executemany(
                 "DELETE FROM raw_payloads WHERE ts=? AND hotkey=?",
@@ -829,30 +764,25 @@ class DataLog:
                 stats["signature_fetch_failures"], fetch_attempts, pct_sig,
             )
 
-    def prune_hotkeys(self, active: List[str]):
-        pass
-
     async def save(self, path: str):
         t0 = time.monotonic()
         async with self._lock:
-            c = self._conn.cursor()
-            c.execute("DELETE FROM breakout_state")
-            for asset, tracker in self._breakout_trackers.items():
-                c.execute(
-                    "INSERT INTO breakout_state (asset, state_json) VALUES (?, ?)",
-                    (asset, json.dumps(tracker.to_dict())),
-                )
-            self._conn.commit()
+            self._flush_breakout_state()
+            self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
         elapsed = time.monotonic() - t0
         logger.info(
-            "Flushed breakout state to %s (%d blocks, %d trackers) [%.1fs]",
-            self._db_path, self._block_count,
+            "Full save: breakout state (%d trackers) + WAL checkpoint [%.1fs]",
             len(self._breakout_trackers), elapsed,
         )
 
     @staticmethod
-    def iter_challenge_training_data(db_path: str, max_block_number: int | None = None):
+    def iter_challenge_training_data(
+        db_path: str,
+        max_block_number: int | None = None,
+        active_hotkeys: set[str] | None = None,
+    ):
         conn = sqlite3.connect(db_path, check_same_thread=False)
+        _ensure_price_data_col(conn)
 
         for spec in config.CHALLENGES:
             ticker = spec["ticker"]
@@ -863,22 +793,32 @@ class DataLog:
             if loss_func in ("lbfgs", "hitfirst"):
                 payload = DataLog._build_lbfgs_from_db(
                     conn, ticker, dim, blocks_ahead, max_block_number,
+                    active_hotkeys=active_hotkeys,
                 )
                 if payload:
                     yield ticker, payload
                 continue
 
             if loss_func == "range_breakout_multi":
-                completed = DataLog._load_breakout_from_db(conn, max_block_number)
+                completed = DataLog._load_breakout_from_db(
+                    conn, max_block_number, active_hotkeys=active_hotkeys,
+                )
                 if completed:
                     yield ticker, {"completed_samples": completed}
                 continue
 
-            if loss_func == "range_breakout":
+            if loss_func == "xsec_rank":
+                payload = DataLog._build_xsec_from_db(
+                    conn, dim, blocks_ahead, max_block_number,
+                    active_hotkeys=active_hotkeys,
+                )
+                if payload:
+                    yield ticker, payload
                 continue
 
             payload = DataLog._build_binary_from_db(
                 conn, ticker, dim, blocks_ahead, max_block_number,
+                active_hotkeys=active_hotkeys,
             )
             if payload:
                 yield ticker, payload
@@ -886,23 +826,31 @@ class DataLog:
         conn.close()
 
     @staticmethod
-    def _build_lbfgs_from_db(conn, ticker, dim, blocks_ahead, max_block_number):
+    def _collect_hotkeys(conn, ticker, active_hotkeys=None):
+        hks: set[str] = set()
+        for (hks_json,) in conn.execute(
+            "SELECT hotkeys FROM challenge_data WHERE ticker = ? AND hotkeys != '[]'",
+            (ticker,),
+        ):
+            for hk in json.loads(hks_json):
+                hks.add(hk)
+        if active_hotkeys is not None:
+            hks &= active_hotkeys
+        if not hks:
+            return None, None
+        sorted_hks = sorted(hks)
+        return sorted_hks, {hk: i for i, hk in enumerate(sorted_hks)}
+
+    @staticmethod
+    def _build_lbfgs_from_db(conn, ticker, dim, blocks_ahead, max_block_number, *, active_hotkeys=None):
         c = conn.cursor()
         spec = config.CHALLENGE_MAP.get(ticker)
         if not spec or spec.get("loss_func") not in ("lbfgs", "hitfirst"):
             return None
 
-        all_hks: set[str] = set()
-        for (hks_json,) in c.execute(
-            "SELECT hotkeys FROM challenge_data WHERE ticker = ? AND hotkeys != '[]'",
-            (ticker,),
-        ):
-            for hk in json.loads(hks_json):
-                all_hks.add(hk)
-        if not all_hks:
+        all_hks_sorted, hk2idx = DataLog._collect_hotkeys(c, ticker, active_hotkeys)
+        if all_hks_sorted is None:
             return None
-        all_hks_sorted = sorted(all_hks)
-        hk2idx = {hk: i for i, hk in enumerate(all_hks_sorted)}
         D = dim
 
         rows: list[np.ndarray] = []
@@ -948,7 +896,7 @@ class DataLog:
         }
 
     @staticmethod
-    def _build_binary_from_db(conn, ticker, dim, blocks_ahead, max_block_number):
+    def _build_binary_from_db(conn, ticker, dim, blocks_ahead, max_block_number, *, active_hotkeys=None):
         c = conn.cursor()
         ahead = blocks_ahead // SAMPLE_EVERY
 
@@ -959,17 +907,9 @@ class DataLog:
             if price is not None:
                 prices_by_sidx[int(sidx)] = float(price)
 
-        all_hks: set[str] = set()
-        for (hks_json,) in c.execute(
-            "SELECT hotkeys FROM challenge_data WHERE ticker = ? AND hotkeys != '[]'",
-            (ticker,),
-        ):
-            for hk in json.loads(hks_json):
-                all_hks.add(hk)
-        if not all_hks:
+        all_hks_sorted, hk2idx = DataLog._collect_hotkeys(c, ticker, active_hotkeys)
+        if all_hks_sorted is None:
             return None
-        all_hks_sorted = sorted(all_hks)
-        hk2idx = {hk: i for i, hk in enumerate(all_hks_sorted)}
 
         X_list: list[np.ndarray] = []
         y_list: list[float] = []
@@ -1034,7 +974,56 @@ class DataLog:
         )
 
     @staticmethod
-    def _load_breakout_from_db(conn, max_block_number):
+    def _build_xsec_from_db(conn, dim, blocks_ahead, max_block_number, *, active_hotkeys=None):
+        ticker = "MULTIXSEC"
+        storage_dim = dim * len(config.BREAKOUT_ASSETS)
+        c = conn.cursor()
+
+        all_hks_sorted, hk2idx = DataLog._collect_hotkeys(c, ticker, active_hotkeys)
+        if all_hks_sorted is None:
+            return None
+
+        rows: list[np.ndarray] = []
+        prices_list: list[list[float]] = []
+
+        for sidx, price_data, emb_blob in c.execute(
+            "SELECT sidx, price_data, embeddings FROM challenge_data "
+            "WHERE ticker = ? ORDER BY sidx",
+            (ticker,),
+        ):
+            block = int(sidx) * SAMPLE_EVERY
+            if max_block_number and block > max_block_number:
+                break
+
+            if not price_data:
+                continue
+            pd_dict = json.loads(price_data)
+            price_vec = [float(pd_dict.get(a, 0.0)) for a in config.BREAKOUT_ASSETS]
+            if not any(p > 0 for p in price_vec):
+                continue
+
+            emb = _unpack_embeddings(emb_blob, storage_dim) if emb_blob else {}
+            row = np.zeros((len(all_hks_sorted), storage_dim), dtype=np.float32)
+            for hk, vec in emb.items():
+                idx = hk2idx.get(hk)
+                if idx is not None:
+                    arr = np.asarray(vec, dtype=np.float32)
+                    if arr.size == storage_dim:
+                        row[idx] = arr.reshape(storage_dim)
+            rows.append(row.reshape(-1))
+            prices_list.append(price_vec)
+            del emb
+
+        if not rows:
+            return None
+        return {
+            "hist": (np.stack(rows, axis=0), hk2idx),
+            "prices_multi": np.array(prices_list, dtype=np.float64),
+            "blocks_ahead": blocks_ahead,
+        }
+
+    @staticmethod
+    def _load_breakout_from_db(conn, max_block_number, *, active_hotkeys=None):
         c = conn.cursor()
         tables = [r[0] for r in c.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
@@ -1050,6 +1039,9 @@ class DataLog:
             for cd in state.get("completed", []):
                 if max_block_number and cd["resolution_block"] > max_block_number:
                     continue
+                emb_raw = cd["embeddings"]
+                if active_hotkeys is not None:
+                    emb_raw = {k: v for k, v in emb_raw.items() if k in active_hotkeys}
                 all_completed.append(CompletedBreakoutSample(
                     trigger_sidx=cd["trigger_sidx"],
                     trigger_block=cd["trigger_block"],
@@ -1058,7 +1050,7 @@ class DataLog:
                     label=cd["label"],
                     embeddings={
                         k: np.array(v, dtype=np.float16)
-                        for k, v in cd["embeddings"].items()
+                        for k, v in emb_raw.items()
                     },
                 ))
         return all_completed
@@ -1077,5 +1069,4 @@ class DataLog:
                     hotkey_first_block[hk] = block
         conn.close()
         return hotkey_first_block
-
 
