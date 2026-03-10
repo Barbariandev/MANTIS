@@ -25,7 +25,7 @@ THE SOFTWARE.
 
 import os
 
-DATALOG_ARCHIVE_URL = "https://pub-879ad825983e43529792665f4f510cd6.r2.dev/mantis_datalog.pkl"
+DATALOG_ARCHIVE_URL = "https://pub-879ad825983e43529792665f4f510cd6.r2.dev/datalog.db"
 
 PRICE_DATA_URL = "https://pub-ba8c1b8edb8046edaccecbd26b5ca7f8.r2.dev/latest_prices.json"
 
@@ -127,6 +127,18 @@ MULTI_BREAKOUT_CHALLENGE = {
 }
 
 CHALLENGES.append(MULTI_BREAKOUT_CHALLENGE)
+
+XSEC_RANK_CHALLENGE = {
+    "name": "XSEC-RANK",
+    "ticker": "MULTIXSEC",
+    "assets": BREAKOUT_ASSETS,
+    "dim": 1,
+    "blocks_ahead": 1200,
+    "loss_func": "xsec_rank",
+    "weight": 3.0,
+}
+
+CHALLENGES.append(XSEC_RANK_CHALLENGE)
 
 CHALLENGE_MAP = {c["ticker"]: c for c in CHALLENGES}
 CHALLENGE_NAME_TO_TICKER = {c["name"]: c["ticker"] for c in CHALLENGES}
