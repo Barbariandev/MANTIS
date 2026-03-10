@@ -29,9 +29,21 @@ from urllib.parse import urlparse
 logger = logging.getLogger(__name__)
 
 NETWORK = "finney"
-sub = bt.Subtensor(network=NETWORK)
+_sub = None
 
 MAX_PAYLOAD_BYTES = 25 * 1024 * 1024
+
+
+def _get_subtensor():
+    global _sub
+    if _sub is None:
+        _sub = bt.Subtensor(network=NETWORK)
+    return _sub
+
+
+def _reset_subtensor():
+    global _sub
+    _sub = None
 
 def _is_valid_r2_url(url: str) -> bool:
     try:
@@ -49,7 +61,16 @@ async def get_miner_payloads(
     if mg is None:
         mg = bt.Metagraph(netuid=netuid, network=NETWORK, sync=True)
     
-    commits = sub.get_all_commitments(netuid)
+    for attempt in range(2):
+        s = _get_subtensor()
+        try:
+            commits = s.get_all_commitments(netuid)
+            break
+        except Exception:
+            logger.warning("get_all_commitments failed (attempt %d/2), reconnecting subtensor", attempt + 1)
+            _reset_subtensor()
+            if attempt == 1:
+                raise
     uid_to_hotkey = dict(zip(mg.uids.tolist(), mg.hotkeys))
     payloads = {}
 
