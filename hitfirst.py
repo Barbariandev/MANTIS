@@ -80,12 +80,17 @@ def compute_hitfirst_salience(
         return {}
 
     X_valid = np.asarray(X_flat[:len_r][valid_mask], dtype=float).reshape(-1, H, D)
+
+    submitted = np.any(X_valid != 0.0, axis=2)
+
     probs = np.clip(X_valid, EPS, 1.0 - EPS)
     sums = probs.sum(axis=2, keepdims=True)
     probs /= np.where(sums <= 0.0, 1.0, sums)
 
     up_scores = logit(probs[:, :, 0])
     dn_scores = logit(probs[:, :, 1])
+    up_scores = np.where(submitted, up_scores, 0.0)
+    dn_scores = np.where(submitted, dn_scores, 0.0)
     up_scores = np.nan_to_num(up_scores, nan=0.0, posinf=0.0, neginf=0.0)
     dn_scores = np.nan_to_num(dn_scores, nan=0.0, posinf=0.0, neginf=0.0)
 
