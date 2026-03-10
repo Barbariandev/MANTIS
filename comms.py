@@ -26,7 +26,7 @@ async def _object_size(url: str, session: aiohttp.ClientSession, timeout: int = 
         if r.status in (200, 206):
             cr = r.headers.get("Content-Range")
             if cr:
-                m = re.match(r"bytes \\d+-\\d+/(\\d+)", cr)
+                m = re.match(r"bytes \d+-\d+/(\d+)", cr)
                 if m:
                     return int(m.group(1))
     return None
