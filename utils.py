@@ -2,21 +2,23 @@ from __future__ import annotations
 
 import numpy as np
 
-LN2 = float(np.log(2.0))
 EPS = 1e-12
 MIN_REQUIRED_SAMPLES = 7200
 
 
 def rolling_std_fast(x: np.ndarray, window: int) -> np.ndarray:
-    x = np.asarray(x, dtype=float)
+    x = np.asarray(x, dtype=np.float64)
     n = int(x.shape[0])
-    if n < int(window):
+    w = int(window)
+    if n < w:
         return np.full(0, np.nan)
-    c1 = np.concatenate(([0.0], np.cumsum(x)))
-    c2 = np.concatenate(([0.0], np.cumsum(x * x)))
-    s1 = c1[window:] - c1[:-window]
-    s2 = c2[window:] - c2[:-window]
-    var = (s2 - (s1 * s1) / window) / max(window - 1, 1)
+    mu = np.mean(x)
+    xc = x - mu
+    c1 = np.concatenate(([0.0], np.cumsum(xc)))
+    c2 = np.concatenate(([0.0], np.cumsum(xc * xc)))
+    s1 = c1[w:] - c1[:-w]
+    s2 = c2[w:] - c2[:-w]
+    var = (s2 - (s1 * s1) / w) / max(w - 1, 1)
     return np.sqrt(np.maximum(var, 0.0))
 
 
@@ -103,47 +105,9 @@ def make_bins_from_price(
     return y, valid_idx
 
 
-def exp_half_life_weights(valid_idx: np.ndarray, half_life_days: float, samples_per_day: float) -> np.ndarray:
-    valid_idx = np.asarray(valid_idx, dtype=int)
-    if valid_idx.size == 0:
-        return np.ones(0, dtype=float)
-    i_max = float(valid_idx.max())
-    age_days = (i_max - valid_idx.astype(float)) / float(samples_per_day)
-    w = np.exp(-LN2 * (age_days / float(half_life_days)))
-    return w * (valid_idx.size / np.sum(w))
-
-
 def logit(p: np.ndarray) -> np.ndarray:
     p = np.clip(p, EPS, 1.0 - EPS)
     return np.log(p) - np.log(1.0 - p)
-
-
-def sigmoid(x: np.ndarray) -> np.ndarray:
-    return 1.0 / (1.0 + np.exp(-x))
-
-
-def bce(y: np.ndarray, p: np.ndarray, eps: float = EPS) -> np.ndarray:
-    p = np.clip(p, eps, 1.0 - eps)
-    return -(y * np.log(p) + (1.0 - y) * np.log(1.0 - p))
-
-
-def project_simplex(v: np.ndarray) -> np.ndarray:
-    if v.ndim != 1:
-        v = v.ravel()
-    n = int(v.size)
-    if n == 0:
-        return v
-    u = np.sort(v)[::-1]
-    cssv = np.cumsum(u) - 1
-    ind = np.arange(1, n + 1)
-    cond = u - cssv / ind > 0
-    if not np.any(cond):
-        return np.full(n, 1.0 / n, dtype=float)
-    rho = int(np.where(cond)[0][-1])
-    theta = float(cssv[rho] / float(rho + 1))
-    w = np.maximum(v - theta, 0.0)
-    s = float(w.sum())
-    return w if s > 0 else np.full(n, 1.0 / n, dtype=float)
 
 
 def recent_mass_weights(t: np.ndarray, *, recent_samples: int, recent_mass: float) -> np.ndarray:
