@@ -42,8 +42,17 @@ import config
 from timelock import Timelock
 
 
-def generate_multi_asset_embeddings() -> List[List[float]]:
-    return [[random.uniform(-1, 1) for _ in range(c["dim"])] for c in config.CHALLENGES]
+def generate_multi_asset_embeddings() -> List:
+    result: List = []
+    for c in config.CHALLENGES:
+        assets = c.get("assets")
+        if assets and c["dim"] == 2:
+            result.append({a: [random.uniform(0, 1), 1.0 - random.uniform(0, 1)] for a in assets})
+        elif assets and c["dim"] == 1:
+            result.append({a: random.uniform(-1, 1) for a in assets})
+        else:
+            result.append([random.uniform(-1, 1) for _ in range(c["dim"])])
+    return result
 
 
 def _target_round(lock_seconds: int) -> int:
