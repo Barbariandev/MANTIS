@@ -17,6 +17,8 @@ from sklearn.metrics import roc_auc_score
 import config
 from bucket_forecast import compute_lbfgs_salience, compute_q_path_salience
 from hitfirst import compute_hitfirst_salience
+from range_breakout import compute_multi_breakout_salience
+from xsec_rank import compute_xsec_rank_salience
 
 
 logger = logging.getLogger(__name__)
@@ -161,7 +163,6 @@ def salience_binary_prediction(
     META_MAX_ITER = int(getattr(config, "META_MAX_ITER", 2000))
     META_CLASS_WEIGHT = getattr(config, "META_CLASS_WEIGHT", "balanced")
     SEED = int(getattr(config, "SEED", 0))
-    rng = np.random.default_rng(SEED)
 
     if not isinstance(hist, tuple) or len(hist) != 2:
         return {}
@@ -444,6 +445,19 @@ def multi_salience(
             return None, None
         return (X_blk[-L:], hk2idx), price_arr[-L:]
 
+    def _extract_hist_price(payload, spec):
+        if not isinstance(payload, dict):
+            return None
+        hist = payload.get("hist")
+        price_raw = payload.get("price")
+        blocks_ahead = int(spec.get("blocks_ahead", 0) or 0)
+        if not isinstance(hist, tuple) or len(hist) != 2 or price_raw is None or blocks_ahead <= 0:
+            return None
+        trimmed = _trim_hist_price(hist, price_raw)
+        if trimmed[0] is None:
+            return None
+        return trimmed[0], trimmed[1], blocks_ahead
+
     per_challenge: List[Tuple[str, Dict[str, float], float]] = []
     breakdown: Dict[str, Dict[str, float]] = {}
     total_w = 0.0
@@ -462,87 +476,70 @@ def multi_salience(
             del payload
             s = salience_binary_prediction(hist, y, ticker)
             del hist, y
-        elif loss_type == "lbfgs":
-            if not isinstance(payload, dict):
-                del payload
-                continue
-            hist = payload.get("hist")
-            price_raw = payload.get("price")
-            blocks_ahead = int(spec.get("blocks_ahead", 0) or 0)
+        elif loss_type in ("lbfgs", "hitfirst"):
+            extracted = _extract_hist_price(payload, spec)
             del payload
-            if (
-                not isinstance(hist, tuple)
-                or len(hist) != 2
-                or price_raw is None
-                or blocks_ahead <= 0
-            ):
+            if extracted is None:
                 continue
-            hist_price = _trim_hist_price(hist, price_raw)
-            del price_raw
-            if hist_price[0] is None:
-                continue
-            hist, price = hist_price
-            s_cls = compute_lbfgs_salience(
-                hist,
-                price,
-                blocks_ahead=blocks_ahead,
-                sample_every=int(config.SAMPLE_EVERY),
-            )
-            s_q = compute_q_path_salience(
-                hist,
-                price,
-                blocks_ahead=blocks_ahead,
-                sample_every=int(config.SAMPLE_EVERY),
-            )
-            del hist, price
-            if _is_uniform_salience(s_cls):
-                s_cls = {}
-            if _is_uniform_salience(s_q):
-                s_q = {}
-
-            # Keep only top-10 from each salience stream, renormalised to sum to 1.
-            s_cls = _topk_renorm(s_cls, 10)
-            s_q = _topk_renorm(s_q, 10)
-
-            keys = set(s_cls.keys()) | set(s_q.keys())
-            s = {}
-            for hk in keys:
-                v = 0.5 * float(s_cls.get(hk, 0.0)) + 0.5 * float(s_q.get(hk, 0.0))
-                if v > 0.0:
-                    s[hk] = v
-            tot = float(sum(s.values()))
-            if tot > 0:
-                s = {k: (v / tot) for k, v in s.items()}
-        elif loss_type == "hitfirst":
-            if not isinstance(payload, dict):
-                del payload
-                continue
-            hist = payload.get("hist")
-            price_raw = payload.get("price")
-            blocks_ahead = int(spec.get("blocks_ahead", 0) or 0)
-            del payload
-            if (
-                not isinstance(hist, tuple)
-                or len(hist) != 2
-                or price_raw is None
-                or blocks_ahead <= 0
-            ):
-                continue
-            hist_price = _trim_hist_price(hist, price_raw)
-            del price_raw
-            if hist_price[0] is None:
-                continue
-            hist, price = hist_price
-            s = compute_hitfirst_salience(
-                hist,
-                price,
-                blocks_ahead=blocks_ahead,
-                sample_every=int(config.SAMPLE_EVERY),
-            )
+            hist, price, blocks_ahead = extracted
+            if loss_type == "lbfgs":
+                se = int(config.SAMPLE_EVERY)
+                s_cls = compute_lbfgs_salience(hist, price, blocks_ahead=blocks_ahead, sample_every=se)
+                s_q = compute_q_path_salience(hist, price, blocks_ahead=blocks_ahead, sample_every=se)
+                if _is_uniform_salience(s_cls):
+                    s_cls = {}
+                if _is_uniform_salience(s_q):
+                    s_q = {}
+                s_cls = _topk_renorm(s_cls, 10)
+                s_q = _topk_renorm(s_q, 10)
+                keys = set(s_cls.keys()) | set(s_q.keys())
+                s = {}
+                for hk in keys:
+                    v = 0.5 * float(s_cls.get(hk, 0.0)) + 0.5 * float(s_q.get(hk, 0.0))
+                    if v > 0.0:
+                        s[hk] = v
+                tot = float(sum(s.values()))
+                if tot > 0:
+                    s = {k: (v / tot) for k, v in s.items()}
+            else:
+                s = compute_hitfirst_salience(
+                    hist, price, blocks_ahead=blocks_ahead, sample_every=int(config.SAMPLE_EVERY),
+                )
             del hist, price
         elif loss_type == "range_breakout_multi":
+            completed = payload.get("completed_samples", [])
             del payload
-            continue
+            if not completed:
+                continue
+            s = compute_multi_breakout_salience(completed)
+            del completed
+        elif loss_type == "xsec_rank":
+            if not isinstance(payload, dict):
+                del payload
+                continue
+            hist = payload.get("hist")
+            prices_multi = payload.get("prices_multi")
+            blocks_ahead = int(spec.get("blocks_ahead", 0) or 0)
+            del payload
+            if (
+                not isinstance(hist, tuple)
+                or len(hist) != 2
+                or prices_multi is None
+                or blocks_ahead <= 0
+            ):
+                continue
+            hist_trimmed = _trim_hist_price(hist, prices_multi[:, 0])
+            if hist_trimmed[0] is None:
+                continue
+            trim_len = hist_trimmed[0][0].shape[0]
+            prices_trimmed = prices_multi[-trim_len:]
+            s = compute_xsec_rank_salience(
+                (hist_trimmed[0][0], hist_trimmed[0][1]),
+                prices_trimmed,
+                blocks_ahead=blocks_ahead,
+                sample_every=int(config.SAMPLE_EVERY),
+            )
+            del hist, prices_multi, prices_trimmed
         else:
             del payload
             continue
@@ -550,9 +547,10 @@ def multi_salience(
             total_challenge_score = float(sum(s.values()))
             if total_challenge_score <= 0:
                 continue
+            s_norm = {hk: v / total_challenge_score for hk, v in s.items()}
             w = float(spec.get("weight", 1.0))
-            breakdown[ticker] = dict(s)
-            per_challenge.append((ticker, s, w))
+            breakdown[ticker] = dict(s_norm)
+            per_challenge.append((ticker, s_norm, w))
             total_w += w
     if not per_challenge or total_w <= 0:
         return ({}, {}) if return_breakdown else {}
