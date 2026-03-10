@@ -9,9 +9,12 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
+import config as _cfg
+
 logger = logging.getLogger(__name__)
 
-RANGE_LOOKBACK_BLOCKS = 7200
+_SAMPLE_EVERY = int(getattr(_cfg, "SAMPLE_EVERY", 5))
+RANGE_LOOKBACK_BLOCKS = 28800  # 4 days of blocks
 BARRIER_PCT = 10.0
 MIN_RANGE_PCT = 1.0
 MAX_PENDING_BLOCKS = 43200
@@ -61,23 +64,23 @@ class RangeBreakoutTracker:
         self._price_history: List[Tuple[int, float]] = []
 
     def _get_range(self, current_sidx: int) -> Tuple[float, float] | None:
-        lookback_sidx = self.range_lookback_blocks // 5
+        lookback_sidx = self.range_lookback_blocks // _SAMPLE_EVERY
         window_prices = [
             p for sidx, p in self._price_history
             if current_sidx - lookback_sidx <= sidx < current_sidx
         ]
-        
+
         if len(window_prices) < lookback_sidx // 2:
             return None
-        
+
         return min(window_prices), max(window_prices)
 
     def update_price(self, sidx: int, price: float):
         if price <= 0 or not np.isfinite(price):
             return
         self._price_history.append((sidx, price))
-        
-        max_sidx_age = 2 * self.range_lookback_blocks // 5
+
+        max_sidx_age = 2 * self.range_lookback_blocks // _SAMPLE_EVERY
         self._price_history = [
             (s, p) for s, p in self._price_history
             if sidx - s <= max_sidx_age
@@ -150,92 +153,48 @@ class RangeBreakoutTracker:
 
         return triggered_sample
 
+    def _resolve_pending(
+        self, sample: PendingBreakoutSample | None, tag: str,
+        current_block: int, current_price: float,
+        cont_cond: bool, rev_cond: bool,
+    ) -> Tuple[PendingBreakoutSample | None, CompletedBreakoutSample | None]:
+        if sample is None:
+            return None, None
+        if current_block - sample.trigger_block > self.max_pending_blocks:
+            logger.info(f"[{self.ticker}] Discarding stale {tag} breakout from sidx={sample.trigger_sidx}")
+            return None, None
+        label = 1 if cont_cond else (0 if rev_cond else -1)
+        if label < 0:
+            return sample, None
+        completed = CompletedBreakoutSample(
+            trigger_sidx=sample.trigger_sidx, trigger_block=sample.trigger_block,
+            resolution_block=current_block, direction=sample.direction,
+            label=label, embeddings=sample.embeddings,
+        )
+        self.completed.append(completed)
+        outcome = "CONTINUED" if label == 1 else "REVERSED"
+        logger.info(f"[{self.ticker}] {tag} breakout {outcome}: sidx={sample.trigger_sidx}, block={current_block}, price={current_price:.2f}")
+        return None, completed
+
     def check_resolutions(self, current_block: int, current_price: float) -> List[CompletedBreakoutSample]:
         if current_price <= 0 or not np.isfinite(current_price):
             return []
-
         newly_completed = []
-
-        if self.pending_high is not None:
-            sample = self.pending_high
-            if current_block - sample.trigger_block > self.max_pending_blocks:
-                logger.info(f"[{self.ticker}] Discarding stale high breakout from sidx={sample.trigger_sidx}")
-                self.pending_high = None
-            elif current_price >= sample.continuation_barrier:
-                completed = CompletedBreakoutSample(
-                    trigger_sidx=sample.trigger_sidx,
-                    trigger_block=sample.trigger_block,
-                    resolution_block=current_block,
-                    direction=sample.direction,
-                    label=1,
-                    embeddings=sample.embeddings,
-                )
-                self.completed.append(completed)
-                newly_completed.append(completed)
-                logger.info(
-                    f"[{self.ticker}] High breakout CONTINUED: sidx={sample.trigger_sidx}, "
-                    f"resolved at block={current_block}, price={current_price:.2f}"
-                )
-                self.pending_high = None
-            elif current_price <= sample.reversal_barrier:
-                completed = CompletedBreakoutSample(
-                    trigger_sidx=sample.trigger_sidx,
-                    trigger_block=sample.trigger_block,
-                    resolution_block=current_block,
-                    direction=sample.direction,
-                    label=0,
-                    embeddings=sample.embeddings,
-                )
-                self.completed.append(completed)
-                newly_completed.append(completed)
-                logger.info(
-                    f"[{self.ticker}] High breakout REVERSED: sidx={sample.trigger_sidx}, "
-                    f"resolved at block={current_block}, price={current_price:.2f}"
-                )
-                self.pending_high = None
-
-        if self.pending_low is not None:
-            sample = self.pending_low
-            if current_block - sample.trigger_block > self.max_pending_blocks:
-                logger.info(f"[{self.ticker}] Discarding stale low breakout from sidx={sample.trigger_sidx}")
-                self.pending_low = None
-            elif current_price <= sample.continuation_barrier:
-                completed = CompletedBreakoutSample(
-                    trigger_sidx=sample.trigger_sidx,
-                    trigger_block=sample.trigger_block,
-                    resolution_block=current_block,
-                    direction=sample.direction,
-                    label=1,
-                    embeddings=sample.embeddings,
-                )
-                self.completed.append(completed)
-                newly_completed.append(completed)
-                logger.info(
-                    f"[{self.ticker}] Low breakout CONTINUED: sidx={sample.trigger_sidx}, "
-                    f"resolved at block={current_block}, price={current_price:.2f}"
-                )
-                self.pending_low = None
-            elif current_price >= sample.reversal_barrier:
-                completed = CompletedBreakoutSample(
-                    trigger_sidx=sample.trigger_sidx,
-                    trigger_block=sample.trigger_block,
-                    resolution_block=current_block,
-                    direction=sample.direction,
-                    label=0,
-                    embeddings=sample.embeddings,
-                )
-                self.completed.append(completed)
-                newly_completed.append(completed)
-                logger.info(
-                    f"[{self.ticker}] Low breakout REVERSED: sidx={sample.trigger_sidx}, "
-                    f"resolved at block={current_block}, price={current_price:.2f}"
-                )
-                self.pending_low = None
-
+        self.pending_high, c = self._resolve_pending(
+            self.pending_high, "High", current_block, current_price,
+            current_price >= (self.pending_high.continuation_barrier if self.pending_high else 0),
+            current_price <= (self.pending_high.reversal_barrier if self.pending_high else 0),
+        )
+        if c:
+            newly_completed.append(c)
+        self.pending_low, c = self._resolve_pending(
+            self.pending_low, "Low", current_block, current_price,
+            current_price <= (self.pending_low.continuation_barrier if self.pending_low else 0),
+            current_price >= (self.pending_low.reversal_barrier if self.pending_low else 0),
+        )
+        if c:
+            newly_completed.append(c)
         return newly_completed
-
-    def get_completed_samples(self) -> List[CompletedBreakoutSample]:
-        return list(self.completed)
 
     def to_dict(self) -> dict:
         def _sample_to_dict(s: PendingBreakoutSample | None) -> dict | None:
@@ -265,15 +224,25 @@ class RangeBreakoutTracker:
 
         return {
             "ticker": self.ticker,
+            "range_lookback_blocks": self.range_lookback_blocks,
+            "barrier_pct": self.barrier_pct,
+            "min_range_pct": self.min_range_pct,
+            "max_pending_blocks": self.max_pending_blocks,
             "pending_high": _sample_to_dict(self.pending_high),
             "pending_low": _sample_to_dict(self.pending_low),
             "completed": [_completed_to_dict(s) for s in self.completed],
-            "price_history": self._price_history[-1000:],
+            "price_history": self._price_history[-(2 * self.range_lookback_blocks // _SAMPLE_EVERY):],
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "RangeBreakoutTracker":
-        tracker = cls(ticker=data["ticker"])
+        tracker = cls(
+            ticker=data["ticker"],
+            range_lookback_blocks=data.get("range_lookback_blocks", 28800),
+            barrier_pct=data.get("barrier_pct", 25.0),
+            min_range_pct=data.get("min_range_pct", 1.0),
+            max_pending_blocks=data.get("max_pending_blocks", 43200),
+        )
 
         def _dict_to_pending(d: dict | None) -> PendingBreakoutSample | None:
             if d is None:
@@ -308,232 +277,69 @@ class RangeBreakoutTracker:
         return tracker
 
 
-def compute_breakout_salience(
-    completed_samples: List[CompletedBreakoutSample],
-    recent_samples: int = 500,
-    recent_mass: float = 0.5,
-) -> Dict[str, float]:
-    from sklearn.linear_model import LogisticRegression
-    from utils import recent_mass_weights
-
-    if len(completed_samples) < 50:
-        logger.info(f"Not enough breakout samples for salience: {len(completed_samples)}")
-        return {}
-
-    all_hks = set()
-    for sample in completed_samples:
-        all_hks.update(sample.embeddings.keys())
-    
-    if not all_hks:
-        return {}
-
-    all_hks = sorted(all_hks)
-    hk2idx = {hk: i for i, hk in enumerate(all_hks)}
-    H = len(all_hks)
-
-    first_emb = next(iter(completed_samples[0].embeddings.values()), None)
-    if first_emb is None:
-        return {}
-    D = len(first_emb)
-
-    X_list = []
-    y_list = []
-    resolution_blocks = []
-
-    for sample in completed_samples:
-        row = np.zeros((H, D), dtype=np.float32)
-        for hk, vec in sample.embeddings.items():
-            idx = hk2idx.get(hk)
-            if idx is not None:
-                arr = np.asarray(vec, dtype=np.float32)
-                if arr.shape == (D,):
-                    row[idx] = arr
-        
-        X_list.append(row.flatten())
-        y_list.append(sample.label)
-        resolution_blocks.append(sample.resolution_block)
-
-    X = np.array(X_list, dtype=np.float32)
-    y = np.array(y_list, dtype=np.int32)
-    resolution_blocks = np.array(resolution_blocks, dtype=np.float64)
-
-    unique_labels = np.unique(y)
-    if len(unique_labels) < 2:
-        logger.info("Only one class in breakout samples, cannot compute salience")
-        return {}
-
-    sw = recent_mass_weights(resolution_blocks, recent_samples=recent_samples, recent_mass=recent_mass)
-
-    clf = LogisticRegression(
-        penalty="l2",
-        C=1.0,
-        solver="lbfgs",
-        class_weight="balanced",
-        max_iter=500,
-        tol=1e-4,
-    )
-    clf.fit(X, y, sample_weight=sw)
-
-    coef = np.abs(clf.coef_.ravel())
-    coef_reshaped = coef.reshape(H, D)
-    importance = coef_reshaped.sum(axis=1)
-
-    total = float(importance.sum())
-    if total <= 0:
-        return {}
-
-    salience = {}
-    for hk, idx in hk2idx.items():
-        score = float(importance[idx] / total)
-        if score > 0:
-            salience[hk] = score
-
-    return salience
-
-
 def compute_multi_breakout_salience(
     completed_samples: List[CompletedBreakoutSample],
-    gate_top_pct: float = 0.10,
-    recent_days: int = 20,
-    blocks_per_day: int = 7200,
-    recent_mass: float = 0.5,
+    min_n: int = 15,
+    min_std: float = 0.03,
+    eta: float = 0.5,
+    corr_min: int = 20,
+    **_,
 ) -> Dict[str, float]:
-    from sklearn.linear_model import LogisticRegression
-    from utils import recent_mass_weights
-
-    recent_blocks = recent_days * blocks_per_day
-
-    if len(completed_samples) < 100:
-        logger.info(f"Not enough multi-breakout samples for salience: {len(completed_samples)}")
+    from sklearn.metrics import roc_auc_score
+    if len(completed_samples) < 50:
         return {}
-
-    all_hks = set()
-    for sample in completed_samples:
-        all_hks.update(sample.embeddings.keys())
-    
-    if not all_hks:
+    me, my = {}, {}
+    for s in completed_samples:
+        for hk, v in s.embeddings.items():
+            a = np.asarray(v, dtype=np.float32)
+            if a.shape == (2,):
+                me.setdefault(hk, []).append(float(a[0]))
+                my.setdefault(hk, []).append(s.label)
+    auc, ns = {}, {}
+    for hk in me:
+        e, y = np.array(me[hk]), np.array(my[hk])
+        if len(e) < min_n or e.std() < min_std or len(np.unique(y)) < 2:
+            continue
+        a = roc_auc_score(y, e)
+        if a > 0.5:
+            auc[hk], ns[hk] = a, len(e)
+    if not auc:
         return {}
-
-    all_hks = sorted(all_hks)
-    H = len(all_hks)
-    D = 2
-
-    resolution_blocks = np.array([s.resolution_block for s in completed_samples], dtype=np.float64)
-    sample_weights = recent_mass_weights(
-        resolution_blocks, 
-        recent_samples=recent_blocks, 
-        recent_mass=recent_mass
-    )
-    
-    weighted_correct = {hk: 0.0 for hk in all_hks}
-    weighted_total = {hk: 0.0 for hk in all_hks}
-    
-    for i, sample in enumerate(completed_samples):
-        w = sample_weights[i]
-        for hk, vec in sample.embeddings.items():
-            if hk not in weighted_correct:
+    hks = sorted(auc)
+    N = len(hks)
+    hi = {h: i for i, h in enumerate(hks)}
+    mat = np.full((len(completed_samples), N), np.nan)
+    for t, s in enumerate(completed_samples):
+        for hk, v in s.embeddings.items():
+            if hk in hi:
+                a = np.asarray(v, dtype=np.float32)
+                if a.shape == (2,):
+                    mat[t, hi[hk]] = a[0]
+    mr = mat.copy()
+    labels = np.array([s.label for s in completed_samples], dtype=int)
+    for lb in range(2):
+        mk = labels == lb
+        mr[mk] -= np.nanmean(mat[mk], axis=0)
+    uniq = np.ones(N)
+    for i in range(N):
+        ci, mi = mr[:, i], ~np.isnan(mr[:, i])
+        tc = 0.0
+        for j in range(N):
+            if j == i:
                 continue
-            arr = np.asarray(vec, dtype=np.float32)
-            if arr.shape != (D,):
+            m = mi & ~np.isnan(mr[:, j])
+            if m.sum() < corr_min:
                 continue
-            pred_label = 1 if arr[0] > 0.5 else 0
-            weighted_correct[hk] += w * int(pred_label == sample.label)
-            weighted_total[hk] += w
-    
-    min_weight = max(20.0, len(completed_samples) / 10.0)
-    empirical_acc = {}
-    for hk in all_hks:
-        if weighted_total[hk] >= min_weight:
-            empirical_acc[hk] = weighted_correct[hk] / weighted_total[hk]
-    
-    if not empirical_acc:
-        logger.info("No miners with enough samples for empirical accuracy")
-        return {}
-    
-    sorted_acc = sorted(empirical_acc.values(), reverse=True)
-    n_keep = max(5, int(len(sorted_acc) * gate_top_pct))
-    threshold = sorted_acc[min(n_keep - 1, len(sorted_acc) - 1)]
-    
-    gated_hks = sorted([hk for hk, acc in empirical_acc.items() if acc >= threshold])
-    
-    if len(gated_hks) < 5:
-        logger.info(f"Too few miners passed gate: {len(gated_hks)}")
-        sorted_miners = sorted(empirical_acc.items(), key=lambda x: -x[1])[:20]
-        raw_weights = {hk: max(0, acc - 0.5) for hk, acc in sorted_miners}
-        total_w = sum(raw_weights.values())
-        if total_w > 0:
-            return {hk: w / total_w for hk, w in raw_weights.items() if w > 0}
-        return {}
-    
-    logger.info(f"Gated to {len(gated_hks)} miners (top {gate_top_pct*100:.0f}% by empirical accuracy)")
-    
-    hk2idx = {hk: i for i, hk in enumerate(gated_hks)}
-    G = len(gated_hks)
-    
-    X_list = []
-    y_list = []
-    resolution_block_list = []
-
-    for sample in completed_samples:
-        row = np.zeros(G, dtype=np.float32)
-        has_any = False
-        for hk, vec in sample.embeddings.items():
-            idx = hk2idx.get(hk)
-            if idx is not None:
-                arr = np.asarray(vec, dtype=np.float32)
-                if arr.shape == (D,):
-                    row[idx] = arr[0]
-                    has_any = True
-        
-        if has_any:
-            X_list.append(row)
-            y_list.append(sample.label)
-            resolution_block_list.append(sample.resolution_block)
-
-    if len(X_list) < 50:
-        logger.info(f"Not enough samples after gating: {len(X_list)}")
-        return {}
-
-    X = np.array(X_list, dtype=np.float32)
-    y = np.array(y_list, dtype=np.int32)
-    resolution_blocks_filtered = np.array(resolution_block_list, dtype=np.float64)
-
-    unique_labels = np.unique(y)
-    if len(unique_labels) < 2:
-        logger.info("Only one class in gated samples")
-        return {}
-
-    sw = recent_mass_weights(resolution_blocks_filtered, recent_samples=recent_blocks, recent_mass=recent_mass)
-
-    clf = LogisticRegression(
-        penalty="l1",
-        C=0.5,
-        solver="saga",
-        class_weight="balanced",
-        max_iter=1000,
-        tol=1e-4,
-    )
-    clf.fit(X, y, sample_weight=sw)
-
-    importance = np.abs(clf.coef_.ravel())
-
-    total_imp = float(importance.sum())
-    if total_imp <= 0:
-        raw_weights = {hk: max(0, empirical_acc[hk] - 0.5) for hk in gated_hks}
-        total_w = sum(raw_weights.values())
-        if total_w > 0:
-            return {hk: w / total_w for hk, w in raw_weights.items() if w > 0}
-        return {}
-
-    salience = {}
-    for hk, idx in hk2idx.items():
-        score = float(importance[idx] / total_imp)
-        if score > 0:
-            salience[hk] = score
-
-    logger.info(
-        f"Gated multi-breakout salience: {len(completed_samples)} samples, "
-        f"{len(gated_hks)} gated miners, {len(salience)} with non-zero weight"
-    )
-    return salience
+            a, b = ci[m], mr[:, j][m]
+            if a.std() < 1e-8 or b.std() < 1e-8:
+                tc += 1.0
+            else:
+                r = np.corrcoef(a, b)[0, 1]
+                tc += abs(float(r)) if np.isfinite(r) else 1.0
+        uniq[i] = 1.0 / (1.0 + tc)
+    lw = np.array([eta * (auc[h] - 0.5) * ns[h] for h in hks])
+    lw -= lw.max()
+    w = np.exp(lw) * uniq
+    w /= w.sum()
+    return {hks[i]: float(w[i]) for i in range(N) if w[i] > 1e-6}
 
