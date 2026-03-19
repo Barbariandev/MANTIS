@@ -4,7 +4,10 @@ import logging
 from typing import Dict, Iterable, Optional, Tuple
 
 import numpy as np
-from sklearn.linear_model import LogisticRegression
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 
 from utils import (
     EPS,
@@ -25,57 +28,116 @@ __all__ = (
 RECENT_SAMPLES = 14_000
 RECENT_MASS = 0.5
 TOP_K = 25
-_WF_CHUNK = 6000
-_MAX_TRAIN = 3 * _WF_CHUNK
-_META_K = 100
-_RECENCY_GAMMA = 0.5 ** 0.1
+SEED = 42
 
 
-def _balanced_accuracy(y_true: np.ndarray, y_pred: np.ndarray, K: int) -> float:
-    per_c = []
-    for c in range(K):
-        mask = y_true == c
-        if mask.sum() > 0:
-            per_c.append(float((y_pred[mask] == c).sum()) / float(mask.sum()))
-    return float(np.mean(per_c)) if per_c else 0.0
+class LinearEnsembleOptimizer(nn.Module):
+    def __init__(self, num_miners: int, num_buckets: int = 5):
+        super().__init__()
+        self.miner_weights = nn.Parameter(torch.ones(num_miners) / max(num_miners, 1))
+        self.bias = nn.Parameter(torch.zeros(num_buckets))
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B = int(x.shape[0])
+        H = int(self.miner_weights.shape[0])
+        x_reshaped = x.view(B, H, -1)
+        miner_probs = x_reshaped[:, :, :5]
 
-def _vectorized_balanced_accuracy(preds: np.ndarray, y: np.ndarray, K: int) -> np.ndarray:
-    """Balanced accuracy for every miner at once.
+        miner_probs = torch.clamp(miner_probs, 1e-6, 1.0)
+        miner_probs = miner_probs / miner_probs.sum(dim=2, keepdim=True)
 
-    preds: (T, H) int argmax predictions
-    y:     (T,) int true labels
-    Returns (H,) balanced accuracy per miner.
-    """
-    mbal = np.zeros(preds.shape[1], dtype=np.float64)
-    for c in range(K):
-        mask_c = y == c
-        nc = mask_c.sum()
-        if nc > 0:
-            mbal += (preds[mask_c] == c).astype(np.float64).mean(axis=0)
-    mbal /= K
-    return mbal
+        weights = torch.softmax(self.miner_weights, dim=0)
+        weighted_probs = torch.einsum("bmc,m->bc", miner_probs, weights)
+        return torch.log(weighted_probs + 1e-9) + self.bias
 
+    def fit(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        *,
+        max_epochs: int = 80,
+        patience: int = 15,
+        lr: float = 0.05,
+        batch_size: int = 1024,
+        device: str = "cpu",
+        class_weights: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
+        val_split: float = 0.15,
+        verbose: bool = False,
+        seed: int = SEED,
+    ) -> "LinearEnsembleOptimizer":
+        self.to(device)
 
-def _uniqueness_penalty(preds: np.ndarray, order: np.ndarray) -> np.ndarray:
-    """Penalise miners whose argmax predictions heavily overlap with
-    higher-ranked miners in *order*.
+        n = int(X.shape[0])
+        val_size = int(n * val_split)
+        train_size = n - val_size
 
-    For exact sybils (100% overlap), penalty -> 0.
-    """
-    n = len(order)
-    pen = np.ones(n, dtype=np.float64)
-    for i in range(1, n):
-        mi = int(order[i])
-        best_overlap = 0.0
-        for j in range(i):
-            mj = int(order[j])
-            ov = float(np.mean(preds[:, mi] == preds[:, mj]))
-            if ov > best_overlap:
-                best_overlap = ov
-        if best_overlap > 0.85:
-            pen[i] = max(0.0, 1.0 - best_overlap)
-    return pen
+        X_train = torch.as_tensor(X[:train_size], dtype=torch.float32, device=device)
+        y_train = torch.as_tensor(y[:train_size], dtype=torch.long, device=device)
+        X_val = torch.as_tensor(X[train_size:], dtype=torch.float32, device=device)
+        y_val = torch.as_tensor(y[train_size:], dtype=torch.long, device=device)
+
+        cw_t = torch.as_tensor(class_weights, dtype=torch.float32, device=device) if class_weights is not None else None
+
+        if sample_weights is None:
+            sw = np.ones(train_size, dtype=np.float32)
+        else:
+            sw = np.asarray(sample_weights[:train_size], dtype=np.float32)
+        sw_t = torch.as_tensor(sw, dtype=torch.float32, device=device)
+
+        torch.manual_seed(seed)
+        _g = torch.Generator()
+        _g.manual_seed(seed)
+        dataset = torch.utils.data.TensorDataset(X_train, y_train, sw_t)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, generator=_g)
+
+        optimizer = optim.Adam(self.parameters(), lr=lr)
+
+        best_val_loss = float("inf")
+        best_state = None
+        epochs_no_improve = 0
+
+        for epoch in range(int(max_epochs)):
+            self.train()
+            train_loss = 0.0
+            for xb, yb, wb in loader:
+                optimizer.zero_grad()
+                logits = self(xb)
+                loss_vec = F.cross_entropy(logits, yb, weight=cw_t, reduction="none")
+                denom = torch.clamp(wb.sum(), min=1.0)
+                loss = (loss_vec * wb).sum() / denom
+                loss.backward()
+                optimizer.step()
+                train_loss += float(loss.item())
+
+            self.eval()
+            with torch.no_grad():
+                val_logits = self(X_val)
+                val_loss = float(F.cross_entropy(val_logits, y_val, weight=cw_t).item())
+
+            if val_loss < best_val_loss - 1e-5:
+                best_val_loss = val_loss
+                best_state = {k: v.clone() for k, v in self.state_dict().items()}
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+
+            if verbose and (epoch % 10 == 0):
+                logger.info(
+                    "LinearEnsemble epoch %d | train=%.4f | val=%.4f",
+                    epoch,
+                    train_loss / max(len(loader), 1),
+                    val_loss,
+                )
+
+            if epochs_no_improve >= patience:
+                if verbose:
+                    logger.info("Early stopping at epoch %d", epoch)
+                break
+
+        if best_state is not None:
+            self.load_state_dict(best_state)
+        return self
 
 
 def compute_linear_salience(
@@ -87,182 +149,74 @@ def compute_linear_salience(
     max_epochs: int = 80,
     device: str = "cpu",
 ) -> Dict[str, float]:
-    """Walk-forward sybil-resistant meta-model salience.
-
-    Combines two signals per walk-forward segment:
-      - Individual balanced accuracy lift on OOS data (prediction quality).
-      - Per-class binary LogReg coef**2 (sybil resistance via L2 splitting).
-
-    importance_j = individual_lift_j * meta_weight_j
-
-    For n sybil clones:
-      - individual_lift is identical per clone.
-      - meta_weight shrinks by ~1/n^2 (L2 splits coef, then squared).
-      - Group total shrinks by ~1/n. Cloning is unprofitable.
-
-    Post-hoc uniqueness penalty catches remaining overlaps.
-    """
     X_flat, hk2idx = hist
     price_arr = np.asarray(price_data, dtype=float)
-    if not hk2idx or price_arr.ndim != 1:
+    if not hk2idx:
+        return {}
+    if price_arr.ndim != 1:
         return {}
 
     required = int(MIN_REQUIRED_SAMPLES)
     if price_arr.size < required or X_flat.shape[0] < required:
         return {}
 
-    H = len(hk2idx)
+    H = int(len(hk2idx))
     if X_flat.ndim != 2:
         return {}
     HD = int(X_flat.shape[1])
     if H <= 0 or HD <= 0 or (HD % H) != 0:
         return {}
-    D = HD // H
+    D = int(HD // H)
     if D != 17:
         return {}
 
     horizon_steps = max(1, int(round(blocks_ahead / max(1, sample_every))))
     vol_window = max(required // 2, 1000)
-    y_all, valid_idx = make_bins_from_price(
-        price_arr, horizon_steps=horizon_steps, vol_window=vol_window
-    )
+    y_all, valid_idx = make_bins_from_price(price_arr, horizon_steps=horizon_steps, vol_window=vol_window)
     if valid_idx.size < required:
         return {}
 
-    X_valid = X_flat[valid_idx]
-    y = y_all
-    N = X_valid.shape[0]
-    K = 5
-    random_bal = 1.0 / K
-
-    X_3d = X_valid.reshape(N, H, D)
-    raw5 = X_3d[:, :, :5]
-    bp = np.clip(raw5.copy(), 1e-6, None)
-    bp /= bp.sum(axis=2, keepdims=True)
-    bp_argmax = bp.argmax(axis=2)
-
-    active_frac = np.mean(np.any(raw5 > 0.01, axis=2), axis=0)
-    active = np.where(active_frac > 0.05)[0]
-    n_active = int(active.size)
-    if n_active < 2:
+    X_train = X_flat[valid_idx]
+    y_train = y_all
+    if X_train.shape[0] != y_train.shape[0]:
         return {}
 
-    warmup = 2 * _WF_CHUNK
-    segments: list[tuple[int, int]] = []
-    f = warmup
-    while f < N:
-        ve = min(f + _WF_CHUNK, N)
-        if ve - f < 200:
-            break
-        segments.append((f, ve))
-        f = ve
+    sw = recent_mass_weights(valid_idx.astype(float), recent_samples=RECENT_SAMPLES, recent_mass=RECENT_MASS)
 
-    if not segments:
+    classes, counts = np.unique(y_train, return_counts=True)
+    K = int(classes.max() + 1) if classes.size > 0 else 0
+    if K <= 0:
         return {}
+    class_weights = np.ones(K, dtype=np.float32)
+    for c, cnt in zip(classes, counts):
+        class_weights[int(c)] = float(len(y_train)) / (K * float(cnt))
 
-    total_imp = np.zeros(n_active)
-    total_w = 0.0
+    num_miners = len(hk2idx)
+    model = LinearEnsembleOptimizer(num_miners=num_miners, num_buckets=5)
+    model.fit(X_train, y_train, max_epochs=max_epochs, device="cpu", class_weights=class_weights, sample_weights=sw, seed=SEED)
 
-    for si, (vs, ve) in enumerate(segments):
-        y_val = y[vs:ve]
-        if np.unique(y_val).size < 2:
-            continue
+    model.eval()
+    with torch.no_grad():
+        miner_weights = torch.softmax(model.miner_weights, dim=0).cpu().numpy()
 
-        ts = max(0, vs - _MAX_TRAIN)
-        tlen = vs - ts
-        y_fit = y[ts:vs]
+    if miner_weights.shape[0] > TOP_K:
+        order = np.argsort(-miner_weights)
+        keep_idx = order[:TOP_K]
+        kept = miner_weights[keep_idx]
+        s = float(kept.sum())
+        if s > 0.0:
+            kept = kept / s
+        pruned = np.zeros_like(miner_weights)
+        pruned[keep_idx] = kept
+        miner_weights = pruned
 
-        preds_val = bp_argmax[vs:ve, active]
-        indiv_ba_oos = _vectorized_balanced_accuracy(preds_val, y_val, K)
-        indiv_lift = np.maximum(indiv_ba_oos - random_bal, 0.0)
-
-        if indiv_lift.max() <= 0:
-            continue
-
-        preds_train = bp_argmax[ts:vs, active]
-        indiv_ba_train = _vectorized_balanced_accuracy(preds_train, y_fit, K)
-        meta_k = min(_META_K, n_active)
-        selected = np.argsort(-indiv_ba_train)[:meta_k]
-        sel_miners = active[selected]
-
-        sw = recent_mass_weights(
-            np.arange(tlen, dtype=float),
-            recent_samples=RECENT_SAMPLES,
-            recent_mass=RECENT_MASS,
-        )
-
-        meta_imp_sel = np.zeros(meta_k)
-        for c in range(K):
-            y_fit_c = (y_fit == c).astype(int)
-            if np.unique(y_fit_c).size < 2:
-                continue
-            feat_fit = bp[ts:vs, sel_miners, c]
-            clf = LogisticRegression(
-                penalty="l2",
-                C=0.1,
-                class_weight="balanced",
-                solver="liblinear",
-                max_iter=100,
-                random_state=42,
-            )
-            clf.fit(feat_fit, y_fit_c, sample_weight=sw)
-            meta_imp_sel += clf.coef_.ravel() ** 2
-
-        meta_imp = np.zeros(n_active)
-        meta_imp[selected] = meta_imp_sel
-        max_meta = meta_imp.max()
-        if max_meta > 0:
-            meta_weight = meta_imp / max_meta
-        else:
-            meta_weight = np.ones(n_active)
-
-        seg_imp = indiv_lift * meta_weight
-
-        if seg_imp.sum() <= 0:
-            continue
-
-        imp_norm = seg_imp / seg_imp.sum()
-        vote_scores = np.zeros((ve - vs, K))
-        for c in range(K):
-            vote_scores[:, c] = ((preds_val == c) * imp_norm[None, :]).sum(axis=1)
-        seg_preds = vote_scores.argmax(axis=1)
-        seg_ba = _balanced_accuracy(y_val, seg_preds, K)
-        if seg_ba <= random_bal:
-            continue
-
-        w = _RECENCY_GAMMA ** (len(segments) - 1 - si)
-        total_imp += seg_imp * w
-        total_w += w
-
-    if total_w <= 0:
-        return {}
-
-    imp_full = np.zeros(H)
-    imp_full[active] = total_imp / total_w
-    if imp_full.sum() <= 0:
-        return {}
-
-    preds_tail = bp_argmax[-_WF_CHUNK:]
-    nz = np.where(imp_full > 0)[0]
-    if nz.size > 1:
-        order = nz[np.argsort(-imp_full[nz])]
-        pen = _uniqueness_penalty(preds_tail, order)
-        for i, mi in enumerate(order):
-            imp_full[mi] *= pen[i]
-
-    if imp_full.sum() <= 0:
-        return {}
-
-    order = np.argsort(-imp_full)[:TOP_K]
-    pruned = np.zeros_like(imp_full)
-    pruned[order] = imp_full[order]
-    s = pruned.sum()
-    if s <= 0:
-        return {}
-    pruned /= s
-
-    inv_map = {v: k for k, v in hk2idx.items()}
-    return {inv_map[i]: float(pruned[i]) for i in range(H) if pruned[i] > 0 and i in inv_map}
+    sal = {}
+    for hk, idx in hk2idx.items():
+        if 0 <= int(idx) < miner_weights.shape[0]:
+            w = float(miner_weights[int(idx)])
+            if w > 0.0:
+                sal[hk] = w
+    return sal
 
 
 def compute_lbfgs_salience(
@@ -294,12 +248,12 @@ def compute_q_path_salience(
     gating_classes: Iterable[int] = (0, 1, 3, 4),
 ) -> Dict[str, float]:
     """
-    Q-path salience: 12 independent balanced binary LogReg models
-      c in {0,1,3,4} x threshold in {0.5sig, 1.0sig, 2.0sig}
+    Q-path salience as 12 independent global models:
+      c ∈ {0,1,3,4} × threshold ∈ {0.5σ, 1.0σ, 2.0σ}
 
-    Each model uses miner quantile logits as features to predict threshold hits.
-    Salience is derived from absolute coefficient magnitudes, averaged across
-    all 12 sub-models and top-K pruned.
+    Each model learns a simplex mixture over miner Q logits (logit(Q)) to predict
+    the opposite-direction threshold hit (binary), and salience is the learned
+    mixture weights. The 12 saliences are averaged and then top-K pruned.
     """
     X_flat, hk2idx = hist
     price = np.asarray(price_data, dtype=float)
@@ -367,6 +321,64 @@ def compute_q_path_salience(
 
     Xr = np.asarray(X_flat[:len_r], dtype=float).reshape(len_r, H, 17)
 
+    device = "cpu"
+    lr = 0.05
+    epochs = 20
+    batch_size = 4096
+
+    def fit_binary_logit_mixture(x_logits: np.ndarray, y: np.ndarray, sw: np.ndarray) -> np.ndarray | None:
+        x_logits = np.asarray(x_logits, dtype=np.float32)
+        y = np.asarray(y, dtype=np.float32).reshape(-1)
+        sw = np.asarray(sw, dtype=np.float32).reshape(-1)
+        if x_logits.ndim != 2:
+            return None
+        N, HH = x_logits.shape
+        if N <= 0 or HH != H or y.shape[0] != N or sw.shape[0] != N:
+            return None
+        if np.unique(y).size < 2:
+            return None
+
+        pos = float(np.sum(y > 0.5))
+        neg = float(N - pos)
+        if pos <= 0.0 or neg <= 0.0:
+            return None
+        w_pos = float(N / (2.0 * pos))
+        w_neg = float(N / (2.0 * neg))
+        w_cls = np.where(y > 0.5, w_pos, w_neg).astype(np.float32)
+        w = (sw * w_cls).astype(np.float32)
+        s = float(np.sum(w))
+        if s > 0.0:
+            w *= float(N / s)
+
+        X_t = torch.as_tensor(x_logits, dtype=torch.float32, device=device)
+        y_t = torch.as_tensor(y, dtype=torch.float32, device=device)
+        w_t = torch.as_tensor(w, dtype=torch.float32, device=device)
+
+        miner_logits = torch.nn.Parameter(torch.zeros(H, dtype=torch.float32, device=device))
+        bias = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32, device=device))
+        opt = torch.optim.Adam([miner_logits, bias], lr=float(lr))
+
+        torch.manual_seed(SEED)
+        _g2 = torch.Generator()
+        _g2.manual_seed(SEED)
+        dataset = torch.utils.data.TensorDataset(X_t, y_t, w_t)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=int(batch_size), shuffle=True, generator=_g2)
+
+        for _ in range(int(epochs)):
+            for xb, yb, wb in loader:
+                opt.zero_grad()
+                w_mix = torch.softmax(miner_logits, dim=0)
+                z = torch.einsum("bh,h->b", xb, w_mix) + bias[0]
+                loss_vec = F.binary_cross_entropy_with_logits(z, yb, reduction="none")
+                denom = torch.clamp(wb.sum(), min=1.0)
+                loss = (loss_vec * wb).sum() / denom
+                loss.backward()
+                opt.step()
+
+        with torch.no_grad():
+            out = torch.softmax(miner_logits, dim=0).detach().cpu().numpy()
+        return out
+
     per_model_weights: list[np.ndarray] = []
 
     for c in (0, 1, 3, 4):
@@ -389,24 +401,13 @@ def compute_q_path_salience(
 
             q_raw = Xr[t_sel, :, start + j]
             q = np.asarray(q_raw, dtype=float)
-            q[~np.isfinite(q)] = 0.5
             q[q == 0.0] = 0.5
             q = np.clip(q, EPS, 1.0 - EPS)
             x_logits = logit(q)
 
-            clf = LogisticRegression(
-                penalty="l2",
-                C=0.5,
-                class_weight="balanced",
-                solver="lbfgs",
-                max_iter=500,
-                random_state=42,
-            )
-            clf.fit(x_logits, (y_hit > 0.5).astype(int), sample_weight=sw)
-            coef = np.abs(clf.coef_.ravel())
-            cs = coef.sum()
-            if cs > 0:
-                per_model_weights.append(coef / cs)
+            w_model = fit_binary_logit_mixture(x_logits, y_hit, sw)
+            if w_model is not None:
+                per_model_weights.append(w_model)
 
     if not per_model_weights:
         return {}
@@ -430,3 +431,6 @@ def compute_q_path_salience(
         if hk is not None and float(w_avg[i]) > 0.0:
             sal[hk] = float(w_avg[i])
     return sal
+
+
+
