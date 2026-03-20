@@ -129,7 +129,7 @@ def compute_linear_salience(
     if valid_idx.size < required:
         return {}
 
-    X_valid = X_flat[valid_idx]
+    X_valid = np.nan_to_num(X_flat[valid_idx], nan=0.0)
     y = y_all
     N = X_valid.shape[0]
     K = 5
@@ -365,7 +365,7 @@ def compute_q_path_salience(
 
     Q_START = {0: 5, 1: 8, 3: 11, 4: 14}
 
-    Xr = np.asarray(X_flat[:len_r], dtype=float).reshape(len_r, H, 17)
+    Xr = np.nan_to_num(np.asarray(X_flat[:len_r], dtype=float), nan=0.0).reshape(len_r, H, 17)
 
     per_model_weights: list[np.ndarray] = []
 
