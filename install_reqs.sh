@@ -58,7 +58,7 @@ PY="$VENV/bin/python"
 PIP="$PY -m pip"
 
 # Upgrade pip tooling
-$PY -m pip install -qU pip setuptools wheel
+$PY -m pip install -qU pip "setuptools~=70.0" wheel
 
 # Optional: Node.js + pm2
 if [[ "${INSTALL_NODE:-0}" == "1" ]]; then
