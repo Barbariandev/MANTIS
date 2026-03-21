@@ -6,7 +6,7 @@
 #   2) If that fails, build from source (Rust + maturin) for the active interpreter.
 #
 # Env vars:
-#   PY_BIN        : Python interpreter to use (default: python3.10 if present, else python3)
+#   PY_BIN        : Python interpreter to use (default: auto-detect, prefers 3.10)
 #   SRC           : Where to clone timelock sources (default: ./timelock-src)
 #   INSTALL_NODE  : If "1", also install Node.js 20 + pm2 (default: 0/disabled)
 
@@ -24,31 +24,59 @@ ROOT="$(pwd)"
 VENV="$ROOT/.venv"
 SRC="${SRC:-$ROOT/timelock-src}"
 
-# Choose interpreter
+# ── Choose interpreter ──────────────────────────────────────────────
+# Preferred: python3.10 (best tested, PyPI wheels for timelock exist).
+# Fallbacks: python3.11, python3.12, python3 -- will work but timelock
+# may need to be built from source and some deps may need adjustment.
 if [[ -n "${PY_BIN:-}" ]]; then
-  : # use override
+  command -v "$PY_BIN" >/dev/null 2>&1 || die "PY_BIN=$PY_BIN not found on PATH"
 elif command -v python3.10 >/dev/null 2>&1; then
   PY_BIN="python3.10"
+elif command -v python3.11 >/dev/null 2>&1; then
+  PY_BIN="python3.11"
+  warn "python3.10 not found, falling back to python3.11 -- timelock may need source build"
+elif command -v python3.12 >/dev/null 2>&1; then
+  PY_BIN="python3.12"
+  warn "python3.10 not found, falling back to python3.12 -- timelock may need source build"
 elif command -v python3 >/dev/null 2>&1; then
   PY_BIN="python3"
+  warn "python3.10 not found, falling back to generic python3"
 else
-  die "Could not find a suitable Python interpreter (need python3)."
+  die "No Python 3 interpreter found. Install python3.10 or set PY_BIN."
 fi
+
+# Validate the chosen interpreter actually works
+"$PY_BIN" -c "import sys; assert sys.version_info >= (3, 10), f'Need Python >= 3.10, got {sys.version}'" \
+  || die "$PY_BIN is older than 3.10 -- please install python3.10+"
+
+# Verify venv module is available
+"$PY_BIN" -c "import venv" 2>/dev/null \
+  || die "$PY_BIN lacks the venv module. Install python3-venv (e.g. apt install python3.10-venv)."
 
 SUDO=""
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   SUDO="sudo"
 fi
 
-step "Using interpreter: $($PY_BIN --version 2>&1 | tr -d '\n')"
+PY_VERSION="$("$PY_BIN" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}.{sys.version_info[2]}")')"
+step "Using interpreter: $PY_BIN (Python $PY_VERSION)"
 
-# Create (or reuse) venv at .venv
+# ── Create (or reuse) venv ──────────────────────────────────────────
 if [[ ! -d "$VENV" ]]; then
   step "Creating virtualenv at $VENV"
   "$PY_BIN" -m venv "$VENV"
   ok "Created $VENV"
 else
-  warn "$VENV already exists – reusing it"
+  EXISTING_PY="$("$VENV/bin/python" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null || echo "unknown")"
+  WANTED_PY="$("$PY_BIN" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')"
+  if [[ "$EXISTING_PY" != "$WANTED_PY" ]]; then
+    warn "Existing venv is Python $EXISTING_PY but we want $WANTED_PY -- recreating"
+    rm -rf "$VENV"
+    "$PY_BIN" -m venv "$VENV"
+    ok "Recreated $VENV with Python $WANTED_PY"
+  else
+    ok "Reusing existing $VENV (Python $EXISTING_PY)"
+  fi
 fi
 
 # Activate venv
@@ -57,8 +85,10 @@ source "$VENV/bin/activate"
 PY="$VENV/bin/python"
 PIP="$PY -m pip"
 
-# Upgrade pip tooling
+# Upgrade pip tooling -- pin setuptools for bittensor compatibility
+step "Upgrading pip tooling"
 $PY -m pip install -qU pip "setuptools~=70.0" wheel
+ok "pip=$($PY -m pip --version | awk '{print $2}'), setuptools=$($PY -c 'import setuptools; print(setuptools.__version__)')"
 
 # Optional: Node.js + pm2
 if [[ "${INSTALL_NODE:-0}" == "1" ]]; then
@@ -171,16 +201,50 @@ if [[ "$PREBUILT" -eq 0 ]]; then
   ok "Built and installed timelock from source"
 fi
 
-# Project requirements (install into the venv)
+# ── Project requirements ────────────────────────────────────────────
 if [[ -f "$ROOT/requirements.txt" ]]; then
   step "Installing project requirements into .venv"
-  $PY -m pip install -r "$ROOT/requirements.txt"
+  MAX_RETRIES=3
+  for attempt in $(seq 1 $MAX_RETRIES); do
+    if $PY -m pip install -r "$ROOT/requirements.txt"; then
+      ok "Requirements installed (attempt $attempt/$MAX_RETRIES)"
+      break
+    fi
+    if [[ $attempt -lt $MAX_RETRIES ]]; then
+      warn "pip install failed (attempt $attempt/$MAX_RETRIES) -- retrying in 5s"
+      sleep 5
+    else
+      die "Failed to install requirements after $MAX_RETRIES attempts"
+    fi
+  done
 else
   warn "No requirements.txt found – skipping"
 fi
 
+# ── Validate key imports ────────────────────────────────────────────
+step "Verifying critical packages import correctly"
+FAILED_IMPORTS=()
+for pkg in numpy scipy sklearn pandas torch bittensor requests aiohttp shap xgboost; do
+  if ! $PY -c "import $pkg" 2>/dev/null; then
+    FAILED_IMPORTS+=("$pkg")
+  fi
+done
+
+if [[ ${#FAILED_IMPORTS[@]} -gt 0 ]]; then
+  die "The following packages failed to import: ${FAILED_IMPORTS[*]}"
+fi
+ok "All critical packages import successfully"
+
+# ── Summary ─────────────────────────────────────────────────────────
 echo
-ok "Timelock ready in $VENV"
+ok "Installation complete in $VENV"
+$PY -c "
+import sys, numpy, scipy, sklearn, pandas, torch
+print(f'  Python     {sys.version.split()[0]}')
+print(f'  numpy      {numpy.__version__}')
+print(f'  scipy      {scipy.__version__}')
+print(f'  sklearn    {sklearn.__version__}')
+print(f'  pandas     {pandas.__version__}')
+print(f'  torch      {torch.__version__}')
+"
 echo "Activate with:  source \"$VENV/bin/activate\""
-
-
