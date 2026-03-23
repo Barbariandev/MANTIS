@@ -79,7 +79,9 @@ def compute_hitfirst_salience(
     if int(np.sum(valid_mask)) < required:
         return {}
 
-    X_valid = np.asarray(X_flat[:len_r][valid_mask], dtype=float).reshape(-1, H, D)
+    X_valid = np.nan_to_num(
+        np.asarray(X_flat[:len_r][valid_mask], dtype=float), nan=0.0
+    ).reshape(-1, H, D)
 
     submitted = np.any(X_valid != 0.0, axis=2)
 
@@ -116,6 +118,7 @@ def compute_hitfirst_salience(
             class_weight="balanced",
             max_iter=500,
             tol=1e-4,
+            random_state=42,
         )
         clf_up.fit(X_up_train, y_up_train)
         coef_up = np.asarray(clf_up.coef_, dtype=float).ravel()
@@ -130,6 +133,7 @@ def compute_hitfirst_salience(
             class_weight="balanced",
             max_iter=500,
             tol=1e-4,
+            random_state=42,
         )
         clf_dn.fit(X_dn_train, y_dn_train)
         coef_dn = np.asarray(clf_dn.coef_, dtype=float).ravel()
