@@ -279,67 +279,78 @@ class RangeBreakoutTracker:
 
 def compute_multi_breakout_salience(
     completed_samples: List[CompletedBreakoutSample],
-    min_n: int = 15,
+    min_n: int = 10,
     min_std: float = 0.03,
-    eta: float = 0.5,
-    corr_min: int = 20,
+    min_auc: float = 0.50,
+    stack_C: float = 1.0,
     **_,
 ) -> Dict[str, float]:
+    from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import roc_auc_score
+
     if len(completed_samples) < 50:
         return {}
-    me, my = {}, {}
+
+    me: Dict[str, list] = {}
+    my: Dict[str, list] = {}
     for s in completed_samples:
         for hk, v in s.embeddings.items():
             a = np.asarray(v, dtype=np.float32)
             if a.shape == (2,):
                 me.setdefault(hk, []).append(float(a[0]))
                 my.setdefault(hk, []).append(s.label)
-    auc, ns = {}, {}
+
+    qualified: Dict[str, float] = {}
     for hk in me:
         e, y = np.array(me[hk]), np.array(my[hk])
         if len(e) < min_n or e.std() < min_std or len(np.unique(y)) < 2:
             continue
         a = roc_auc_score(y, e)
-        if a > 0.5:
-            auc[hk], ns[hk] = a, len(e)
-    if not auc:
+        if a > min_auc:
+            qualified[hk] = a
+    if not qualified:
         return {}
-    hks = sorted(auc)
+
+    hks = sorted(qualified)
     N = len(hks)
     hi = {h: i for i, h in enumerate(hks)}
-    mat = np.full((len(completed_samples), N), np.nan)
+
+    T = len(completed_samples)
+    mat = np.full((T, N), np.nan)
     for t, s in enumerate(completed_samples):
         for hk, v in s.embeddings.items():
             if hk in hi:
                 a = np.asarray(v, dtype=np.float32)
                 if a.shape == (2,):
                     mat[t, hi[hk]] = a[0]
-    mr = mat.copy()
+
     labels = np.array([s.label for s in completed_samples], dtype=int)
-    for lb in range(2):
-        mk = labels == lb
-        mr[mk] -= np.nanmean(mat[mk], axis=0)
-    uniq = np.ones(N)
-    for i in range(N):
-        ci, mi = mr[:, i], ~np.isnan(mr[:, i])
-        tc = 0.0
-        for j in range(N):
-            if j == i:
-                continue
-            m = mi & ~np.isnan(mr[:, j])
-            if m.sum() < corr_min:
-                continue
-            a, b = ci[m], mr[:, j][m]
-            if a.std() < 1e-8 or b.std() < 1e-8:
-                tc += 1.0
-            else:
-                r = np.corrcoef(a, b)[0, 1]
-                tc += abs(float(r)) if np.isfinite(r) else 1.0
-        uniq[i] = 1.0 / (1.0 + tc)
-    lw = np.array([eta * (auc[h] - 0.5) * ns[h] for h in hks])
-    lw -= lw.max()
-    w = np.exp(lw) * uniq
+
+    col_mu = np.nanmean(mat, axis=0)
+    col_std = np.nanstd(mat, axis=0)
+    col_std[col_std < 1e-8] = 1.0
+    zmat = (mat - col_mu) / col_std
+    zmat = np.nan_to_num(zmat, nan=0.0)
+
+    if len(np.unique(labels)) < 2 or T < 30:
+        return {}
+
+    clf = LogisticRegression(
+        penalty="l1",
+        C=stack_C,
+        solver="liblinear",
+        class_weight="balanced",
+        max_iter=500,
+        random_state=42,
+    )
+    clf.fit(zmat, labels)
+
+    coefs = clf.coef_.ravel()
+    w = np.maximum(coefs, 0.0)
+
+    if w.sum() < 1e-12:
+        return {}
     w /= w.sum()
+
     return {hks[i]: float(w[i]) for i in range(N) if w[i] > 1e-6}
 
