@@ -177,7 +177,7 @@ def salience_binary_prediction(
     if not isinstance(hk2idx, dict) or not hk2idx or not isinstance(dim, int) or dim <= 0:
         return {}
 
-    X_flat = np.asarray(X_flat, dtype=np.float32)
+    X_flat = np.nan_to_num(np.asarray(X_flat, dtype=np.float32), nan=0.0)
     y = np.asarray(challenge_returns, dtype=np.float32)
     if X_flat.shape[0] != y.shape[0]:
         return {}
