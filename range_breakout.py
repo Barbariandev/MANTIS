@@ -277,33 +277,128 @@ class RangeBreakoutTracker:
         return tracker
 
 
-def compute_multi_breakout_salience(
+def _compute_multi_breakout_salience_old(
     completed_samples: List[CompletedBreakoutSample],
-    min_n: int = 10,
+    min_n: int = 15,
     min_std: float = 0.03,
-    min_auc: float = 0.50,
-    stack_C: float = 1.0,
+    eta: float = 0.5,
+    corr_min: int = 20,
     **_,
 ) -> Dict[str, float]:
-    from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import roc_auc_score
-
     if len(completed_samples) < 50:
         return {}
-
-    me: Dict[str, list] = {}
-    my: Dict[str, list] = {}
+    me, my = {}, {}
     for s in completed_samples:
         for hk, v in s.embeddings.items():
             a = np.asarray(v, dtype=np.float32)
             if a.shape == (2,):
                 me.setdefault(hk, []).append(float(a[0]))
                 my.setdefault(hk, []).append(s.label)
+    auc, ns = {}, {}
+    for hk in me:
+        e, y = np.array(me[hk]), np.array(my[hk])
+        if len(e) < min_n or e.std() < min_std or len(np.unique(y)) < 2:
+            continue
+        a = roc_auc_score(y, e)
+        if a > 0.5:
+            auc[hk], ns[hk] = a, len(e)
+    if not auc:
+        return {}
+    hks = sorted(auc)
+    N = len(hks)
+    hi = {h: i for i, h in enumerate(hks)}
+    mat = np.full((len(completed_samples), N), np.nan)
+    for t, s in enumerate(completed_samples):
+        for hk, v in s.embeddings.items():
+            if hk in hi:
+                a = np.asarray(v, dtype=np.float32)
+                if a.shape == (2,):
+                    mat[t, hi[hk]] = a[0]
+    mr = mat.copy()
+    labels = np.array([s.label for s in completed_samples], dtype=int)
+    for lb in range(2):
+        mk = labels == lb
+        mr[mk] -= np.nanmean(mat[mk], axis=0)
+    uniq = np.ones(N)
+    for i in range(N):
+        ci, mi = mr[:, i], ~np.isnan(mr[:, i])
+        tc = 0.0
+        for j in range(N):
+            if j == i:
+                continue
+            m = mi & ~np.isnan(mr[:, j])
+            if m.sum() < corr_min:
+                continue
+            a, b = ci[m], mr[:, j][m]
+            if a.std() < 1e-8 or b.std() < 1e-8:
+                tc += 1.0
+            else:
+                r = np.corrcoef(a, b)[0, 1]
+                tc += abs(float(r)) if np.isfinite(r) else 1.0
+        uniq[i] = 1.0 / (1.0 + tc)
+    lw = np.array([eta * (auc[h] - 0.5) * ns[h] for h in hks])
+    lw -= lw.max()
+    w = np.exp(lw) * uniq
+    w /= w.sum()
+    return {hks[i]: float(w[i]) for i in range(N) if w[i] > 1e-6}
+
+
+def _assign_episodes(samples: List[CompletedBreakoutSample],
+                     gap_sidxs: int = 1440) -> np.ndarray:
+    """Group samples into temporal episodes.  Samples whose trigger_sidx
+    differ by <= *gap_sidxs* belong to the same episode.  Returns an
+    int array of episode IDs parallel to *samples*."""
+    n = len(samples)
+    sidxs = np.array([s.trigger_sidx for s in samples], dtype=np.int64)
+    order = np.argsort(sidxs, kind='stable')
+    ep_ids = np.empty(n, dtype=np.int32)
+    ep = 0
+    ep_ids[order[0]] = 0
+    for i in range(1, n):
+        if sidxs[order[i]] - sidxs[order[i - 1]] > gap_sidxs:
+            ep += 1
+        ep_ids[order[i]] = ep
+    return ep_ids
+
+
+def compute_multi_breakout_salience(
+    completed_samples: List[CompletedBreakoutSample],
+    min_episodes: int = 5,
+    min_std: float = 0.03,
+    min_auc: float = 0.50,
+    meta_C: float = 0.01,
+    episode_gap_sidxs: int = 1440,
+    **_,
+) -> Dict[str, float]:
+    """Compute salience using the same pattern as salience_binary_prediction:
+    L2 logistic on z-scored miner predictions, |coef| as importance.
+    Adapted for small samples with episode-based weighting."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import roc_auc_score
+
+    if len(completed_samples) < 50:
+        return {}
+
+    ep_ids = _assign_episodes(completed_samples, episode_gap_sidxs)
+    n_episodes = int(ep_ids.max()) + 1
+
+    me: Dict[str, list] = {}
+    my: Dict[str, list] = {}
+    me_ep: Dict[str, list] = {}
+    for i, s in enumerate(completed_samples):
+        for hk, v in s.embeddings.items():
+            a = np.asarray(v, dtype=np.float32)
+            if a.shape == (2,):
+                me.setdefault(hk, []).append(float(a[0]))
+                my.setdefault(hk, []).append(s.label)
+                me_ep.setdefault(hk, []).append(int(ep_ids[i]))
 
     qualified: Dict[str, float] = {}
     for hk in me:
         e, y = np.array(me[hk]), np.array(my[hk])
-        if len(e) < min_n or e.std() < min_std or len(np.unique(y)) < 2:
+        hk_episodes = len(set(me_ep[hk]))
+        if hk_episodes < min_episodes or e.std() < min_std or len(np.unique(y)) < 2:
             continue
         a = roc_auc_score(y, e)
         if a > min_auc:
@@ -332,25 +427,31 @@ def compute_multi_breakout_salience(
     zmat = (mat - col_mu) / col_std
     zmat = np.nan_to_num(zmat, nan=0.0)
 
-    if len(np.unique(labels)) < 2 or T < 30:
+    if len(np.unique(labels)) < 2 or n_episodes < min_episodes:
         return {}
 
+    ep_weights = np.zeros(T, dtype=np.float64)
+    for ep in range(n_episodes):
+        mask = ep_ids == ep
+        cnt = mask.sum()
+        if cnt > 0:
+            ep_weights[mask] = 1.0 / cnt
+    ep_weights /= ep_weights.sum()
+    ep_weights *= T
+
     clf = LogisticRegression(
-        penalty="l1",
-        C=stack_C,
-        solver="liblinear",
+        penalty="l2",
+        C=meta_C,
+        solver="lbfgs",
         class_weight="balanced",
-        max_iter=500,
+        max_iter=1000,
         random_state=42,
     )
-    clf.fit(zmat, labels)
+    clf.fit(zmat, labels, sample_weight=ep_weights)
 
-    coefs = clf.coef_.ravel()
-    w = np.maximum(coefs, 0.0)
-
+    w = np.abs(clf.coef_.ravel())
     if w.sum() < 1e-12:
         return {}
     w /= w.sum()
-
     return {hks[i]: float(w[i]) for i in range(N) if w[i] > 1e-6}
 
