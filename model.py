@@ -33,6 +33,7 @@ INDICES_PER_DAY: int = int(getattr(config, "INDICES_PER_DAY", 1440))
 BLOCKS_PER_DAY: int = int(getattr(config, "BLOCKS_PER_DAY", 7200))
 MAX_INDEX_HISTORY: int = int(MAX_DAYS * INDICES_PER_DAY)
 MAX_BLOCK_HISTORY: int = int(MAX_DAYS * BLOCKS_PER_DAY)
+HALFLIFE_DAYS: float = float(getattr(config, "HALFLIFE_DAYS", 15.0))
 
 try:
     torch.set_num_threads(1)
@@ -58,6 +59,15 @@ def set_global_seed(seed: int) -> None:
     
 
 set_global_seed(config.SEED)
+
+
+def _time_weights(T: int, indices_per_day: int = INDICES_PER_DAY,
+                   halflife_days: float = HALFLIFE_DAYS) -> np.ndarray:
+    lam = np.log(2.0) / (halflife_days * indices_per_day)
+    age = np.arange(T, 0, -1, dtype=np.float64)
+    w = np.exp(-lam * age)
+    w /= w.mean()
+    return w
 
 
 def _reshape_X_to_hotkey_dim(X: np.ndarray, H: int, D: int) -> np.ndarray:
@@ -91,6 +101,7 @@ def _fit_base_logistic(
     X_fit: np.ndarray,
     y_fit: np.ndarray,
     seed: int,
+    sample_weight: np.ndarray | None = None,
 ) -> LogisticRegression | None:
     if X_fit.shape[0] < 2 or len(np.unique(y_fit)) < 2:
         return None
@@ -105,7 +116,7 @@ def _fit_base_logistic(
         tol=1e-3,
         random_state=seed,
     )
-    clf.fit(X_fit, y_fit)
+    clf.fit(X_fit, y_fit, sample_weight=sample_weight)
     return clf
 
 
@@ -119,12 +130,14 @@ def _fit_meta_logistic_en(
     C: float,
     max_iter: int,
     class_weight: str | None,
+    sample_weight: np.ndarray | None = None,
 ) -> LogisticRegression | None:
     row_has_any = np.any(~np.isnan(X_train_sel), axis=1)
     if row_has_any.sum() < min_rows:
         return None
     X = np.where(np.isnan(X_train_sel[row_has_any]), 0.0, X_train_sel[row_has_any])
     y = y_train_head[row_has_any]
+    sw = sample_weight[row_has_any] if sample_weight is not None else None
     if len(np.unique(y)) < 2:
         return None
     meta = LogisticRegression(
@@ -140,7 +153,7 @@ def _fit_meta_logistic_en(
         fit_intercept=True,
         warm_start=False,
     )
-    meta.fit(X, y)
+    meta.fit(X, y, sample_weight=sw)
     return meta
 
 
@@ -196,6 +209,7 @@ def salience_binary_prediction(
         return {}
 
     X = _reshape_X_to_hotkey_dim(X_flat, H, dim)
+    tw = _time_weights(T)
 
     first_nz_idx = np.full(H, T, dtype=np.int32)
     for j in range(H):
@@ -222,7 +236,8 @@ def salience_binary_prediction(
         mask_fit = _nonzero_rows_2d(Xi_fit)
         if mask_fit.sum() < MIN_BASE_TRAIN or len(np.unique(yi_fit[mask_fit])) < 2:
             continue
-        clf = _fit_base_logistic(Xi_fit[mask_fit], yi_fit[mask_fit], seed=SEED)
+        clf = _fit_base_logistic(Xi_fit[mask_fit], yi_fit[mask_fit], seed=SEED,
+                                 sample_weight=tw[:sel_split][mask_fit])
         if clf is None:
             continue
         Xi_eval = X[sel_split:, j, :].astype(np.float32, copy=False)
@@ -259,7 +274,8 @@ def salience_binary_prediction(
             mask_fit = _nonzero_rows_2d(Xi_fit)
             if mask_fit.sum() < MIN_BASE_TRAIN or len(np.unique(yi_fit[mask_fit])) < 2:
                 continue
-            clf_oos = _fit_base_logistic(Xi_fit[mask_fit], yi_fit[mask_fit], seed=SEED)
+            clf_oos = _fit_base_logistic(Xi_fit[mask_fit], yi_fit[mask_fit], seed=SEED,
+                                         sample_weight=tw[:fit_end][mask_fit])
             if clf_oos is None:
                 continue
             Xi_slice = Xi_all[seg_val_start:seg_val_end]
@@ -281,6 +297,7 @@ def salience_binary_prediction(
         C=META_C,
         max_iter=META_MAX_ITER,
         class_weight=META_CLASS_WEIGHT,
+        sample_weight=tw,
     )
     if meta_clf is None:
         return {}
