@@ -61,7 +61,8 @@ def _uniqueness_penalty(preds: np.ndarray, order: np.ndarray) -> np.ndarray:
     """Penalise miners whose argmax predictions heavily overlap with
     higher-ranked miners in *order*.
 
-    For exact sybils (100% overlap), penalty -> 0.
+    Uses a smooth quadratic penalty: penalty = (1 - max_overlap)^2
+    so exact sybils (100% overlap) -> 0, independent miners -> ~1.
     """
     n = len(order)
     pen = np.ones(n, dtype=np.float64)
@@ -73,8 +74,7 @@ def _uniqueness_penalty(preds: np.ndarray, order: np.ndarray) -> np.ndarray:
             ov = float(np.mean(preds[:, mi] == preds[:, mj]))
             if ov > best_overlap:
                 best_overlap = ov
-        if best_overlap > 0.85:
-            pen[i] = max(0.0, 1.0 - best_overlap)
+        pen[i] = (1.0 - best_overlap) ** 2
     return pen
 
 
@@ -182,7 +182,7 @@ def compute_linear_salience(
         preds_train = bp_argmax[ts:vs, active]
         indiv_ba_train = _vectorized_balanced_accuracy(preds_train, y_fit, K)
         meta_k = min(_META_K, n_active)
-        selected = np.argsort(-indiv_ba_train)[:meta_k]
+        selected = np.argsort(-indiv_ba_train, kind='stable')[:meta_k]
         sel_miners = active[selected]
 
         sw = recent_mass_weights(
@@ -245,7 +245,7 @@ def compute_linear_salience(
     preds_tail = bp_argmax[-_WF_CHUNK:]
     nz = np.where(imp_full > 0)[0]
     if nz.size > 1:
-        order = nz[np.argsort(-imp_full[nz])]
+        order = nz[np.argsort(-imp_full[nz], kind='stable')]
         pen = _uniqueness_penalty(preds_tail, order)
         for i, mi in enumerate(order):
             imp_full[mi] *= pen[i]
@@ -253,7 +253,7 @@ def compute_linear_salience(
     if imp_full.sum() <= 0:
         return {}
 
-    order = np.argsort(-imp_full)[:TOP_K]
+    order = np.argsort(-imp_full, kind='stable')[:TOP_K]
     pruned = np.zeros_like(imp_full)
     pruned[order] = imp_full[order]
     s = pruned.sum()
@@ -414,7 +414,7 @@ def compute_q_path_salience(
     w_avg = np.mean(np.stack(per_model_weights, axis=0), axis=0)
 
     if w_avg.shape[0] > TOP_K:
-        order = np.argsort(-w_avg)
+        order = np.argsort(-w_avg, kind='stable')
         keep = order[:TOP_K]
         kept = w_avg[keep]
         s = float(np.sum(kept))
