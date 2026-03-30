@@ -1024,36 +1024,237 @@ class DataLog:
 
     @staticmethod
     def _load_breakout_from_db(conn, max_block_number, *, active_hotkeys=None):
-        c = conn.cursor()
-        tables = [r[0] for r in c.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        )]
-        if "breakout_state" not in tables:
-            return []
-
+        from collections import deque
         from range_breakout import CompletedBreakoutSample
 
-        all_completed = []
-        for _asset, state_json in c.execute("SELECT asset, state_json FROM breakout_state"):
-            state = json.loads(state_json)
-            for cd in state.get("completed", []):
-                if max_block_number and cd["resolution_block"] > max_block_number:
+        mb = config.CHALLENGE_MAP.get("MULTIBREAKOUT")
+        if not mb:
+            return []
+
+        assets = mb["assets"]
+        n_assets = len(assets)
+        asset_indices = {asset: i for i, asset in enumerate(assets)}
+        storage_dim = 2 * n_assets
+
+        lookback_sidxs = mb.get("range_lookback_blocks", 28800) // SAMPLE_EVERY
+        barrier_frac = mb.get("barrier_pct", 25.0) / 100.0
+        min_range_frac = mb.get("min_range_pct", 1.0) / 100.0
+        max_pending_blocks = 43200
+
+        c = conn.cursor()
+
+        # ---- Phase 1: pre-MULTIXSEC samples from breakout_state ----
+        row = c.execute(
+            "SELECT MIN(sidx) FROM challenge_data "
+            "WHERE ticker='MULTIXSEC' AND price_data IS NOT NULL"
+        ).fetchone()
+        xsec_start = int(row[0]) if row and row[0] else None
+
+        tables = {r[0] for r in c.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+
+        pre_xsec: list = []
+        if "breakout_state" in tables and xsec_start is not None:
+            for asset, state_json in c.execute(
+                "SELECT asset, state_json FROM breakout_state"
+            ):
+                aidx = asset_indices.get(asset)
+                if aidx is None:
                     continue
-                emb_raw = cd["embeddings"]
-                if active_hotkeys is not None:
-                    emb_raw = {k: v for k, v in emb_raw.items() if k in active_hotkeys}
-                all_completed.append(CompletedBreakoutSample(
-                    trigger_sidx=cd["trigger_sidx"],
-                    trigger_block=cd["trigger_block"],
-                    resolution_block=cd["resolution_block"],
-                    direction=cd["direction"],
-                    label=cd["label"],
-                    embeddings={
-                        k: np.array(v, dtype=np.float16)
-                        for k, v in emb_raw.items()
-                    },
-                ))
-        return all_completed
+                estart = aidx * 2
+                for cd in json.loads(state_json).get("completed", []):
+                    if cd["trigger_sidx"] >= xsec_start:
+                        continue
+                    if max_block_number and cd["resolution_block"] > max_block_number:
+                        continue
+                    emb_raw = cd.get("embeddings", {})
+                    per_asset = {}
+                    for hk, v in emb_raw.items():
+                        arr = np.array(v, dtype=np.float16)
+                        if arr.shape[0] >= estart + 2:
+                            per_asset[hk] = arr[estart:estart + 2]
+                        elif arr.shape == (2,):
+                            per_asset[hk] = arr
+                    if active_hotkeys is not None:
+                        per_asset = {k: v for k, v in per_asset.items()
+                                     if k in active_hotkeys}
+                    pre_xsec.append(CompletedBreakoutSample(
+                        trigger_sidx=cd["trigger_sidx"],
+                        trigger_block=cd["trigger_block"],
+                        resolution_block=cd["resolution_block"],
+                        direction=cd["direction"],
+                        label=cd["label"],
+                        embeddings=per_asset,
+                    ))
+
+        if xsec_start is None:
+            logger.info("No MULTIXSEC data; returning %d pre-xsec samples", len(pre_xsec))
+            return pre_xsec
+
+        # ---- Phase 2: load MULTIXSEC prices into numpy ----
+        sidxs_list, price_rows = [], []
+        for sidx, price_data in c.execute(
+            "SELECT sidx, price_data FROM challenge_data "
+            "WHERE ticker='MULTIXSEC' AND price_data IS NOT NULL ORDER BY sidx",
+        ):
+            sidx = int(sidx)
+            if max_block_number and sidx * SAMPLE_EVERY > max_block_number:
+                break
+            pd = json.loads(price_data)
+            sidxs_list.append(sidx)
+            price_rows.append([float(pd.get(a, 0.0)) for a in assets])
+
+        if not sidxs_list:
+            return pre_xsec
+
+        sidx_arr = np.array(sidxs_list, dtype=np.int64)
+        price_mat = np.array(price_rows, dtype=np.float64)
+        T = len(sidxs_list)
+
+        # ---- Phase 3: batch-load MULTIBREAKOUT embedding blobs ----
+        emb_blobs: dict = {}
+        for sidx, blob in c.execute(
+            "SELECT sidx, embeddings FROM challenge_data "
+            "WHERE ticker='MULTIBREAKOUT' AND sidx>=? "
+            "AND embeddings IS NOT NULL",
+            (xsec_start,),
+        ):
+            emb_blobs[int(sidx)] = blob
+
+        emb_decoded: dict = {}
+
+        def _slice_emb(trigger_sidx: int, ai: int) -> dict:
+            if trigger_sidx not in emb_decoded:
+                blob = emb_blobs.get(trigger_sidx)
+                emb_decoded[trigger_sidx] = (
+                    _unpack_embeddings(blob, storage_dim) if blob else {}
+                )
+            full = emb_decoded[trigger_sidx]
+            if not full:
+                return {}
+            s = ai * 2
+            out = {}
+            for hk, vec in full.items():
+                if vec.shape[0] >= s + 2:
+                    out[hk] = vec[s:s + 2]
+            if active_hotkeys is not None:
+                out = {k: v for k, v in out.items() if k in active_hotkeys}
+            return out
+
+        # ---- Phase 4: vectorised replay per asset ----
+        post_xsec: list = []
+
+        for ai in range(n_assets):
+            prices = price_mat[:, ai]
+
+            # O(n) rolling min/max via monotone deques (trailing window by sidx)
+            rng_lo = np.full(T, np.nan)
+            rng_hi = np.full(T, np.nan)
+            rng_cnt = np.zeros(T, dtype=np.int32)
+            lo_q: deque = deque()
+            hi_q: deque = deque()
+            valid_in_window = 0
+            win_head = 0
+
+            for t in range(T):
+                cur_sidx = int(sidx_arr[t])
+                win_lo = cur_sidx - lookback_sidxs
+
+                while win_head < t and sidx_arr[win_head] < win_lo:
+                    if prices[win_head] > 0:
+                        valid_in_window -= 1
+                    win_head += 1
+                while lo_q and lo_q[0][1] < win_head:
+                    lo_q.popleft()
+                while hi_q and hi_q[0][1] < win_head:
+                    hi_q.popleft()
+
+                if lo_q:
+                    rng_lo[t] = lo_q[0][0]
+                if hi_q:
+                    rng_hi[t] = hi_q[0][0]
+                rng_cnt[t] = valid_in_window
+
+                if prices[t] > 0:
+                    pv = prices[t]
+                    while lo_q and lo_q[-1][0] >= pv:
+                        lo_q.pop()
+                    lo_q.append((pv, t))
+                    while hi_q and hi_q[-1][0] <= pv:
+                        hi_q.pop()
+                    hi_q.append((pv, t))
+                    valid_in_window += 1
+
+            pending_hi = None
+            pending_lo = None
+            half_lookback = lookback_sidxs // 2
+
+            for t in range(T):
+                p = prices[t]
+                if p <= 0:
+                    continue
+                cur_sidx = int(sidx_arr[t])
+                cur_block = cur_sidx * SAMPLE_EVERY
+
+                if pending_hi is not None:
+                    tsidx, tblk, d, cont_b, rev_b = pending_hi
+                    if cur_block - tblk > max_pending_blocks:
+                        pending_hi = None
+                    elif p >= cont_b:
+                        post_xsec.append(CompletedBreakoutSample(
+                            trigger_sidx=tsidx, trigger_block=tblk,
+                            resolution_block=cur_block, direction=d,
+                            label=1, embeddings=_slice_emb(tsidx, ai),
+                        ))
+                        pending_hi = None
+                    elif p <= rev_b:
+                        post_xsec.append(CompletedBreakoutSample(
+                            trigger_sidx=tsidx, trigger_block=tblk,
+                            resolution_block=cur_block, direction=d,
+                            label=0, embeddings=_slice_emb(tsidx, ai),
+                        ))
+                        pending_hi = None
+
+                if pending_lo is not None:
+                    tsidx, tblk, d, cont_b, rev_b = pending_lo
+                    if cur_block - tblk > max_pending_blocks:
+                        pending_lo = None
+                    elif p <= cont_b:
+                        post_xsec.append(CompletedBreakoutSample(
+                            trigger_sidx=tsidx, trigger_block=tblk,
+                            resolution_block=cur_block, direction=d,
+                            label=1, embeddings=_slice_emb(tsidx, ai),
+                        ))
+                        pending_lo = None
+                    elif p >= rev_b:
+                        post_xsec.append(CompletedBreakoutSample(
+                            trigger_sidx=tsidx, trigger_block=tblk,
+                            resolution_block=cur_block, direction=d,
+                            label=0, embeddings=_slice_emb(tsidx, ai),
+                        ))
+                        pending_lo = None
+
+                if rng_cnt[t] < half_lookback:
+                    continue
+                lo, hi = rng_lo[t], rng_hi[t]
+                if np.isnan(lo) or np.isnan(hi):
+                    continue
+                rw = hi - lo
+                if rw < p * min_range_frac:
+                    continue
+                bd = rw * barrier_frac
+
+                if p > hi and pending_hi is None:
+                    pending_hi = (cur_sidx, cur_block, 1, p + bd, p - bd)
+                if p < lo and pending_lo is None:
+                    pending_lo = (cur_sidx, cur_block, -1, p - bd, p + bd)
+
+        logger.info(
+            "Breakout: %d pre-xsec + %d recomputed from %d price rows",
+            len(pre_xsec), len(post_xsec), T,
+        )
+        return pre_xsec + post_xsec
 
     @staticmethod
     def get_hotkey_first_blocks_from_db(db_path: str, sample_every: int) -> dict[str, int]:
