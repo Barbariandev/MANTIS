@@ -79,9 +79,7 @@ def compute_hitfirst_salience(
     if int(np.sum(valid_mask)) < required:
         return {}
 
-    X_valid = np.nan_to_num(
-        np.asarray(X_flat[:len_r][valid_mask], dtype=float), nan=0.0
-    ).reshape(-1, H, D)
+    X_valid = np.asarray(X_flat[:len_r][valid_mask], dtype=float).reshape(-1, H, D)
 
     submitted = np.any(X_valid != 0.0, axis=2)
 
@@ -99,18 +97,9 @@ def compute_hitfirst_salience(
     y_up = (labels[valid_mask] == 0).astype(int)
     y_dn = (labels[valid_mask] == 1).astype(int)
 
-    n_samples = int(up_scores.shape[0])
-    split = int(max(1, np.floor(0.7 * n_samples)))
-
-    X_up_train, y_up_train = up_scores[:split], y_up[:split]
-    X_up_test = up_scores[split:]
-
-    X_dn_train, y_dn_train = dn_scores[:split], y_dn[:split]
-    X_dn_test = dn_scores[split:]
-
     importance = np.zeros(H, dtype=float)
 
-    if np.unique(y_up_train).size == 2 and X_up_train.shape[0] > 0:
+    if np.unique(y_up).size == 2 and up_scores.shape[0] > 0:
         clf_up = LogisticRegression(
             penalty="l2",
             C=1.0,
@@ -120,12 +109,11 @@ def compute_hitfirst_salience(
             tol=1e-4,
             random_state=42,
         )
-        clf_up.fit(X_up_train, y_up_train)
+        clf_up.fit(up_scores, y_up)
         coef_up = np.asarray(clf_up.coef_, dtype=float).ravel()
-        scale_up = np.mean(np.abs(X_up_test), axis=0) if X_up_test.shape[0] > 0 else np.ones(H, dtype=float)
-        importance += np.abs(coef_up) * scale_up
+        importance += np.abs(coef_up)
 
-    if np.unique(y_dn_train).size == 2 and X_dn_train.shape[0] > 0:
+    if np.unique(y_dn).size == 2 and dn_scores.shape[0] > 0:
         clf_dn = LogisticRegression(
             penalty="l2",
             C=1.0,
@@ -135,10 +123,9 @@ def compute_hitfirst_salience(
             tol=1e-4,
             random_state=42,
         )
-        clf_dn.fit(X_dn_train, y_dn_train)
+        clf_dn.fit(dn_scores, y_dn)
         coef_dn = np.asarray(clf_dn.coef_, dtype=float).ravel()
-        scale_dn = np.mean(np.abs(X_dn_test), axis=0) if X_dn_test.shape[0] > 0 else np.ones(H, dtype=float)
-        importance += np.abs(coef_dn) * scale_dn
+        importance += np.abs(coef_dn)
 
     total = float(np.sum(importance))
     if total <= 0.0:
