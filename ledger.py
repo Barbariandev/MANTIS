@@ -128,7 +128,7 @@ def ensure_datalog(path: str) -> str:
         return path
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     url = config.DATALOG_ARCHIVE_URL
-    r = requests.get(url, timeout=900, stream=True)
+    r = requests.get(url, timeout=1500, stream=True)
     if r.status_code == 200:
         tmp = path + ".tmp"
         with open(tmp, "wb") as f:
