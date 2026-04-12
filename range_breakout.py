@@ -364,7 +364,7 @@ def _assign_episodes(samples: List[CompletedBreakoutSample],
 
 def compute_multi_breakout_salience(
     completed_samples: List[CompletedBreakoutSample],
-    min_episodes: int = 5,
+    min_episodes: int = 2,
     min_std: float = 0.03,
     min_auc: float = 0.50,
     meta_C: float = 0.01,
