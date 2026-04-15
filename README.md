@@ -1,148 +1,194 @@
 # MANTIS
 
-## Purpose
-MANTIS is a Bittensor subnet (netuid 123) that rewards miners for embeddings which improve forecasting targets specified in `config.py`. Each challenge specifies a `ticker`, embedding dimension (`dim`), horizon (`blocks_ahead`), and a loss/scoring type (`loss_func`). Validators collect encrypted miner payloads, align embeddings with prices, compute per-hotkey salience, and set on-chain weights.
+Bittensor Subnet 123 — Multi-challenge signal aggregation network.
 
 ---
 
-## Minimal Architecture Diagram
+## Architecture
+
+Validators sample miner payloads every `SAMPLE_EVERY` blocks, decrypt them after a timelock maturation window, and store (embedding, price) pairs in a SQLite database. Periodically, walk-forward scoring computes per-hotkey salience for each challenge, aggregates across challenges by weight, applies EMA smoothing, and sets on-chain weights.
+
 ```mermaid
 graph TD
-    subgraph "validator.py (orchestrator)"
-        direction LR
-        A[On sampled block] --> B[cycle.py];
-        B -->|payloads| C["datalog.append_step()"];
-        A --> D[Periodic checks];
-        D --> E["datalog.process_pending_payloads()"];
-        D --> F["datalog.get_training_data_sync()"]; 
-        F --> G["model.multi_salience()"]; 
-        G --> H["subtensor.set_weights()"];
+    subgraph validator["validator.py"]
+        A["Sample block"] --> B["cycle.get_miner_payloads()"]
+        B --> C["ledger.append_step()"]
+        A --> D["Periodic weight calc"]
+        D --> E["ledger.iter_challenge_training_data()"]
+        E --> F["model.multi_salience()"]
+        F --> G["EMA smooth + set_weights()"]
     end
 
-    subgraph "ledger.py (state)"
-        I[DataLog]
+    subgraph ledger["ledger.py (SQLite)"]
+        H["challenge_data"]
+        I["raw_payloads"]
+        J["drand_cache"]
     end
 
-    subgraph "External"
-        J[Miners]
-        K[Drand beacon]
-        L[Subtensor]
+    subgraph external["External"]
+        K["Miners (R2)"]
+        L["Drand beacon"]
+        M["Subtensor"]
+        N["price_service.py → R2"]
     end
 
-    C --> I;
-    E --> I;
-    F -- reads --> I;
-    B -- downloads --> J;
-    E -- fetches --> K;
-    H -- writes --> L;
-    B -- reads commits --> L;
+    C --> H
+    C --> I
+    E -- reads --> H
+    B -- downloads --> K
+    I -- decrypt via --> L
+    G -- writes --> M
+    B -- reads commits --> M
+    N -- publishes --> H
 ```
 
 ---
 
-## Core Modules
-1. **`config.py`** – Defines network constants and the `CHALLENGES` list.
-2. **`ledger.py`** – Contains the `DataLog` and per‑challenge `ChallengeData` structures. It stores prices, decrypted embeddings and raw payloads and handles decryption & validation.
-3. **`validator.py`** – Orchestrates block sampling, payload collection, decryption, model training and weight setting.
-4. **`model.py`** – Computes per‑hotkey salience across challenges and produces a final hotkey→score distribution used for weights.
-5. **`cycle.py`** – Downloads miner payloads and validates commit URLs.
-6. **`comms.py`** – Performs asynchronous HTTP downloads (payload retrieval).
-7. **`bucket_forecast.py` / `hitfirst.py` / `utils.py`** – Implements LBFGS p/Q salience and HITFIRST salience (shared math lives in `utils.py`).
+## Challenges
+
+All challenges are defined in `config.py` under `CHALLENGES`. Each specifies a `ticker`, `dim`, `blocks_ahead` (forward horizon in blocks at 12s/block), `loss_func` (scoring dispatch key), and `weight` (relative importance in final aggregation).
+
+| Challenge | Ticker | dim | Horizon | loss\_func | Weight | Description |
+|---|---|---|---|---|---|---|
+| ETH-1H-BINARY | `ETH` | 2 | 300 (1h) | `binary` | 1.0 | Binary direction prediction |
+| CADUSD-1H-BINARY | `CADUSD` | 2 | 300 | `binary` | 1.0 | " |
+| NZDUSD-1H-BINARY | `NZDUSD` | 2 | 300 | `binary` | 1.0 | " |
+| CHFUSD-1H-BINARY | `CHFUSD` | 2 | 300 | `binary` | 1.0 | " |
+| XAGUSD-1H-BINARY | `XAGUSD` | 2 | 300 | `binary` | 1.0 | " |
+| ETH-HITFIRST | `ETHHITFIRST` | 3 | 500 | `hitfirst` | 2.5 | Barrier-hit direction |
+| ETH-LBFGS | `ETHLBFGS` | 17 | 300 (1h) | `lbfgs` | 3.5 | Volatility regime + quantile paths |
+| BTC-LBFGS-6H | `BTCLBFGS` | 17 | 1800 (6h) | `lbfgs` | 2.875 | " |
+| MULTI-BREAKOUT | `MULTIBREAKOUT` | 2/asset | event | `range_breakout_multi` | 5.0 | Range breakout continuation/reversal (33 assets) |
+| XSEC-RANK | `MULTIXSEC` | 1/asset | 1200 (4h) | `xsec_rank` | 3.0 | Cross-sectional return ranking (33 assets) |
+| FUNDING-XSEC | `FUNDINGXSEC` | 1/asset | 2400 (8h) | `funding_xsec` | 4.0 | Cross-sectional funding rate ranking (20 assets) |
 
 ---
 
-## Data Structure
-```python
-@dataclass
-class ChallengeData:
-    dim: int
-    blocks_ahead: int
-    sidx: Dict[int, Dict[str, Any]]
+## Scoring
 
-class DataLog:
-    blocks: List[int]
-    challenges: Dict[str, ChallengeData]
-    raw_payloads: Dict[int, Dict[str, bytes]]
-```
-Each challenge maps sample indices to prices and hotkey embeddings. The `DataLog` holds the per‑block payload queue and the challenge data.
+### Walk-forward meta-model
 
----
+All challenge types follow a two-stage walk-forward evaluation with strict temporal embargo.
 
-## End‑to‑End Workflow
-1. **Initialise** – `validator.py` loads or creates a `DataLog` and syncs the metagraph.
-2. **Collect** – Every `SAMPLE_EVERY` blocks the validator downloads encrypted payloads and current prices and appends them via `datalog.append_step`.
-3. **Decrypt** – `datalog.process_pending_payloads` obtains Drand signatures once the 300‑block delay has elapsed, decrypts payloads, validates structure and stores embeddings.
-4. **Prune** – Periodically, inactive hotkeys are removed from challenge data via `datalog.prune_hotkeys`.
-5. **Evaluate** – Periodically the validator builds a training snapshot from the `DataLog`, runs `model.multi_salience()`, and converts the resulting hotkey salience into UID weights. A small fixed weight is reserved for young UIDs; the remainder is allocated by salience. For LBFGS challenges, p-only and Q-only saliences are combined 50/50 within the challenge.
+**Stage 1 — Feature selection.** For each miner \(j\), fit an L2 logistic regression on the miner's historical predictions against realized labels. Evaluate OOS AUC on a held-out window. Select top-\(K\) miners by AUC (default \(K = 20\)).
 
-6. **Bootstrap** – On first run the validator attempts to download an initial datalog snapshot from `config.DATALOG_ARCHIVE_URL` into `config.STORAGE_DIR`.
+**Stage 2 — Meta-model.** Stack the selected miners' OOS base-model predictions as features in an ElasticNet (or L2) logistic regression. Extract miner importance from absolute coefficient magnitude:
 
----
+\[
+w_j = |{\beta_j}| \cdot \max\!\Big(\frac{\text{AUC}_{\text{meta}} - 0.5}{0.5},\; 0\Big)
+\]
 
-## Security Highlights
-- **Time‑lock encryption** prevents miners from seeing future prices before submitting.
-- **Embedded hotkey checks** ensure decrypted payloads belong to the committing miner.
-- **Payload validation** replaces malformed data with zero vectors.
-- **Download size limits** mitigate denial‑of‑service attacks.
+Segment-level importances are aggregated with exponential recency weighting (half-life configurable via `HALFLIFE`).
 
----
+### Embargo
 
-## Commit & Payload Constraints
-- **Commit host**: Cloudflare R2 only (`*.r2.dev` or `*.r2.cloudflarestorage.com`).
-- **Object key**: Path must be exactly your hotkey (no directories or extra segments).
-- **Size limit**: Payloads must be ≤ 25 MB.
-- **Format**: Only V2 JSON payloads are accepted. They include fields like `v`, `round`, `hk`, `owner_pk`, `C`, `W_owner`, `W_time`, `binding`, and `alg`.
+For challenges with forward-looking labels, the embargo between train and validation windows is:
 
----
+\[
+\text{embargo} = \max(\text{LAG},\; \text{ahead})
+\]
 
-## Extensibility
-- Swap out the salience algorithm by editing **`model.py`**.
-- Adjust challenges or hyperparameters in **`config.py`**.
-- Modify storage or decryption logic in **`ledger.py`**.
+where `ahead = blocks_ahead / SAMPLE_EVERY`. Training rows whose labels reference data within the validation window are excluded via `train_cutoff = val_start - ahead`.
+
+### Sybil resistance
+
+L2 regularization splits coefficient mass among correlated miners. If \(n\) clones submit identical predictions, each receives \(\approx w/n\) weight. L1 drives zero-information miners to exactly zero.
+
+### Cross-sectional challenges (XSEC-RANK, FUNDING-XSEC)
+
+The ranking problem is reformulated as binary classification: for each (timestep, asset) pair, the label is 1 if the asset's forward metric exceeds the cross-sectional median. All assets are pooled into a single problem, multiplying effective sample count by the number of assets. Stale miners (temporal std < \(10^{-4}\)) are zeroed before pooling.
+
+### Weight aggregation
+
+Per-challenge salience vectors are normalized to sum to 1, multiplied by challenge weight, and averaged:
+
+\[
+s_j = \frac{1}{\sum_c w_c} \sum_c w_c \cdot \hat{s}_{j,c}
+\]
+
+EMA smoothing (\(\alpha = 0.15\)) is applied across weight-setting intervals to reduce block-to-block variance. Degenerate distributions (near-uniform or zero-sum) are rejected.
 
 ---
 
-## License
-Released under the MIT License © 2024 MANTIS.
+## Encryption
 
-3. **Decrypt** – `datalog.process_pending_payloads` obtains Drand signatures once the 300‑block delay has elapsed, decrypts payloads, validates structure and stores embeddings.
-4. **Prune** – Periodically, inactive hotkeys are removed from challenge data via `datalog.prune_hotkeys`.
-5. **Evaluate** – Every `TASK_INTERVAL` blocks the validator builds training data, computes salience scores and normalises weights on‑chain. A small fixed weight is reserved for young UIDs; the remainder is allocated by salience. For LBFGS challenges, classifier and Q saliences are combined 50/50 within the challenge, then challenge-level weights from `config.py` are applied for multi-challenge aggregation.
+Dual-path encryption ensures no party can observe predictions before maturation:
 
-6. **Bootstrap** – On first run the validator attempts to download an initial datalog snapshot from `config.DATALOG_ARCHIVE_URL` into `config.STORAGE_DIR`.
+1. **Owner path** — X25519 ECDH + ChaCha20-Poly1305 AEAD. The owner can decrypt immediately for trading.
+2. **Timelock path** — Drand IBE (BLS12-381). After the specified Drand round, validators decrypt via the published beacon signature.
 
----
-
-## Security Highlights
-- **Time‑lock encryption** prevents miners from seeing future prices before submitting.
-- **Embedded hotkey checks** ensure decrypted payloads belong to the committing miner.
-- **Payload validation** replaces malformed data with zero vectors.
-- **Download size limits** mitigate denial‑of‑service attacks.
+A SHA-256 binding hash over (hotkey, round, owner\_pk, ephemeral\_pk) is used as AAD, preventing replay, relay, and substitution attacks.
 
 ---
 
-## Commit & Payload Constraints
-- **Commit host**: Cloudflare R2 only (`*.r2.dev` or `*.r2.cloudflarestorage.com`).
-- **Object key**: Path must be exactly your hotkey (no directories or extra segments).
-- **Size limit**: Payloads must be ≤ 25 MB.
-- **Format**: Only V2 JSON payloads are accepted. They include fields like `v`, `round`, `hk`, `owner_pk`, `C`, `W_owner`, `W_time`, `binding`, and `alg` as described in the payload guide.
+## Modules
+
+| File | Role |
+|---|---|
+| `config.py` | Challenge definitions, network constants, encryption params |
+| `validator.py` | Block sampling, payload collection, decryption scheduling, weight setting |
+| `ledger.py` | SQLite storage, submission validation, training data iteration, Drand cache |
+| `model.py` | `multi_salience()` — dispatches to per-challenge scoring, aggregates |
+| `cycle.py` | Miner payload download, commit URL validation |
+| `funding_xsec.py` | FUNDING-XSEC scoring: forward pairing, label construction, walk-forward |
+| `xsec_rank.py` | XSEC-RANK scoring |
+| `range_breakout.py` | MULTI-BREAKOUT state machine + scoring |
+| `bucket_forecast.py` | LBFGS classifier + Q-path salience |
+| `hitfirst.py` | HITFIRST barrier-hit scoring |
+| `price_service.py` | Fetches spot prices (Polygon) + funding rates (OKX/HL/CoinGlass), uploads to R2 |
+
+---
+
+## Storage
+
+SQLite with WAL mode. Tables:
+
+- **`challenge_data`** — `(ticker, sidx)` → `price` or `price_data` (JSON for multi-asset), `hotkeys` (JSON list), `embeddings` (binary float16 blob)
+- **`challenge_meta`** — `(ticker)` → `dim`, `blocks_ahead`
+- **`block_index`** — Sequential index → block number mapping
+- **`raw_payloads`** — Encrypted ciphertexts held until maturation
+- **`drand_cache`** — Cached beacon signatures
+- **`breakout_state`** — Serialized range tracker state
+
+Training data is streamed via generator iteration, not loaded into memory.
+
+---
+
+## Key Parameters
+
+| Parameter | Value | Location |
+|---|---|---|
+| `SAMPLE_EVERY` | 5 blocks (60s) | `config.py` |
+| `LAG` | 60 samples | `config.py` |
+| `TASK_INTERVAL` | 500 blocks | `config.py` |
+| `WEIGHT_CALC_INTERVAL` | 1000 blocks | `config.py` |
+| `WEIGHT_SET_INTERVAL` | 360 blocks | `config.py` |
+| `BURN_PCT` | 0.30 (UID 0) | `config.py` |
+| `MAX_DAYS` | 60 | `config.py` |
+| `EMA alpha` | 0.15 | `validator.py` |
+| `TOP_K` (feature selection) | 20 | `funding_xsec.py`, `xsec_rank.py` |
+
+---
+
+## Payload Format
+
+V2 JSON only. Required fields: `v`, `round`, `hk`, `owner_pk`, `C`, `W_owner`, `W_time`, `binding`, `alg`.
+
+Commit constraints:
+- Host: Cloudflare R2 (`*.r2.dev` or `*.r2.cloudflarestorage.com`)
+- Object key: exactly your hotkey (no path segments)
+- Size: ≤ 25 MB
 
 ---
 
 ## Dependencies
-Project dependencies are declared in `pyproject.toml` (PEP 621). Key libraries include `bittensor`, `xgboost`, `requests`, `aiohttp`, `torch`, and `scikit-learn`.
 
-See `MINER_GUIDE.md` for setup and `lbfgs_guide.md` for 17-dim LBFGS embeddings.
+Declared in `pyproject.toml`. Core: `bittensor`, `torch`, `scikit-learn`, `numpy`, `requests`, `aiohttp`, `tqdm`, `boto3`.
 
----
-
-## Extensibility
-- Swap out the salience algorithm by editing **`model.py`**.
-- Adjust challenges or hyperparameters in **`config.py`**.
-- Modify storage or decryption logic in **`ledger.py`**.
+See `MINER_GUIDE.md` for submission details per challenge type.
 
 ---
 
 ## License
-Released under the MIT License © 2024 MANTIS.
 
+MIT License (c) 2024 MANTIS
