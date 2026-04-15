@@ -107,6 +107,17 @@ async def get_asset_prices(session: aiohttp.ClientSession) -> dict[str, float] |
                     v = fetched.get(asset)
                     if isinstance(v, (int, float)) and 0 < v < float('inf'):
                         out[asset] = float(v)
+            funding_raw = data.get("funding_rates", {}) or {}
+            if not isinstance(funding_raw, dict):
+                funding_raw = {}
+            if funding_raw:
+                fr_map = {}
+                for asset in getattr(config, "FUNDING_ASSETS", []):
+                    fv = funding_raw.get(asset)
+                    if isinstance(fv, (int, float)):
+                        fr_map[asset] = float(fv)
+                if fr_map:
+                    out["_funding_rates"] = fr_map
             logging.info(f"Fetched prices, filled zeros where missing: {out}")
             return out
     except Exception as e:
