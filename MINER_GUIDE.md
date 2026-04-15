@@ -1,205 +1,127 @@
-# MANTIS Mining Guide
+# Miner Guide
 
-A quick reference for setting up your MANTIS miner. This guide details how to generate multi-asset embeddings, encrypt them securely with your hotkey, and submit them to the network.
-
-## 1. Prerequisites
-
-- **Python Environment:** Python 3.10 or newer.
-- **Registered Hotkey:** Your hotkey must be registered on the subnet. Without this, you cannot commit your data URL.
-- **Cloudflare R2 bucket**: the validator only accepts commit URLs hosted on R2 (`*.r2.dev` or `*.r2.cloudflarestorage.com`), and the object key must be exactly your hotkey.
-
-## 2. Setup
-
-Install the necessary Python packages for encryption and API requests (and optional upload helpers if you want).
+## 1. Setup
 
 ```bash
-pip install timelock requests cryptography
+pip install timelock requests cryptography boto3 python-dotenv
 ```
 
-It is also recommended to use a tool like `boto3` and `python-dotenv` if you want to programmatically upload to R2.
+Requirements:
+- Python 3.10+
+- Registered hotkey on subnet 123
+- Cloudflare R2 bucket (commit URLs must be `*.r2.dev` or `*.r2.cloudflarestorage.com`, object key = your hotkey)
 
-## 3. The Mining Process: Step-by-Step
+---
 
-The core mining loop involves creating data, encrypting it for a future time, uploading it to your public URL, and ensuring the network knows where to find it.
+## 2. Submission Loop
 
-Your required challenge list is defined in `config.py` (`CHALLENGES`). At the time of writing, it includes:
+**Once:** commit your R2 URL on-chain via `subtensor.commit()`.
 
-- **Binary** (dim=2): `ETH`, `CADUSD`, `NZDUSD`, `CHFUSD`, `XAGUSD`
-- **HITFIRST** (dim=3): `ETHHITFIRST`
-- **LBFGS** (dim=17): `ETHLBFGS`, `BTCLBFGS`
-
-### Step 1: Build Your Multi-Asset Embeddings
-
-You must submit embeddings for all configured challenges. Each challenge has a required embedding dimension defined in the network's configuration.
-
-**Important (ranges / semantics):**
-
-- **Binary challenges (dim=2, `loss_func="binary"`)**
-  - Two features per challenge.
-  - Must be in **[-1, 1]** (validator drops invalid values to zeros).
-  - These are treated as features for a classifier, not necessarily probabilities.
-- **HITFIRST (`ETHHITFIRST`, dim=3, `loss_func="hitfirst"`)**
-  - Submit a 3-way probability vector in **(0, 1)** that sums to 1.
-  - Interpretable as: `[P(up first), P(down first), P(neither)]`.
-- **LBFGS (`ETHLBFGS`, `BTCLBFGS`, dim=17, `loss_func="lbfgs"`)** + **MULTI-BREAKOUT**
-  - `p[0:5]`: 5-bucket probabilities (in (0,1), sum to 1)
-  - `q[5:17]`: 12 probabilities in (0,1) used for Q-path scoring
-  - Index map:
-    - `[0:5]`  => `p[0..4]`
-    - `[5:8]`  => Q bucket 0, thresholds [0.5σ, 1.0σ, 2.0σ]
-    - `[8:11]` => Q bucket 1, thresholds [0.5σ, 1.0σ, 2.0σ]
-    - `[11:14]` => Q bucket 3, thresholds [0.5σ, 1.0σ, 2.0σ]
-    - `[14:17]` => Q bucket 4, thresholds [0.5σ, 1.0σ, 2.0σ]
-
-```python
-import numpy as np
-from config import CHALLENGES
-
-# Generate embeddings for each challenge (replace with your model outputs)
-multi_asset_embedding = [
-    np.random.uniform(-1, 1, size=c["dim"]).tolist()
-    for c in CHALLENGES
-]
-```
-
-### Step 2: Timelock-Encrypt Your Payload (V2 Only)
-
-The validator accepts only V2 JSON payloads. You can call the helper script or embed the logic directly in your miner.
-
-**CLI helper (recommended)**
-
-```bash
-python generate_and_encrypt.py --hotkey "$MY_HOTKEY" --lock-seconds 30 --out "$MY_HOTKEY"
-```
-
-The script uses the owner public key and Drand parameters from `config.py`, targets a round roughly 30 seconds ahead, and writes a JSON payload whose filename matches your hotkey.
-
-**Inline Python example**
+**Every ~60s:** generate embeddings for all challenges, encrypt as V2 payload, upload to R2 (overwriting previous file).
 
 ```python
 import json
-from generate_and_encrypt import generate_v2, generate_multi_asset_embeddings
-from config import OWNER_HPKE_PUBLIC_KEY_HEX
+from generate_and_encrypt import generate_v2
+from config import CHALLENGES, OWNER_HPKE_PUBLIC_KEY_HEX
 
-embeddings = generate_multi_asset_embeddings()
+embeddings = build_all_embeddings()  # see below
+
 payload = generate_v2(
     hotkey=my_hotkey,
     lock_seconds=30,
     owner_pk_hex=OWNER_HPKE_PUBLIC_KEY_HEX,
-    payload_text=None,
     embeddings=embeddings,
 )
 
-with open(my_hotkey, "w", encoding="utf-8") as fh:
-    json.dump(payload, fh, indent=2)
+with open(my_hotkey, "w") as f:
+    json.dump(payload, f)
+# upload to R2
 ```
 
-The resulting JSON contains fields such as `v`, `round`, `hk`, `owner_pk`, `C`, `W_owner`, `W_time`, `binding`, and `alg`. Do not modify or strip these fields; the validator verifies them when decrypting the payload.
+---
 
-### Step 3: Upload to Your Public URL
-Upload the generated payload file to your public hosting solution (e.g., R2, personal server). The file must be publicly accessible via a direct download link.
+## 3. Challenge Specifications
 
-**Important**:
+### 3.1 Binary (dim=2)
 
-- The validator expects the **filename in the commit URL** to match your hotkey (case-insensitive).
-- The commit URL must be **Cloudflare R2** (`*.r2.dev` or `*.r2.cloudflarestorage.com`).
-- The URL path must be **exactly one segment**: `/<hotkey>` (no directories).
+Tickers: `ETH`, `CADUSD`, `NZDUSD`, `CHFUSD`, `XAGUSD`
 
-### Step 4: Commit the URL to the Subnet
-Finally, you must commit the public URL of your payload file to the subtensor. **You only need to do this once**, unless your URL changes. After the initial commit, you just need to update the file at that URL (Steps 1-3).
+Horizon: 300 blocks (1h). Two features in \([-1, 1]\). These are inputs to a logistic regression classifier, not probabilities. Scoring: feature selection (per-miner L2 logistic, AUC on held-out half, top-50 selected), then ElasticNet (L1 ratio 0.5) meta-model on walk-forward OOS base-model predictions. Importance = \(|\beta_j|\).
 
 ```python
-import bittensor as bt
-
-# Configure your wallet and the subtensor
-wallet = bt.wallet(name="your_wallet_name", hotkey="your_hotkey_name")
-subtensor = bt.subtensor(network="finney")
-
-# The public URL where the validator can download your payload file.
-# The final path component MUST match your hotkey.
-public_url = f"https://your-public-url.com/{my_hotkey}" 
-
-# Commit the URL on-chain
-subtensor.commit(wallet=wallet, netuid=123, data=public_url)  # Use the correct netuid
+embeddings["ETH"] = [0.3, -0.1]       # your model output
+embeddings["CADUSD"] = [-0.5, 0.2]
+# ... etc for all 5
 ```
 
-## 4. Summary Flow
+### 3.2 HITFIRST (dim=3)
 
-**Once:**
-1.  Set up your public hosting (e.g., R2 bucket, server) and get its base URL.
-2.  Run the `subtensor.commit()` script (Step 4) to register your full payload URL on the network.
+Ticker: `ETHHITFIRST` (price\_key: `ETH`)
 
-**Frequently (e.g., every minute):**
-1.  Generate new multi-asset embeddings (Step 1).
-2.  Encrypt and write the V2 payload (Step 2).
-3.  Upload the new file to your public URL, overwriting the old one (Step 3).
+Horizon: 500 blocks. Three-way probability vector in \((0, 1)\) summing to 1: \([P(\text{up first}),\; P(\text{down first}),\; P(\text{neither})]\).
 
-## 5. Scoring and Rewards
-
-The network trains a predictive model for each asset and calculates your salience (importance) across all of them. Your final reward is based on your total predictive contribution to the system.
-
-- **Asset Filtering**: The system automatically filters out periods where asset prices haven't changed for a configured number of timesteps (e.g., during market closures), ensuring you are not penalized for stale data feeds.
-- **Zero Submissions**: If you submit only zeros for an asset, your contribution for that asset will be 0. Providing valuable embeddings for all assets is the best way to maximize your rewards.
-
-You are now ready to mine with multi-asset support!
-
-## 6. MULTI-BREAKOUT Challenge (Range Breakout)
-
-The MULTI-BREAKOUT challenge predicts whether price will **continue** or **reverse** after breaking out of a recent trading range. This challenge covers 33 liquid crypto assets and carries the highest weight (5.0) in the incentive distribution.
-
-### 6.1 What is a Range Breakout?
-
-A range breakout occurs when price moves beyond a defined barrier (25% of the recent 4-day range) from the current price:
-
-```
-         ┌─────────────────────────────┐
-  HIGH   │     4-day range             │
-         │                             │
-         │   ████ barrier (25%)        │  ← BREAKOUT triggers here
-  PRICE ─┼─────────────────────────────┤
-         │   ████ barrier (25%)        │  ← or here
-         │                             │
-  LOW    │                             │
-         └─────────────────────────────┘
-```
-
-### 6.2 Challenge Parameters
-
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| `range_lookback_blocks` | 28800 | 4 days of blocks (7200/day) |
-| `barrier_pct` | 25.0 | Barrier = 25% of range |
-| `min_range_pct` | 1.0 | Skip if range < 1% of price |
-| `weight` | 5.0 | Highest challenge weight |
-| `gate_top_pct` | 0.10 | Only top 10% by accuracy score |
-
-### 6.3 How Resolution Works
-
-When price hits a barrier:
-1. **Direction** is recorded (UP or DOWN breakout)
-2. **Outcome** is determined by subsequent price action:
-   - **Continuation**: Price continues in breakout direction (hits opposite barrier)
-   - **Reversal**: Price reverses (returns to pre-breakout level)
-
-Example: If BTC range is $95,000-$100,000 (range = $5,000), barrier = $1,250 (25% of $5,000).
-- Breakout triggers at $101,250 (up) or $93,750 (down)
-- If up breakout → continuation = price hits $102,500; reversal = price returns to $100,000
-
-### 6.4 Submission Format
-
-Submit a dictionary keyed by asset ticker. Each value is `[P_continuation, P_reversal]`:
+Barriers are set at \(\pm 1\sigma\) of recent returns. Scoring: two independent L2 logistic regressions on logit-transformed miner probabilities (one for up-barrier-hit, one for down). Single fit on all valid samples (no walk-forward). Importance = \(|\beta_j^{\text{up}}| + |\beta_j^{\text{down}}|\).
 
 ```python
-{
-    "BTC": [0.55, 0.45],  # 55% continuation, 45% reversal
-    "ETH": [0.40, 0.60],  # 40% continuation, 60% reversal
-    # ... all 33 assets
+embeddings["ETHHITFIRST"] = [0.4, 0.35, 0.25]
+```
+
+### 3.3 LBFGS (dim=17)
+
+Tickers: `ETHLBFGS` (1h), `BTCLBFGS` (6h)
+
+Two scoring paths combined 75/25:
+
+**Classifier path (75%)** — `p[0:5]`: 5-bucket probability distribution over volatility regimes (boundaries at \(\pm 1\sigma\), \(\pm 2\sigma\)). Must be in \((0, 1)\), sum to 1. Scoring: per-class L2 logistic regressions on argmax predictions, walk-forward segmented. Importance = \(\sum_c \beta_{j,c}^2\). Uniqueness penalty suppresses miners with >85% argmax overlap with higher-ranked peers.
+
+**Q-path (25%)** — `q[5:17]`: 12 exceedance probabilities. For tail buckets 0, 1, 3, 4 (not the center bucket 2), predict \(P(|\text{return}| > k\sigma)\) at thresholds \(k \in \{0.5, 1.0, 2.0\}\). Scoring: 12 independent binary L2 logistic models on logit-transformed probabilities. Importance = averaged \(|\beta_j|\) across sub-models.
+
+```
+Index   Meaning
+[0:5]   p[0..4] — regime probabilities
+[5:8]   Q bucket 0, thresholds [0.5σ, 1.0σ, 2.0σ]
+[8:11]  Q bucket 1, thresholds [0.5σ, 1.0σ, 2.0σ]
+[11:14] Q bucket 3, thresholds [0.5σ, 1.0σ, 2.0σ]
+[14:17] Q bucket 4, thresholds [0.5σ, 1.0σ, 2.0σ]
+```
+
+```python
+import numpy as np
+
+p = np.array([0.05, 0.15, 0.60, 0.15, 0.05])  # regime probs
+q = np.random.uniform(0.01, 0.99, 12).tolist()   # exceedance probs
+
+embeddings["ETHLBFGS"] = p.tolist() + q
+embeddings["BTCLBFGS"] = p.tolist() + q
+```
+
+### 3.4 MULTI-BREAKOUT (dim=2 per asset, 33 assets)
+
+Ticker: `MULTIBREAKOUT`
+
+A state machine tracks rolling 4-day price ranges per asset. When price breaches a barrier (25% of range width), a breakout event triggers. Predict whether it continues or reverses.
+
+**Parameters:**
+
+| Parameter | Value |
+|---|---|
+| `range_lookback_blocks` | 28800 (4 days) |
+| `barrier_pct` | 25% of range |
+| `min_range_pct` | 1% (skip tight ranges) |
+
+**Submission:** dict keyed by asset. Each value is \([P_{\text{continuation}},\; P_{\text{reversal}}]\) in \((0, 1)\).
+
+```python
+from config import BREAKOUT_ASSETS
+
+embeddings["MULTIBREAKOUT"] = {
+    asset: [float(np.clip(your_model(asset), 0.01, 0.99)),
+            float(np.clip(1 - your_model(asset), 0.01, 0.99))]
+    for asset in BREAKOUT_ASSETS
 }
 ```
 
-Both probabilities must be in (0, 1). They don't need to sum to 1 (they represent independent confidence levels).
-
-### 6.5 Supported Assets
+**Assets (33):**
 
 ```python
 BREAKOUT_ASSETS = [
@@ -210,83 +132,205 @@ BREAKOUT_ASSETS = [
 ]
 ```
 
-### 6.6 Code Example
+**Scoring:** two-stage. (1) AUC gate — per-miner AUC on \(P_{\text{continuation}}\) vs realized label, requiring AUC > 0.5, ≥ 2 temporal episodes, and prediction std > 0.03. (2) L2 logistic regression on z-scored predictions from qualifying miners with episode-balanced sample weighting (each temporal episode gets equal total weight). Importance = \(|\beta_j|\).
+
+**Breakouts are rare.** ~1-5 per asset per day. Submissions only matter at the instant a breakout triggers. Continuous submission is mandatory.
+
+### 3.5 XSEC-RANK (dim=1 per asset, 33 assets)
+
+Ticker: `MULTIXSEC`
+
+Horizon: 1200 blocks (4h). Predict which assets will have above-median forward returns relative to the cross-section.
+
+**Submission:** dict keyed by asset. Each value is a single score in \([-1, 1]\).
+
+**Label construction:** for each (timestep, asset) pair:
+
+\[
+y_{t,a} = \mathbf{1}\!\Big[r_{t \to t+h}^{(a)} > \text{median}_a\big(r_{t \to t+h}\big)\Big]
+\]
+
+All 33 assets are pooled into a single binary classification (33x sample multiplier). Walk-forward meta-model with AUC-scaled coefficients.
+
+```python
+from config import BREAKOUT_ASSETS
+
+embeddings["MULTIXSEC"] = {
+    asset: float(np.clip(your_score(asset), -1, 1))
+    for asset in BREAKOUT_ASSETS
+}
+```
+
+### 3.6 FUNDING-XSEC (dim=1 per asset, 20 assets)
+
+Ticker: `FUNDINGXSEC`
+
+Horizon: 2400 blocks (8h). Predict which assets' perpetual funding rates will change more than the cross-sectional median over the next settlement window.
+
+**Label construction:**
+
+\[
+\Delta f_a = f_{t+h}^{(a)} - f_t^{(a)}
+\]
+\[
+y_{t,a} = \mathbf{1}\!\Big[\Delta f_a > \text{median}_a(\Delta f)\Big]
+\]
+
+Using changes rather than levels destroys the high autocorrelation in funding rate levels (\(\phi \approx 0.97\)) and isolates asset-specific deviations. The cross-sectional median subtraction removes the market-wide funding factor (beta). Base rate is exactly 50% by construction.
+
+**Submission:** dict keyed by asset. Each value is a single score in \([-1, 1]\). Positive = expect above-median funding change. Magnitude matters (used as logistic regression feature). Missing assets default to 0.0 (neutral).
+
+```python
+from config import FUNDING_ASSETS
+
+embeddings["FUNDINGXSEC"] = {
+    asset: float(np.clip(your_model(asset), -1, 1))
+    for asset in FUNDING_ASSETS
+}
+```
+
+**Assets (20):**
+
+```python
+FUNDING_ASSETS = [
+    "BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK", "DOT", "SUI",
+    "NEAR", "AAVE", "UNI", "LTC", "HBAR", "PEPE", "TRX", "SHIB", "TAO", "ONDO",
+]
+```
+
+**Scoring:** identical structure to XSEC-RANK. All 20 assets pooled (20x sample multiplier). Walk-forward meta-model with embargo \(= \max(\text{LAG}, \text{ahead})\). Stale miners (temporal std < \(10^{-4}\) per asset column) are zeroed before pooling.
+
+**Useful features:**
+- Current funding rate levels (mean reversion: extreme rates tend to normalize)
+- Open interest changes and long/short ratio shifts
+- Recent price momentum relative to peers
+- Liquidation volume and order book skew
+- Cross-asset lead-lag (BTC funding often leads alts by 1-2 settlement periods)
+
+---
+
+## 4. Full Embedding Assembly
 
 ```python
 import numpy as np
-from config import BREAKOUT_ASSETS
+from config import CHALLENGES, BREAKOUT_ASSETS, FUNDING_ASSETS
 
-def generate_multibreakout_payload():
-    """Generate MULTI-BREAKOUT submission."""
-    payload = {}
-    for asset in BREAKOUT_ASSETS:
-        # Replace with your model's predictions
-        p_cont = np.clip(np.random.uniform(0.3, 0.7), 0.01, 0.99)
-        p_rev = np.clip(np.random.uniform(0.3, 0.7), 0.01, 0.99)
-        payload[asset] = [float(p_cont), float(p_rev)]
-    return payload
+embeddings = {}
 
-# Add to your embeddings dict
-embeddings["MULTIBREAKOUT"] = generate_multibreakout_payload()
+for spec in CHALLENGES:
+    ticker = spec["ticker"]
+
+    if ticker == "MULTIBREAKOUT":
+        embeddings[ticker] = {a: [0.5, 0.5] for a in BREAKOUT_ASSETS}
+
+    elif ticker == "MULTIXSEC":
+        embeddings[ticker] = {a: 0.0 for a in BREAKOUT_ASSETS}
+
+    elif ticker == "FUNDINGXSEC":
+        embeddings[ticker] = {a: 0.0 for a in FUNDING_ASSETS}
+
+    else:
+        embeddings[ticker] = np.zeros(spec["dim"]).tolist()
+
+# Replace all zeros above with your actual model outputs.
 ```
 
-### 6.7 Scoring Mechanism
+---
 
-Scoring is two-stage:
+## 5. Scoring Details
 
-1. **Empirical Accuracy Gate**: Only miners in the top 10% by raw prediction accuracy (over resolved breakouts) proceed to attribution scoring.
+### Weight allocation
 
-2. **Logistic Regression Attribution**: A logistic model learns which miners' predictions are most informative. Salience is derived from the learned mixture weights.
+Per-challenge salience is normalized to sum to 1, then weighted:
 
-### 6.8 Important: When Submissions Matter
+| Challenge | Weight | Share of total |
+|---|---|---|
+| MULTI-BREAKOUT | 5.0 | ~22% |
+| FUNDING-XSEC | 4.0 | ~17% |
+| ETHLBFGS | 3.5 | ~15% |
+| XSEC-RANK | 3.0 | ~13% |
+| BTCLBFGS | 2.875 | ~12% |
+| ETHHITFIRST | 2.5 | ~11% |
+| Binary (5x) | 1.0 each | ~22% total |
 
-**99%+ of submissions are discarded.** The validator only uses submissions that were active at the moment a breakout triggered for a specific asset. Since breakouts are rare and unpredictable, you must submit continuously.
+### Scoring by challenge type
 
-- Breakouts happen ~1-5 times per day per asset (varies by volatility)
-- Your submission at minute T is evaluated if a breakout triggers at minute T
-- Submissions at all other minutes are ignored for scoring
+Not all challenges use the same scoring structure. Summary:
 
-**Continuous submission is mandatory** due to design simplicity—the validator samples every minute and only retains data when breakouts occur.
+| Challenge | Scoring method | Importance metric |
+|---|---|---|
+| Binary | Walk-forward ElasticNet (L1/L2) meta-model on OOS base-model predictions | \(\|\beta_j\|\) |
+| LBFGS | 75% classifier path (per-class L2 logreg, \(\beta_j^2\), uniqueness penalty) + 25% Q-path (12 sub-models, averaged \(\|\beta_j\|\)) | blended |
+| HITFIRST | Two single-fit L2 logistic regressions (up-hit, down-hit) — no walk-forward | \(\|\beta_j^{\text{up}}\| + \|\beta_j^{\text{down}}\|\) |
+| MULTI-BREAKOUT | AUC gate → L2 logreg on z-scored predictions, episode-balanced weighting | \(\|\beta_j\|\) |
+| XSEC-RANK | Walk-forward L2 meta-model, AUC-scaled coefficients, recency-weighted segments | \(\|\beta_j\| \cdot \text{AUC\_scale}\) |
+| FUNDING-XSEC | Same as XSEC-RANK + stale filter (\(\text{std} < 10^{-4}\)) + extended embargo | \(\|\beta_j\| \cdot \text{AUC\_scale}\) |
 
-### 6.9 Strategy Considerations
+For challenges with walk-forward segments, recency weighting applies: \(w_i = \gamma^{n - 1 - i}\) where \(\gamma = 0.5^{1/\text{HALFLIFE}}\).
 
-- **Base rate**: Historically, breakouts have a slight continuation bias (~52-55%). Beating this baseline requires regime-specific signals.
-- **Regime dependence**: Continuation probability varies with volatility, trend strength, and time-of-day. Static predictions underperform.
-- **Cross-asset signals**: Correlated assets (e.g., BTC/ETH) often break out together. Lead-lag relationships can improve predictions.
+### What gets you zero weight
 
-### 6.10 Reward Share
+- Submitting constant values (temporal std < \(10^{-4}\))
+- Submitting all zeros
+- Random noise (AUC ≈ 0.5 → coefficient pushed to zero by L1/L2)
+- Copying a top miner (L2 splits coefficient mass among clones)
 
-| Challenge | Weight | Share |
-|-----------|--------|-------|
-| MULTI-BREAKOUT | 5.0 | ~30% |
-| ETHLBFGS | 3.5 | ~21% |
-| BTCLBFGS | 2.875 | ~17% |
-| ETHHITFIRST | 2.5 | ~15% |
-| Binary (5x) | 1.0 each | ~17% |
+---
 
-### 6.11 Debugging Your Submissions
+## 6. Validation Checklist
 
 ```python
-def validate_multibreakout(payload: dict) -> bool:
-    from config import BREAKOUT_ASSETS
-    if not isinstance(payload, dict):
-        return False
-    for asset in BREAKOUT_ASSETS:
-        if asset not in payload:
-            return False
-        vec = payload[asset]
-        if not isinstance(vec, list) or len(vec) != 2:
-            return False
-        if not all(0 < v < 1 for v in vec):
-            return False
-    return True
+from config import CHALLENGES, BREAKOUT_ASSETS, FUNDING_ASSETS
+
+def validate_embeddings(emb: dict) -> list[str]:
+    errors = []
+    for spec in CHALLENGES:
+        tk = spec["ticker"]
+        if tk not in emb:
+            errors.append(f"Missing {tk}")
+            continue
+        val = emb[tk]
+
+        if tk == "MULTIBREAKOUT":
+            if not isinstance(val, dict):
+                errors.append(f"{tk}: expected dict"); continue
+            for a in BREAKOUT_ASSETS:
+                v = val.get(a)
+                if not isinstance(v, list) or len(v) != 2:
+                    errors.append(f"{tk}.{a}: need [p_cont, p_rev]")
+                elif not all(0 < x < 1 for x in v):
+                    errors.append(f"{tk}.{a}: values must be in (0,1)")
+
+        elif tk == "MULTIXSEC":
+            if not isinstance(val, dict):
+                errors.append(f"{tk}: expected dict"); continue
+            for a in BREAKOUT_ASSETS:
+                v = val.get(a, None)
+                if not isinstance(v, (int, float)) or not (-1 <= v <= 1):
+                    errors.append(f"{tk}.{a}: need float in [-1,1]")
+
+        elif tk == "FUNDINGXSEC":
+            if not isinstance(val, dict):
+                errors.append(f"{tk}: expected dict"); continue
+            for a in FUNDING_ASSETS:
+                v = val.get(a, None)
+                if v is not None and (not isinstance(v, (int, float)) or not (-1 <= v <= 1)):
+                    errors.append(f"{tk}.{a}: need float in [-1,1]")
+
+        else:
+            if not isinstance(val, list) or len(val) != spec["dim"]:
+                errors.append(f"{tk}: expected list of length {spec['dim']}")
+
+    return errors
 ```
 
-### 6.12 Format Errors
+---
 
-- **Missing assets**: Must include all 33 assets
-- **Wrong dimension**: Each asset needs exactly `[P_cont, P_rev]`
-- **Out of range**: Values must be in (0, 1), not [0, 1]
-- **Wrong key**: Use ticker (e.g., `"MULTIBREAKOUT"`) not challenge name
+## 7. Common Mistakes
 
-
+- **Wrong ticker key**: use `"MULTIBREAKOUT"` not `"MULTI-BREAKOUT"`, `"FUNDINGXSEC"` not `"FUNDING-XSEC"`.
+- **LBFGS probabilities don't sum to 1**: `p[0:5]` must form a valid distribution.
+- **HITFIRST probabilities outside (0,1)**: hard zeros or ones cause log-loss issues.
+- **Breakout values at boundary**: use `(0, 1)` not `[0, 1]`.
+- **Stale submissions**: if your embedding doesn't change across timestamps, the stale filter zeroes your contribution.
+- **Missing challenges**: omitting a challenge means zero weight for that fraction of emissions.
