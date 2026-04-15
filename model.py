@@ -19,6 +19,7 @@ from bucket_forecast import compute_lbfgs_salience, compute_q_path_salience
 from hitfirst import compute_hitfirst_salience
 from range_breakout import compute_multi_breakout_salience
 from xsec_rank import compute_xsec_rank_salience
+from funding_xsec import compute_funding_xsec_salience
 
 
 logger = logging.getLogger(__name__)
@@ -460,6 +461,36 @@ def multi_salience(
                 sample_every=int(config.SAMPLE_EVERY),
             )
             del hist, prices_multi, prices_trimmed
+        elif loss_type == "funding_xsec":
+            if not isinstance(payload, dict):
+                del payload
+                continue
+            hist = payload.get("hist")
+            funding_rates = payload.get("funding_rates")
+            sidx_arr = payload.get("sidx_arr")
+            blocks_ahead = int(spec.get("blocks_ahead", 0) or 0)
+            del payload
+            if (
+                not isinstance(hist, tuple)
+                or len(hist) != 2
+                or funding_rates is None
+                or blocks_ahead <= 0
+            ):
+                continue
+            hist_trimmed = _trim_hist_price(hist, funding_rates[:, 0])
+            if hist_trimmed[0] is None:
+                continue
+            trim_len = hist_trimmed[0][0].shape[0]
+            funding_trimmed = funding_rates[-trim_len:]
+            sidx_trimmed = sidx_arr[-trim_len:] if sidx_arr is not None else None
+            s = compute_funding_xsec_salience(
+                (hist_trimmed[0][0], hist_trimmed[0][1]),
+                funding_trimmed,
+                blocks_ahead=blocks_ahead,
+                sample_every=int(config.SAMPLE_EVERY),
+                sidx_arr=sidx_trimmed,
+            )
+            del hist, funding_rates, funding_trimmed, sidx_trimmed
         else:
             del payload
             continue
