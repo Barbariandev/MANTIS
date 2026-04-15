@@ -113,6 +113,11 @@ BREAKOUT_ASSETS = [
     "NEAR", "ICP", "ETC", "ONDO", "SKY",
 ]
 
+FUNDING_ASSETS = [
+    "BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK", "DOT", "SUI",
+    "NEAR", "AAVE", "UNI", "LTC", "HBAR", "PEPE", "TRX", "SHIB", "TAO", "ONDO",
+]
+
 MULTI_BREAKOUT_CHALLENGE = {
     "name": "MULTI-BREAKOUT",
     "ticker": "MULTIBREAKOUT",
@@ -139,6 +144,18 @@ XSEC_RANK_CHALLENGE = {
 }
 
 CHALLENGES.append(XSEC_RANK_CHALLENGE)
+
+FUNDING_XSEC_CHALLENGE = {
+    "name": "FUNDING-XSEC",
+    "ticker": "FUNDINGXSEC",
+    "assets": FUNDING_ASSETS,
+    "dim": 1,
+    "blocks_ahead": 2400,  
+    "loss_func": "funding_xsec",
+    "weight": 4.0,
+}
+
+CHALLENGES.append(FUNDING_XSEC_CHALLENGE)
 
 CHALLENGE_MAP = {c["ticker"]: c for c in CHALLENGES}
 CHALLENGE_NAME_TO_TICKER = {c["name"]: c["ticker"] for c in CHALLENGES}
