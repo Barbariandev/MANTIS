@@ -278,7 +278,11 @@ class DataLog:
         self._init_breakout_trackers()
         self._load_breakout_state()
 
-        self._drand_db_count: int = self._conn.execute("SELECT COUNT(*) FROM drand_cache").fetchone()[0]
+        try:
+            self._drand_db_count: int = self._conn.execute("SELECT COUNT(*) FROM drand_cache").fetchone()[0]
+        except sqlite3.DatabaseError as e:
+            logger.warning(f"drand_cache table seems corrupted: {e}")
+            self._drand_db_count = 0
 
         logger.info(
             "Opened live SQLite datalog: %s (%d blocks, drand_in_db=%d)",
@@ -453,12 +457,15 @@ class DataLog:
         cached = self._drand_cache.get(round_num)
         if cached:
             return cached
-        row = self._conn.execute(
-            "SELECT signature FROM drand_cache WHERE round=?", (round_num,)
-        ).fetchone()
-        if row and row[0]:
-            self._drand_cache[round_num] = row[0]
-            return row[0]
+        try:
+            row = self._conn.execute(
+                "SELECT signature FROM drand_cache WHERE round=?", (round_num,)
+            ).fetchone()
+            if row and row[0]:
+                self._drand_cache[round_num] = row[0]
+                return row[0]
+        except sqlite3.DatabaseError as e:
+            logger.warning(f"Failed to read from drand_cache: {e}")
 
         url = f"{config.DRAND_API}/beacons/{config.DRAND_BEACON_ID}/rounds/{round_num}"
         sig = None
@@ -489,11 +496,14 @@ class DataLog:
                 to_drop = sorted(self._drand_cache)[:len(self._drand_cache) - self._DRAND_MEM_CAP // 2]
                 for k in to_drop:
                     del self._drand_cache[k]
-            self._conn.execute(
-                "INSERT OR REPLACE INTO drand_cache (round, signature) VALUES (?, ?)",
-                (round_num, sig),
-            )
-            self._conn.commit()
+            try:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO drand_cache (round, signature) VALUES (?, ?)",
+                    (round_num, sig),
+                )
+                self._conn.commit()
+            except sqlite3.DatabaseError as e:
+                logger.warning(f"Failed to write to drand_cache: {e}")
         return sig
 
     def _zero_vecs(self):
