@@ -66,37 +66,35 @@ All challenges are defined in `config.py` under `CHALLENGES`. Each specifies a `
 
 ## Scoring
 
-### Walk-forward meta-model
+### Per-challenge scoring
 
-All challenge types follow a two-stage walk-forward evaluation with strict temporal embargo.
+Each `loss_func` has its own scoring path. All use L2 logistic regression and coefficient-based importance, but the structure differs.
 
-**Stage 1 — Feature selection.** For each miner \(j\), fit an L2 logistic regression on the miner's historical predictions against realized labels. Evaluate OOS AUC on a held-out window. Select top-\(K\) miners by AUC (default \(K = 20\)).
+**Binary** (`binary`) — Walk-forward with ElasticNet meta-model. Feature selection: per-miner L2 logistic on first half, AUC on second half, select top-\(K\) (default 50). Meta-model: ElasticNet logistic (L1 ratio 0.5) on OOS base-model predictions across walk-forward segments. Importance = \(|\beta_j|\). Segments weighted by recency.
 
-**Stage 2 — Meta-model.** Stack the selected miners' OOS base-model predictions as features in an ElasticNet (or L2) logistic regression. Extract miner importance from absolute coefficient magnitude:
+**LBFGS** (`lbfgs`) — Two independent scoring paths blended 75/25:
+- *Classifier path* (`compute_linear_salience`): per-class L2 logistic regressions on 5-bucket argmax predictions. Importance = \(\beta_j^2\) summed across classes. Vectorized balanced accuracy evaluation. Uniqueness penalty suppresses miners with >85% argmax overlap with higher-ranked peers.
+- *Q-path* (`compute_q_path_salience`): 12 independent binary L2 logistic models (one per tail-bucket / sigma-threshold combination). Importance = averaged \(|\beta_j|\) across sub-models.
+
+Both paths are individually top-\(K\) renormalized with exponential rank decay before blending.
+
+**HITFIRST** (`hitfirst`) — Two L2 logistic regressions on logit-transformed miner probabilities: one for up-barrier-hit (\(y=1\) if price hits +\(\sigma\) first), one for down-barrier-hit. Importance = \(|\beta_j^{\text{up}}| + |\beta_j^{\text{down}}|\). No walk-forward — single fit on all valid samples.
+
+**MULTI-BREAKOUT** (`range_breakout_multi`) — Operates on completed breakout events (not time series). Two-stage: (1) Empirical AUC gate — per-miner AUC on \(P_{\text{continuation}}\) vs realized label, requiring AUC > 0.5 and ≥ 2 temporal episodes. (2) L2 logistic on z-scored miner predictions with episode-balanced sample weighting (each temporal episode gets equal total weight regardless of event count). Importance = \(|\beta_j|\).
+
+**XSEC-RANK** (`xsec_rank`) — Cross-sectional binary reformulation: label = 1 if asset's forward return exceeds the cross-sectional median. All assets pooled (\(N_{\text{assets}} \times\) sample multiplier). Walk-forward meta-model: feature selection by per-miner univariate AUC, top-\(K\) (default 20) selected, L2 logistic meta-model. Importance per segment:
 
 \[
-w_j = |{\beta_j}| \cdot \max\!\Big(\frac{\text{AUC}_{\text{meta}} - 0.5}{0.5},\; 0\Big)
+w_j = |\beta_j| \cdot \max\!\Big(\frac{\text{AUC}_{\text{meta}} - 0.5}{0.5},\; 0\Big)
 \]
 
-Segment-level importances are aggregated with exponential recency weighting (half-life configurable via `HALFLIFE`).
+Segments aggregated with exponential recency weighting.
 
-### Embargo
-
-For challenges with forward-looking labels, the embargo between train and validation windows is:
-
-\[
-\text{embargo} = \max(\text{LAG},\; \text{ahead})
-\]
-
-where `ahead = blocks_ahead / SAMPLE_EVERY`. Training rows whose labels reference data within the validation window are excluded via `train_cutoff = val_start - ahead`.
+**FUNDING-XSEC** (`funding_xsec`) — Same structure as XSEC-RANK but on funding rate changes instead of price returns. Embargo = \(\max(\text{LAG}, \text{ahead})\) with explicit `train_cutoff = val_start - ahead` to prevent label leakage from forward-looking labels. Stale miners (temporal std < \(10^{-4}\) per asset column) zeroed before pooling.
 
 ### Sybil resistance
 
-L2 regularization splits coefficient mass among correlated miners. If \(n\) clones submit identical predictions, each receives \(\approx w/n\) weight. L1 drives zero-information miners to exactly zero.
-
-### Cross-sectional challenges (XSEC-RANK, FUNDING-XSEC)
-
-The ranking problem is reformulated as binary classification: for each (timestep, asset) pair, the label is 1 if the asset's forward metric exceeds the cross-sectional median. All assets are pooled into a single problem, multiplying effective sample count by the number of assets. Stale miners (temporal std < \(10^{-4}\)) are zeroed before pooling.
+L2 regularization splits coefficient mass among correlated miners. If \(n\) clones submit identical predictions, each receives \(\approx w/n\) weight. L1 (in binary challenges) or the uniqueness penalty (in LBFGS) drives zero-information or duplicate miners to zero.
 
 ### Weight aggregation
 
