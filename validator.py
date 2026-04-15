@@ -62,12 +62,14 @@ WEIGHTS_PATH = os.path.join(config.STORAGE_DIR, "saved_weights.pkl")
 SAVE_INTERVAL = 480
 
 
-def save_weights(weights_tensor: torch.Tensor, uids: list[int], block: int):
+def save_weights(weights_tensor: torch.Tensor, uids: list[int], block: int, hotkeys: list[str] = None):
     weights_data = {
         "weights": weights_tensor,
         "uids": uids,
         "block": block,
     }
+    if hotkeys is not None:
+        weights_data["hotkeys"] = hotkeys
     with open(WEIGHTS_PATH, "wb") as f:
         pickle.dump(weights_data, f)
     logging.info(f"Saved weights calculated at block {block} to {WEIGHTS_PATH}")
@@ -407,11 +409,40 @@ async def run_main_loop(
                             weights_logger.warning("Zero-sum weights tensor, skipping set.")
                             return
                         
+                        # Apply EMA to reduce block-to-block variance (~6000 blocks average age)
+                        # WEIGHT_CALC_INTERVAL is 1000 blocks, so alpha=0.15 gives an average age of ~5666 blocks
+                        old_weights_data = load_weights()
+                        if old_weights_data is not None:
+                            old_w = old_weights_data["weights"]
+                            alpha = 0.15
+                            new_w_tensor = torch.zeros_like(final_w)
+                            
+                            if "hotkeys" in old_weights_data:
+                                old_hks = old_weights_data["hotkeys"]
+                                old_hk_to_w = {hk: float(old_w[i]) for i, hk in enumerate(old_hks) if i < len(old_w)}
+                                for i, hk in enumerate(metagraph.hotkeys):
+                                    old_val = old_hk_to_w.get(hk, 0.0)
+                                    new_val = float(final_w[i])
+                                    new_w_tensor[i] = alpha * new_val + (1.0 - alpha) * old_val
+                            else:
+                                old_uids = old_weights_data["uids"]
+                                old_uid_to_w = {uid: float(old_w[i]) for i, uid in enumerate(old_uids) if i < len(old_w)}
+                                for i, uid in enumerate(uids):
+                                    old_val = old_uid_to_w.get(uid, 0.0)
+                                    new_val = float(final_w[i])
+                                    new_w_tensor[i] = alpha * new_val + (1.0 - alpha) * old_val
+                                    
+                            if new_w_tensor.sum() > 0:
+                                final_w = new_w_tensor / new_w_tensor.sum()
+                        
+                        # Update normalized_weights for logging
+                        normalized_weights = {uid: float(final_w[i]) for i, uid in enumerate(uids)}
+                        
                         weights_to_log = {uid: f"{weight:.8f}" for uid, weight in normalized_weights.items() if uid in uids and weight > 0}
                         weights_logger.info(f"Normalized weights for block {block_snapshot}: {json.dumps(weights_to_log)}")
                         weights_logger.info(f"Final tensor sum: {final_w.sum().item()}")
                         
-                        save_weights(final_w, uids, block_snapshot)
+                        save_weights(final_w, uids, block_snapshot, metagraph.hotkeys)
                         weights_logger.info(f"Weights calculated and saved at block {block_snapshot} (max={final_w.max():.4f})")
 
                         del general_sal_hk, per_challenge, sal
