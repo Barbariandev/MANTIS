@@ -235,6 +235,58 @@ if [[ ${#FAILED_IMPORTS[@]} -gt 0 ]]; then
 fi
 ok "All critical packages import successfully"
 
+# ── BLAS library pin ────────────────────────────────────────────────
+# numpy==2.2.6 wheels bundle scipy-openblas (OpenBLAS 0.3.29).
+# We assert this at install time so a wheel swap or channel change is caught.
+EXPECTED_BLAS_NAME="scipy-openblas"
+EXPECTED_BLAS_VER="0.3.29"
+
+step "Verifying pinned BLAS library ($EXPECTED_BLAS_NAME $EXPECTED_BLAS_VER)"
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 MKL_CBWR=COMPATIBLE \
+  OPENBLAS_NUM_THREADS=1 BLIS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
+  $PY -c "
+import numpy as np, sys, os
+
+print('  BLAS env vars:')
+for v in ['OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'MKL_CBWR',
+          'OPENBLAS_NUM_THREADS', 'BLIS_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS']:
+    print(f'    {v}={os.environ.get(v, \"(unset)\")}')
+
+expected_name = '$EXPECTED_BLAS_NAME'
+expected_ver  = '$EXPECTED_BLAS_VER'
+
+cfg = np.show_config('dicts') if hasattr(np, 'show_config') else None
+if not isinstance(cfg, dict):
+    print('  WARNING: numpy.show_config(\"dicts\") unavailable, cannot verify BLAS pin')
+    np.show_config()
+    sys.exit(0)
+
+blas_info  = cfg.get('Build Dependencies', {}).get('blas', {})
+lapack_info = cfg.get('Build Dependencies', {}).get('lapack', {})
+blas_name = blas_info.get('name', 'unknown')
+blas_ver  = blas_info.get('version', 'unknown')
+print(f'  numpy BLAS:   {blas_name} {blas_ver}')
+print(f'  numpy LAPACK: {lapack_info.get(\"name\",\"unknown\")} {lapack_info.get(\"version\",\"unknown\")}')
+
+if blas_name != expected_name:
+    print(f'  FATAL: expected BLAS \"{expected_name}\" but got \"{blas_name}\"', file=sys.stderr)
+    print(f'         Ensure numpy=={np.__version__} is installed from PyPI (not intel, conda, etc.)', file=sys.stderr)
+    sys.exit(1)
+if blas_ver != expected_ver:
+    print(f'  WARNING: expected BLAS version {expected_ver} but got {blas_ver}')
+    print(f'           Weights may differ from reference -- update EXPECTED_BLAS_VER if intentional')
+
+openblas_cfg = blas_info.get('openblas configuration', '')
+print(f'  OpenBLAS config: {openblas_cfg}')
+
+a = np.random.RandomState(42).randn(200, 200)
+ref = a @ a.T
+for _ in range(5):
+    assert np.array_equal(ref, a @ a.T), 'BLAS matmul not bitwise reproducible!'
+print('  matmul reproducibility: PASS (5/5 identical)')
+"
+ok "BLAS pin verified: $EXPECTED_BLAS_NAME $EXPECTED_BLAS_VER"
+
 # ── Summary ─────────────────────────────────────────────────────────
 echo
 ok "Installation complete in $VENV"
