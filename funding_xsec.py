@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 SEED = int(getattr(config, "SEED", 42))
 N_ASSETS = len(config.FUNDING_ASSETS)
 
+
 # Tolerance window: the forward sidx match must be within this fraction of
 # the target ahead value.  E.g. for ahead=480 and tolerance 0.15, we accept
 # matches in [408, 552].  This prevents using rows that are wildly misaligned
