@@ -8,6 +8,13 @@ import os
 import random
 from typing import Dict, List, Tuple
 
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("MKL_CBWR", "COMPATIBLE")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("BLIS_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+
 import numpy as np
 import torch
 from tqdm import tqdm
