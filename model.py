@@ -23,6 +23,7 @@ from sklearn.metrics import roc_auc_score
 
 import config
 from bucket_forecast import compute_lbfgs_salience, compute_q_path_salience
+from cluster import collapse_salience, find_clusters, select_representatives
 from hitfirst import compute_hitfirst_salience
 from range_breakout import compute_multi_breakout_salience
 from xsec_rank import compute_xsec_rank_salience
@@ -386,6 +387,29 @@ def multi_salience(
             return None
         return trimmed[0], trimmed[1], blocks_ahead
 
+    def _cluster_reps(hist_in, dim_in, ticker_for_log: str) -> Dict[str, str]:
+        """Conservative deterministic clone detection for one challenge.
+
+        Returns ``{member_hk: representative_hk}`` so the caller can collapse
+        any per-challenge salience dict via ``collapse_salience``.  The result
+        is empty when no non-trivial cluster exists or input is malformed.
+        """
+        if hist_in is None or dim_in is None or int(dim_in) <= 0:
+            return {}
+        try:
+            clusters = find_clusters(hist_in, dim=int(dim_in))
+        except Exception:
+            logger.exception("[%s] cluster detection failed", ticker_for_log)
+            return {}
+        if not clusters:
+            return {}
+        reps = select_representatives(clusters)
+        logger.info(
+            "[%s] %d cluster(s) detected covering %d hotkeys; lex-min reps assigned",
+            ticker_for_log, len(clusters), len(reps),
+        )
+        return reps
+
     per_challenge: List[Tuple[str, Dict[str, float], float]] = []
     breakdown: Dict[str, Dict[str, float]] = {}
     total_w = 0.0
@@ -403,6 +427,10 @@ def multi_salience(
             hist, y = payload
             del payload
             s = salience_binary_prediction(hist, y, ticker)
+            if s:
+                reps = _cluster_reps(hist, spec.get("dim"), ticker)
+                if reps:
+                    s = collapse_salience(s, reps)
             del hist, y
         elif loss_type in ("lbfgs", "hitfirst"):
             extracted = _extract_hist_price(payload, spec)
@@ -414,6 +442,11 @@ def multi_salience(
                 se = int(config.SAMPLE_EVERY)
                 s_cls = compute_lbfgs_salience(hist, price, blocks_ahead=blocks_ahead, sample_every=se)
                 s_q = compute_q_path_salience(hist, price, blocks_ahead=blocks_ahead, sample_every=se)
+                if s_cls or s_q:
+                    reps = _cluster_reps(hist, spec.get("dim"), ticker)
+                    if reps:
+                        s_cls = collapse_salience(s_cls, reps)
+                        s_q = collapse_salience(s_q, reps)
                 if _is_uniform_salience(s_cls):
                     s_cls = {}
                 if _is_uniform_salience(s_q):
@@ -433,6 +466,10 @@ def multi_salience(
                 s = compute_hitfirst_salience(
                     hist, price, blocks_ahead=blocks_ahead, sample_every=int(config.SAMPLE_EVERY),
                 )
+                if s:
+                    reps = _cluster_reps(hist, spec.get("dim"), ticker)
+                    if reps:
+                        s = collapse_salience(s, reps)
             del hist, price
         elif loss_type == "range_breakout_multi":
             completed = payload.get("completed_samples", [])
@@ -467,6 +504,10 @@ def multi_salience(
                 blocks_ahead=blocks_ahead,
                 sample_every=int(config.SAMPLE_EVERY),
             )
+            if s:
+                reps = _cluster_reps(hist_trimmed[0], len(config.BREAKOUT_ASSETS), ticker)
+                if reps:
+                    s = collapse_salience(s, reps)
             del hist, prices_multi, prices_trimmed
         elif loss_type == "funding_xsec":
             if not isinstance(payload, dict):
@@ -497,6 +538,10 @@ def multi_salience(
                 sample_every=int(config.SAMPLE_EVERY),
                 sidx_arr=sidx_trimmed,
             )
+            if s:
+                reps = _cluster_reps(hist_trimmed[0], len(config.FUNDING_ASSETS), ticker)
+                if reps:
+                    s = collapse_salience(s, reps)
             del hist, funding_rates, funding_trimmed, sidx_trimmed
         else:
             del payload
