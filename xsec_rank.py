@@ -149,7 +149,7 @@ def compute_xsec_rank_salience(
             sel_aucs[j] = float(roc_auc_score(y_eval_j, scores_j))
 
         k = min(TOP_K, H)
-        selected = np.argsort(-sel_aucs)[:k]
+        selected = np.argsort(-sel_aucs, kind='stable')[:k]
         if selected.size == 0:
             pbar.update(1)
             continue
