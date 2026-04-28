@@ -36,25 +36,6 @@ NETUID = 123
 
 NUM_UIDS = 256
 
-# --------------------------------------------------------------------------
-# SCHEDULED 2026-04-27 — Q2 challenge-weight rebalance
-# --------------------------------------------------------------------------
-# On the next deployment cycle following 2026-04-27, the four challenge
-# weights flagged inline below are reduced to 50 % of their current values.
-# The rebalance concentrates relative emission on the volatility-binned
-# (LBFGS) and multi-asset breakout signal stack that powers the production
-# prediction layer.
-
-#   ETHHITFIRST            2.5   -> 1.25  (low signal duty cycle; majority
-#                                          of barrier events resolve to the
-#                                          neither-hit class)
-#   CADUSD (1H binary)     1.0   -> 0.5   (1H binary direction not producing
-#                                          extractable signal at this pair)
-#   NZDUSD (1H binary)     1.0   -> 0.5   (same)
-#
-# CHFUSD and XAGUSD remain at full weight
-# ETHLBFGS, BTCLBFGS, MULTIBREAKOUT, MULTIXSEC, and FUNDINGXSEC are unchanged.
-# --------------------------------------------------------------------------
 CHALLENGES = [
     {
         "name": "ETH-1H-BINARY",
@@ -62,7 +43,7 @@ CHALLENGES = [
         "dim": 2,
         "blocks_ahead": 300,
         "loss_func": "binary",
-        "weight": 1,    # SCHEDULED 2026-04-27: 1 -> 0.5
+        "weight": 0.5,
     },
     {
         "name": "ETH-HITFIRST-100M",
@@ -71,7 +52,7 @@ CHALLENGES = [
         "dim": 3,
         "blocks_ahead": 500,
         "loss_func": "hitfirst",
-        "weight": 2.5,  # SCHEDULED 2026-04-27: 2.5 -> 1.25
+        "weight": 1.25, 
     },
     {
         "name": "ETH-LBFGS",
@@ -97,7 +78,7 @@ CHALLENGES = [
         "dim": 2,
         "blocks_ahead": 300,
         "loss_func": "binary",
-        "weight": 1,    # SCHEDULED 2026-04-27: 1 -> 0.5
+        "weight": 0.5,
     },
     {
         "name": "NZDUSD-1H-BINARY",
@@ -105,7 +86,7 @@ CHALLENGES = [
         "dim": 2,
         "blocks_ahead": 300,
         "loss_func": "binary",
-        "weight": 1,    # SCHEDULED 2026-04-27: 1 -> 0.5
+        "weight": 0.5,
     },
     {
         "name": "CHFUSD-1H-BINARY",
