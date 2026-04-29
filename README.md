@@ -189,7 +189,7 @@ See `MINER_GUIDE.md` for submission details per challenge type.
 
 ## Model Iteration Tool
 
-The [MANTIS Model Iteration Tool](https://github.com/BarbarianDev/mantis_model_iteration_tool) is a standalone framework for developing, backtesting, and iterating on MANTIS mining strategies. It provides autonomous agent-driven research, walk-forward evaluation with causal data access, and a web dashboard for tracking iterations across all challenge types. See the [repository](https://github.com/BarbarianDev/mantis_model_iteration_tool) for setup and SDK documentation.
+The [MANTIS Model Iteration Tool](https://github.com/BarbarianDev/mantis_model_iteration_tool) is a standalone framework for developing, backtesting, and iterating on MANTIS mining strategies. It provides autonomous agent-driven research, walk-forward evaluation with causal data access, and a web dashboard for tracking iterations across all crypto challenge types. See the [repository](https://github.com/BarbarianDev/mantis_model_iteration_tool) for setup and SDK documentation. 
 
 ---
 
