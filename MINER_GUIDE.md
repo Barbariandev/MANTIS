@@ -326,7 +326,59 @@ def validate_embeddings(emb: dict) -> list[str]:
 
 ---
 
-## 7. Common Mistakes
+## 7. Model Iteration Tool
+
+The [MANTIS Model Iteration Tool](https://github.com/BarbarianDev/mantis_model_iteration_tool) is an open-source framework for developing and backtesting MANTIS mining strategies. It runs autonomous agents that implement `Featurizer` and `Predictor` classes, evaluates them with causal data access and walk-forward backtesting, and tracks iterations in a web dashboard.
+
+**Quick start:**
+
+```bash
+git clone https://github.com/BarbarianDev/mantis_model_iteration_tool.git
+cd mantis_model_iteration_tool
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+python -m mantis_model_iteration_tool.gui   # http://127.0.0.1:8420
+```
+
+**Supported challenges:**
+
+| Challenge | Metric |
+|---|---|
+| `ETH-1H-BINARY` | AUC |
+| `ETH-HITFIRST-100M` | Log loss |
+| `ETH-LBFGS` / `BTC-LBFGS-6H` | Balanced accuracy |
+| `MULTI-BREAKOUT` | AUC |
+| `XSEC-RANK` / `FUNDING-XSEC` | Spearman |
+
+**SDK example:**
+
+```python
+from mantis_model_iteration_tool import Featurizer, Predictor, evaluate
+import numpy as np
+
+class MyFeaturizer(Featurizer):
+    warmup = 200
+    compute_interval = 1
+
+    def compute(self, view):
+        prices = view.prices("ETH")
+        returns = np.diff(np.log(prices[-100:]))
+        return {"momentum": np.array([returns.mean()]),
+                "volatility": np.array([returns.std()])}
+
+class MyPredictor(Predictor):
+    def predict(self, features):
+        p_up = 0.5 + 0.5 * np.tanh(features["momentum"][0] * 500)
+        return np.array([p_up, 1.0 - p_up])
+
+result = evaluate("ETH-1H-BINARY", MyFeaturizer(), MyPredictor(), days_back=60)
+```
+
+The tool enforces causal data access (no future leakage), containerized execution with resource limits, and structured iteration tracking. See the [repository](https://github.com/BarbarianDev/mantis_model_iteration_tool) for full documentation.
+
+---
+
+## 8. Common Mistakes
 
 - **Wrong ticker key**: use `"MULTIBREAKOUT"` not `"MULTI-BREAKOUT"`, `"FUNDINGXSEC"` not `"FUNDING-XSEC"`.
 - **LBFGS probabilities don't sum to 1**: `p[0:5]` must form a valid distribution.
