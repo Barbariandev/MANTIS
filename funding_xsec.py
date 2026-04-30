@@ -78,9 +78,9 @@ def compute_funding_xsec_salience(
     there are gaps in the data stream.
     """
     LAG_T = int(getattr(config, "LAG", 60))
-    CHUNK_T = int(getattr(config, "CHUNK_SIZE", 4000))
+    CHUNK_T = int(getattr(config, "CHUNK_SIZE", 8000))
     TOP_K = int(getattr(config, "TOP_K", 20))
-    HALFLIFE = int(getattr(config, "WINDOWS_HALF_LIFE", 10))
+    HALFLIFE = int(getattr(config, "WINDOWS_HALF_LIFE", 3))
     MIN_TRAIN_ROWS = 200
 
     X_flat, hk2idx = hist
