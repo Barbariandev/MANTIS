@@ -176,6 +176,15 @@ SAMPLE_EVERY = 5
 
 LAG = 60
 
+# Walk-forward bandwidth and recency-kernel parameters live here so every
+# scorer reads from a single source of truth.  Values are expressed in
+# physical units (contiguous validator samples, calendar days) rather than
+# implementation indices, which keeps the time-domain estimator invariant
+# under future changes to chunking or sample cadence.
+CHUNK_SIZE = 8000
+HALFLIFE_DAYS = 15.0
+WINDOWS_HALF_LIFE = 3
+
 TASK_INTERVAL = 500
 
 WEIGHT_CALC_INTERVAL = 1000
