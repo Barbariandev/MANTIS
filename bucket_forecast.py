@@ -25,10 +25,21 @@ __all__ = (
 RECENT_SAMPLES = 14_000
 RECENT_MASS = 0.5
 TOP_K = 25
-_WF_CHUNK = 6000
+# Walk-forward bandwidth in contiguous validator samples.  At the 60-second
+# sample cadence this is ~8.33 calendar days per segment, chosen so that
+# each segment spans a full overnight regime cycle plus margin and so that
+# the per-class L2 objective sees a positive-definite Hessian approximation
+# on the tail-bucket targets where the active miner set is narrowest.
+_WF_CHUNK = 12_000
 _MAX_TRAIN = 3 * _WF_CHUNK
 _META_K = 100
-_RECENCY_GAMMA = 0.5 ** 0.1
+# Recency exponent derived from a 15-day calendar half-life rather than from
+# a fixed segment count, so the kernel's effective memory stays anchored
+# under future changes to chunk size or sample cadence.  At ~8.33 days per
+# segment the per-segment decay is 0.5 ** (8.33 / 15.0) ≈ 0.681.
+_HALFLIFE_DAYS = 15.0
+_DAYS_PER_SEGMENT = (_WF_CHUNK * 60.0) / 86_400.0
+_RECENCY_GAMMA = 0.5 ** (_DAYS_PER_SEGMENT / _HALFLIFE_DAYS)
 
 
 def _balanced_accuracy(y_true: np.ndarray, y_pred: np.ndarray, K: int) -> float:
