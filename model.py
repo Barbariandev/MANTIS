@@ -173,7 +173,7 @@ def salience_binary_prediction(
     ticker: str,
 ) -> Dict[str, float]:
     LAG = int(getattr(config, "LAG", 1))
-    CHUNK_SIZE = int(getattr(config, "CHUNK_SIZE", 4000))
+    CHUNK_SIZE = int(getattr(config, "CHUNK_SIZE", 8000))
     TOP_K = int(getattr(config, "TOP_K", 50))
     RET_EPS = float(getattr(config, "RET_EPS", 0.0))
     MIN_BASE_TRAIN = int(getattr(config, "MIN_BASE_TRAIN", 50))
