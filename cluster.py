@@ -288,3 +288,176 @@ def collapse_salience(
         rep = representatives.get(hk, hk)
         out[rep] = out.get(rep, 0.0) + float(salience[hk])
     return out
+
+
+# -- Soft-correlated cohort detection --------------------------------------
+
+# Pairwise |corr| threshold above which two miners are considered cohort
+# members.  Chosen to capture strategy-variant near-clones that share a
+# common signal but differ by additive noise or small phase shifts, while
+# leaving genuinely independent strategies intact.  Empirical validation
+# via the drift harness governs the precise value; 0.92 is the prior.
+COHORT_TAU: float = 0.92
+
+# Minimum number of non-zero submission rows for a miner to participate in
+# cohort detection.  Below this, pairwise correlation is dominated by
+# silence and the resulting cohort assignment is noise.
+COHORT_MIN_SUBMISSIONS: int = 200
+
+
+def find_correlated_cohorts(
+    hist: Tuple[np.ndarray, Dict[str, int]],
+    *,
+    dim: int | None = None,
+    tau: float = COHORT_TAU,
+    min_nonzero_rows: int = COHORT_MIN_SUBMISSIONS,
+) -> List[FrozenSet[str]]:
+    """Cluster miners whose embedding histories are correlated above ``tau``.
+
+    The pairwise distance is ``1 - |corr|`` evaluated on each miner's full
+    flattened ``(T * D)`` history after row-mean removal and unit-norm
+    rescaling, so two miners running the same strategy with different
+    embedding magnitudes still match.  Clustering is hierarchical
+    agglomerative with complete linkage so every pair within a returned
+    cohort is guaranteed to have ``|corr| ≥ tau`` (no chain merging).
+
+    Determinism guarantees:
+      * Hotkeys are lex-sorted before the distance matrix is built, so the
+        matrix layout is canonical regardless of dict iteration order.
+      * scipy ``linkage(method="complete")`` is deterministic given the
+        condensed distance vector.
+      * Tie-breaking inside ``fcluster(criterion="distance")`` is governed
+        by the ``Z`` matrix's natural order, which is itself derived from
+        the lex-sorted layout.
+
+    Returns a list of non-singleton cohorts.  Singletons are omitted to
+    match the contract of ``find_clusters``; consumers treat absent
+    hotkeys as their own representative.
+    """
+    X_flat, hk2idx = hist
+    if not hk2idx or X_flat is None:
+        return []
+    X_flat = np.asarray(X_flat)
+    if X_flat.ndim != 2:
+        return []
+    H = len(hk2idx)
+    if H < 2 or X_flat.shape[1] % H != 0:
+        return []
+    D = int(dim) if dim is not None else X_flat.shape[1] // H
+    if D <= 0 or D * H != X_flat.shape[1]:
+        return []
+    T = int(X_flat.shape[0])
+    if T < min_nonzero_rows:
+        return []
+
+    X = X_flat.reshape(T, H, D)
+    nz_mask = np.any(X != 0, axis=2)
+    sub_counts = nz_mask.sum(axis=0)
+
+    hk_sorted = sorted(hk2idx.keys())
+
+    feats: List[np.ndarray] = []
+    valid_hk: List[str] = []
+    for hk in hk_sorted:
+        i = int(hk2idx[hk])
+        if not (0 <= i < H):
+            continue
+        if int(sub_counts[i]) < min_nonzero_rows:
+            continue
+        col = X[:, i, :].astype(np.float32, copy=False).ravel()
+        col = col - float(col.mean())
+        norm = float(np.linalg.norm(col))
+        if not np.isfinite(norm) or norm < 1e-9:
+            continue
+        feats.append((col / norm).astype(np.float32, copy=False))
+        valid_hk.append(hk)
+
+    if len(valid_hk) < 2:
+        return []
+
+    F = np.stack(feats, axis=0)
+    corr = np.abs(F @ F.T).astype(np.float64)
+    np.fill_diagonal(corr, 1.0)
+    corr = np.clip(corr, 0.0, 1.0)
+    dist = 1.0 - corr
+    np.fill_diagonal(dist, 0.0)
+    dist = (dist + dist.T) * 0.5
+
+    try:
+        from scipy.cluster.hierarchy import fcluster, linkage
+        from scipy.spatial.distance import squareform
+    except Exception:
+        logger.exception("scipy unavailable; soft-cohort detection disabled")
+        return []
+
+    cond = squareform(dist, checks=False)
+    if cond.size == 0:
+        return []
+
+    Z = linkage(cond, method="complete")
+    cutoff = float(max(0.0, 1.0 - float(tau)))
+    labels = fcluster(Z, t=cutoff, criterion="distance")
+
+    by_label: Dict[int, List[str]] = {}
+    for hk, lbl in zip(valid_hk, labels):
+        by_label.setdefault(int(lbl), []).append(hk)
+
+    out: List[FrozenSet[str]] = []
+    for members in by_label.values():
+        if len(members) < 2:
+            continue
+        out.append(frozenset(members))
+
+    if out:
+        logger.info(
+            "cohort scan: H=%d valid=%d tau=%.3f cohorts=%d total_members=%d",
+            H, len(valid_hk), tau, len(out), sum(len(c) for c in out),
+        )
+
+    return out
+
+
+def equalize_within_cluster(
+    salience: Dict[str, float],
+    representatives: Dict[str, str],
+) -> Dict[str, float]:
+    """Mass-conserving equal-split across each cluster's members.
+
+    For every cluster, replace each member's salience with the cluster's
+    aggregate divided by member count.  The result is invariant under
+    permutations of the pre-collapse mass distribution within a cluster:
+    two validators that disagree on which member of a cohort received
+    which fraction of the cluster's L2 mass produce identical post-
+    collapse output, by construction.
+
+    Mass is conserved within each cluster (sum across members
+    unchanged); hotkeys absent from ``representatives`` are passed
+    through unchanged.
+    """
+    if not representatives or not salience:
+        return dict(salience)
+
+    groups: Dict[str, List[str]] = {}
+    for member, rep in representatives.items():
+        groups.setdefault(rep, []).append(member)
+    for rep in list(groups.keys()):
+        if rep not in groups[rep]:
+            groups[rep].append(rep)
+
+    out: Dict[str, float] = {}
+    seen: set[str] = set()
+    for rep in sorted(groups.keys()):
+        members = sorted(set(groups[rep]))
+        total = float(sum(float(salience.get(m, 0.0)) for m in members))
+        share = total / float(len(members)) if members else 0.0
+        for m in members:
+            seen.add(m)
+            if total > 0.0:
+                out[m] = share
+
+    for hk, v in salience.items():
+        if hk in seen:
+            continue
+        out[hk] = float(v)
+
+    return out
