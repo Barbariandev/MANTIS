@@ -41,6 +41,103 @@ _HALFLIFE_DAYS = 15.0
 _DAYS_PER_SEGMENT = (_WF_CHUNK * 60.0) / 86_400.0
 _RECENCY_GAMMA = 0.5 ** (_DAYS_PER_SEGMENT / _HALFLIFE_DAYS)
 
+# Per-segment OOS quality metrics, populated when ``_QUALITY_TRACE`` is
+# enabled by an external harness.  The list holds tuples of
+# ``(segment_idx, seg_ba)`` for the linear/lbfgs path and is cleared
+# explicitly by the caller between runs.  Production code paths leave
+# this list empty by default; appending is gated on ``_QUALITY_TRACE``
+# so the runtime cost is one boolean read per segment when off.
+_QUALITY_TRACE: bool = False
+_QUALITY_LOG: list = []
+
+# Bootstrap aggregator parameters for the per-class L2 meta-fits.  The per-
+# class binary objective sees a (T, meta_k) design with column correlation
+# structure dominated by shared exposure to the same y, which produces a
+# flat coefficient subspace whose L2 minimum is sensitive to small
+# perturbations in either the row sample or the BLAS microkernel.  Block-
+# bootstrap aggregation collapses that per-fit variance toward the data-
+# independent signal, which is the dominant V-trust contributor on the
+# bucket scorers as measured by the drift harness.  The block size is
+# anchored to a roughly two-hour autocorrelation horizon at the 60-second
+# sample cadence, which is large enough to preserve regime persistence
+# without over-correlating across replicates.
+_BOOTSTRAP_N = 20
+_BOOTSTRAP_BLOCK = 120
+
+
+def _bootstrap_l2_abs_coef(
+    feat_fit: np.ndarray,
+    y_fit: np.ndarray,
+    *,
+    sample_weight: np.ndarray | None,
+    C: float,
+    solver: str,
+    max_iter: int,
+    seed: int,
+    n_bootstrap: int = _BOOTSTRAP_N,
+    block_size: int = _BOOTSTRAP_BLOCK,
+) -> np.ndarray | None:
+    """Block-bootstrap a single L2 binary logistic; return aggregated |coef|.
+
+    Returns ``None`` when the timeline is too short for block bootstrap or
+    every replicate degenerated; the caller's single-fit fallback path
+    then preserves prior behaviour on small inputs.  Aggregation is
+    median-of-means across four sub-groups for heavy-tailed robustness.
+    """
+    T = int(feat_fit.shape[0])
+    K = int(feat_fit.shape[1]) if feat_fit.ndim == 2 else 0
+    if T < int(block_size) * 2 or K == 0 or int(n_bootstrap) <= 1:
+        return None
+    if np.unique(y_fit).size < 2:
+        return None
+
+    n_blocks = max(1, T // int(block_size))
+    coefs: list[np.ndarray] = []
+    for b in range(int(n_bootstrap)):
+        rng = np.random.default_rng(int(seed) + b)
+        block_starts = np.sort(rng.integers(0, T - int(block_size) + 1, size=n_blocks))
+        idx_chunks = [np.arange(int(s), int(s) + int(block_size)) for s in block_starts]
+        idx = np.concatenate(idx_chunks)
+        idx = idx[idx < T]
+        if idx.size == 0:
+            continue
+        Xb = feat_fit[idx]
+        yb = y_fit[idx]
+        swb = sample_weight[idx] if sample_weight is not None else None
+        if np.unique(yb).size < 2:
+            continue
+        try:
+            clf = LogisticRegression(
+                penalty="l2",
+                C=float(C),
+                class_weight="balanced",
+                solver=solver,
+                max_iter=int(max_iter),
+                random_state=int(seed) + b,
+            )
+            clf.fit(Xb, yb, sample_weight=swb)
+            coefs.append(np.abs(clf.coef_.ravel()))
+        except Exception:
+            continue
+
+    if not coefs:
+        return None
+
+    coefs_arr = np.stack(coefs, axis=0)
+    if coefs_arr.shape[1] != K:
+        return None
+
+    n = int(coefs_arr.shape[0])
+    n_groups = min(4, n)
+    if n_groups < 2:
+        return coefs_arr.mean(axis=0)
+    group_size = n // n_groups
+    group_means = np.stack([
+        coefs_arr[i * group_size:(i + 1) * group_size].mean(axis=0)
+        for i in range(n_groups)
+    ], axis=0)
+    return np.median(group_means, axis=0)
+
 
 def _balanced_accuracy(y_true: np.ndarray, y_pred: np.ndarray, K: int) -> float:
     per_c = []
@@ -208,16 +305,31 @@ def compute_linear_salience(
             if np.unique(y_fit_c).size < 2:
                 continue
             feat_fit = bp[ts:vs, sel_miners, c]
-            clf = LogisticRegression(
-                penalty="l2",
-                C=0.1,
-                class_weight="balanced",
-                solver="liblinear",
-                max_iter=100,
-                random_state=42,
+            # Per-class bootstrap: distinct seed per (segment, class) so the
+            # sampling across the full walk-forward sweep stays independent
+            # while remaining bit-deterministic given a fixed top-level
+            # seed.  Aggregator returns |coef|; we square to preserve the
+            # original L2-mass-splitting penalty semantics on cohorts that
+            # the cluster-collapse pass left intact.
+            agg = _bootstrap_l2_abs_coef(
+                feat_fit, y_fit_c,
+                sample_weight=sw,
+                C=0.1, solver="liblinear", max_iter=100,
+                seed=42 + 1000 * (si + 1) + int(c),
+                n_bootstrap=_BOOTSTRAP_N, block_size=_BOOTSTRAP_BLOCK,
             )
-            clf.fit(feat_fit, y_fit_c, sample_weight=sw)
-            meta_imp_sel += clf.coef_.ravel() ** 2
+            if agg is None:
+                clf = LogisticRegression(
+                    penalty="l2",
+                    C=0.1,
+                    class_weight="balanced",
+                    solver="liblinear",
+                    max_iter=100,
+                    random_state=42,
+                )
+                clf.fit(feat_fit, y_fit_c, sample_weight=sw)
+                agg = np.abs(clf.coef_.ravel())
+            meta_imp_sel += agg ** 2
 
         meta_imp = np.zeros(n_active)
         meta_imp[selected] = meta_imp_sel
@@ -238,6 +350,8 @@ def compute_linear_salience(
             vote_scores[:, c] = ((preds_val == c) * imp_norm[None, :]).sum(axis=1)
         seg_preds = vote_scores.argmax(axis=1)
         seg_ba = _balanced_accuracy(y_val, seg_preds, K)
+        if _QUALITY_TRACE:
+            _QUALITY_LOG.append(("linear", int(si), float(seg_ba), float(random_bal)))
         if seg_ba <= random_bal:
             continue
 
@@ -405,19 +519,28 @@ def compute_q_path_salience(
             q = np.clip(q, EPS, 1.0 - EPS)
             x_logits = logit(q)
 
-            clf = LogisticRegression(
-                penalty="l2",
-                C=0.5,
-                class_weight="balanced",
-                solver="lbfgs",
-                max_iter=500,
-                random_state=42,
+            y_bin = (y_hit > 0.5).astype(int)
+            agg = _bootstrap_l2_abs_coef(
+                x_logits, y_bin,
+                sample_weight=sw,
+                C=0.5, solver="lbfgs", max_iter=500,
+                seed=42 + 17 * int(c) + int(j),
+                n_bootstrap=_BOOTSTRAP_N, block_size=_BOOTSTRAP_BLOCK,
             )
-            clf.fit(x_logits, (y_hit > 0.5).astype(int), sample_weight=sw)
-            coef = np.abs(clf.coef_.ravel())
-            cs = coef.sum()
+            if agg is None:
+                clf = LogisticRegression(
+                    penalty="l2",
+                    C=0.5,
+                    class_weight="balanced",
+                    solver="lbfgs",
+                    max_iter=500,
+                    random_state=42,
+                )
+                clf.fit(x_logits, y_bin, sample_weight=sw)
+                agg = np.abs(clf.coef_.ravel())
+            cs = float(agg.sum())
             if cs > 0:
-                per_model_weights.append(coef / cs)
+                per_model_weights.append(agg / cs)
 
     if not per_model_weights:
         return {}
