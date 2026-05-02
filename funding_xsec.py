@@ -15,6 +15,80 @@ logger = logging.getLogger(__name__)
 SEED = int(getattr(config, "SEED", 42))
 N_ASSETS = len(config.FUNDING_ASSETS)
 
+# Per-segment OOS quality trace, same contract as the xsec-rank scorer.
+_QUALITY_TRACE: bool = False
+_QUALITY_LOG: list = []
+
+# Block-bootstrap aggregator parameters.  Same justification and shape as
+# the xsec-rank meta-fit: the per-segment L2 meta-fit operates on a
+# (T, K) design whose flat-loss subspace under cross-sectional rank
+# targets is the dominant V-trust contributor on this challenge.
+_BOOTSTRAP_N = 20
+_BOOTSTRAP_BLOCK = 120
+
+
+def _bootstrap_meta_l2(
+    X: np.ndarray,
+    y: np.ndarray,
+    *,
+    seed: int,
+    n_bootstrap: int = 20,
+    block_size: int = 120,
+) -> Tuple[np.ndarray, float, np.ndarray] | None:
+    """Block-bootstrap aggregator for the funding-xsec meta-fit.
+
+    Returns ``(coef_signed_mean, intercept_mean, abs_coef_median_of_means)``
+    so callers can use the signed mean for prediction and the median-of-
+    means absolute vector for importance ranking.  Returns ``None`` if
+    the timeline is too short or every replicate degenerated.
+    """
+    T = int(X.shape[0])
+    K = int(X.shape[1])
+    if T < int(block_size) * 2 or n_bootstrap <= 1:
+        return None
+    if len(np.unique(y)) < 2:
+        return None
+    n_blocks = max(1, T // int(block_size))
+    coefs: list[np.ndarray] = []
+    intercepts: list[float] = []
+    for b in range(int(n_bootstrap)):
+        rng = np.random.default_rng(int(seed) + b)
+        block_starts = np.sort(rng.integers(0, T - int(block_size) + 1, size=n_blocks))
+        idx = np.concatenate([np.arange(int(s), int(s) + int(block_size)) for s in block_starts])
+        idx = idx[idx < T]
+        if idx.size == 0:
+            continue
+        Xb = X[idx]; yb = y[idx]
+        if len(np.unique(yb)) < 2:
+            continue
+        try:
+            clf = LogisticRegression(
+                penalty="l2", C=0.5, class_weight="balanced",
+                solver="lbfgs", max_iter=100, random_state=int(seed) + b,
+            )
+            clf.fit(Xb, yb)
+            coefs.append(np.asarray(clf.coef_, dtype=np.float64).ravel())
+            intercepts.append(float(clf.intercept_[0]))
+        except Exception:
+            continue
+    if not coefs:
+        return None
+    coefs_arr = np.stack(coefs, axis=0)
+    if coefs_arr.shape[1] != K:
+        return None
+    signed_mean = coefs_arr.mean(axis=0)
+    intercept_mean = float(np.mean(intercepts))
+    abs_arr = np.abs(coefs_arr)
+    n = int(abs_arr.shape[0])
+    n_groups = min(4, n)
+    if n_groups < 2:
+        abs_agg = abs_arr.mean(axis=0)
+    else:
+        gs = n // n_groups
+        group_means = np.stack([abs_arr[i * gs:(i + 1) * gs].mean(axis=0) for i in range(n_groups)], axis=0)
+        abs_agg = np.median(group_means, axis=0)
+    return signed_mean, intercept_mean, abs_agg
+
 
 # Tolerance window: the forward sidx match must be within this fraction of
 # the target ahead value.  E.g. for ahead=480 and tolerance 0.15, we accept
@@ -333,17 +407,31 @@ def compute_funding_xsec_salience(
             pbar.update(1)
             continue
 
-        meta_clf = LogisticRegression(
-            penalty="l2", C=0.5, class_weight="balanced",
-            solver="lbfgs", max_iter=100, random_state=SEED,
+        agg = _bootstrap_meta_l2(
+            X_meta_tr, y_meta_tr, seed=SEED + 7919 * (seg_i + 1),
+            n_bootstrap=_BOOTSTRAP_N, block_size=_BOOTSTRAP_BLOCK,
         )
-        meta_clf.fit(X_meta_tr, y_meta_tr)
-
         X_meta_va = np.where(np.isnan(meta_val), 0.0, meta_val)
-        proba = meta_clf.predict_proba(X_meta_va)[:, 1]
-        auc = float(roc_auc_score(y_va_all, proba))
-
-        coef = np.abs(meta_clf.coef_.ravel())
+        if agg is not None:
+            signed_mean, intercept_mean, abs_agg = agg
+            score_va = X_meta_va @ signed_mean + intercept_mean
+            try:
+                proba_va = 1.0 / (1.0 + np.exp(-score_va))
+                auc = float(roc_auc_score(y_va_all, proba_va))
+            except Exception:
+                auc = 0.5
+            coef = abs_agg
+        else:
+            meta_clf = LogisticRegression(
+                penalty="l2", C=0.5, class_weight="balanced",
+                solver="lbfgs", max_iter=100, random_state=SEED,
+            )
+            meta_clf.fit(X_meta_tr, y_meta_tr)
+            proba = meta_clf.predict_proba(X_meta_va)[:, 1]
+            auc = float(roc_auc_score(y_va_all, proba))
+            coef = np.abs(meta_clf.coef_.ravel())
+        if _QUALITY_TRACE:
+            _QUALITY_LOG.append(("funding_xsec", int(seg_i), float(auc), int(agg is not None)))
         scale = max((auc - 0.5) / 0.5, 0.0)
 
         imp = np.zeros(H, dtype=np.float64)
