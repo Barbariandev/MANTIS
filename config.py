@@ -43,7 +43,7 @@ CHALLENGES = [
         "dim": 2,
         "blocks_ahead": 300,
         "loss_func": "binary",
-        "weight": 0.5,
+        "weight": 1,
     },
     {
         "name": "ETH-HITFIRST-100M",
@@ -52,7 +52,7 @@ CHALLENGES = [
         "dim": 3,
         "blocks_ahead": 500,
         "loss_func": "hitfirst",
-        "weight": 1.25, 
+        "weight": 2.5,
     },
     {
         "name": "ETH-LBFGS",
@@ -78,7 +78,7 @@ CHALLENGES = [
         "dim": 2,
         "blocks_ahead": 300,
         "loss_func": "binary",
-        "weight": 0.5,
+        "weight": 1,
     },
     {
         "name": "NZDUSD-1H-BINARY",
@@ -86,7 +86,7 @@ CHALLENGES = [
         "dim": 2,
         "blocks_ahead": 300,
         "loss_func": "binary",
-        "weight": 0.5,
+        "weight": 1,
     },
     {
         "name": "CHFUSD-1H-BINARY",
@@ -157,6 +157,38 @@ FUNDING_XSEC_CHALLENGE = {
 
 CHALLENGES.append(FUNDING_XSEC_CHALLENGE)
 
+TRADE_MIX_ASSETS = ["BTC", "ETH", "TAO", "SOL"]
+
+# Sized so TRADEMIX = 15% of total emissions weight.
+# Recompute as: 0.15 * sum(other weights) / 0.85
+_TRADE_MIX_TARGET_FRACTION = 0.15
+_TRADE_MIX_WEIGHT = (
+    _TRADE_MIX_TARGET_FRACTION * sum(c["weight"] for c in CHALLENGES) /
+    (1.0 - _TRADE_MIX_TARGET_FRACTION)
+)
+
+TRADE_MIX_CHALLENGE = {
+    "name": "TRADE-MIX",
+    "ticker": "TRADEMIX",
+    "assets": TRADE_MIX_ASSETS,
+    "dim": 1,
+    "blocks_ahead": 300,
+    "loss_func": "trade_mix",
+    "weight": _TRADE_MIX_WEIGHT,
+    "luck_filter": "shrunk_sharpe",
+    "meta_model": "skillw",
+    "min_skill_prob": 0.65,
+    "horizon_bars": 60,
+    "rebal_period": 60,
+    "fee_bps": 20.0,
+    "loo_folds": 5,
+    "max_oos_window_bars": 43200,
+    "min_history_window_bars": 43200,
+    "dedup_cosine_threshold": 0.95,
+}
+
+CHALLENGES.append(TRADE_MIX_CHALLENGE)
+
 CHALLENGE_MAP = {c["ticker"]: c for c in CHALLENGES}
 CHALLENGE_NAME_TO_TICKER = {c["name"]: c["ticker"] for c in CHALLENGES}
 ASSET_EMBEDDING_DIMS = {c["ticker"]: c["dim"] for c in CHALLENGES}
@@ -175,15 +207,6 @@ SEED = 42
 SAMPLE_EVERY = 5
 
 LAG = 60
-
-# Walk-forward bandwidth and recency-kernel parameters live here so every
-# scorer reads from a single source of truth.  Values are expressed in
-# physical units (contiguous validator samples, calendar days) rather than
-# implementation indices, which keeps the time-domain estimator invariant
-# under future changes to chunking or sample cadence.
-CHUNK_SIZE = 8000
-HALFLIFE_DAYS = 15.0
-WINDOWS_HALF_LIFE = 3
 
 TASK_INTERVAL = 500
 
