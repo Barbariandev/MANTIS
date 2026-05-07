@@ -17,6 +17,7 @@ shap==0.49.1
 yfinance==1.2.0
 tqdm==4.67.3
 xgboost==3.2.0
+threadpoolctl==3.6.0
 cryptography==46.0.5
 flask>=3.0
 gunicorn>=22.0
