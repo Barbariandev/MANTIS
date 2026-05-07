@@ -48,7 +48,7 @@ graph TD
 
 All challenges are defined in `config.py` under `CHALLENGES`. Each specifies a `ticker`, `dim`, `blocks_ahead` (forward horizon in blocks at 12s/block), `loss_func` (scoring dispatch key), and `weight` (relative importance in final aggregation).
 
-| Challenge | Ticker | dim | Horizon | loss\_func | Weight | Description |
+| Challenge | Ticker | dim | Horizon | loss_func | Weight | Description |
 |---|---|---|---|---|---|---|
 | ETH-1H-BINARY | `ETH` | 2 | 300 (1h) | `binary` | 1.0 | Binary direction prediction |
 | CADUSD-1H-BINARY | `CADUSD` | 2 | 300 | `binary` | 1.0 | " |
@@ -70,41 +70,41 @@ All challenges are defined in `config.py` under `CHALLENGES`. Each specifies a `
 
 Each `loss_func` has its own scoring path. All use L2 logistic regression and coefficient-based importance, but the structure differs.
 
-**Binary** (`binary`) — Walk-forward with ElasticNet meta-model. Feature selection: per-miner L2 logistic on first half, AUC on second half, select top-\(K\) (default 50). Meta-model: ElasticNet logistic (L1 ratio 0.5) on OOS base-model predictions across walk-forward segments. Importance = \(|\beta_j|\). Segments weighted by recency.
+**Binary** (`binary`) — Walk-forward with ElasticNet meta-model. Feature selection: per-miner L2 logistic on first half, AUC on second half, select top-$K$ (default 50). Meta-model: ElasticNet logistic (L1 ratio 0.5) on OOS base-model predictions across walk-forward segments. Importance = $|\beta_j|$. Segments weighted by recency.
 
 **LBFGS** (`lbfgs`) — Two independent scoring paths blended 75/25:
-- *Classifier path* (`compute_linear_salience`): per-class L2 logistic regressions on 5-bucket argmax predictions. Importance = \(\beta_j^2\) summed across classes. Vectorized balanced accuracy evaluation. Uniqueness penalty suppresses miners with >85% argmax overlap with higher-ranked peers.
-- *Q-path* (`compute_q_path_salience`): 12 independent binary L2 logistic models (one per tail-bucket / sigma-threshold combination). Importance = averaged \(|\beta_j|\) across sub-models.
+- *Classifier path* (`compute_linear_salience`): per-class L2 logistic regressions on 5-bucket argmax predictions. Importance = $\beta_j^2$ summed across classes. Vectorized balanced accuracy evaluation. Uniqueness penalty suppresses miners with >85% argmax overlap with higher-ranked peers.
+- *Q-path* (`compute_q_path_salience`): 12 independent binary L2 logistic models (one per tail-bucket / sigma-threshold combination). Importance = averaged $|\beta_j|$ across sub-models.
 
-Both paths are individually top-\(K\) renormalized with exponential rank decay before blending.
+Both paths are individually top-$K$ renormalized with exponential rank decay before blending.
 
-**HITFIRST** (`hitfirst`) — Two L2 logistic regressions on logit-transformed miner probabilities: one for up-barrier-hit (\(y=1\) if price hits +\(\sigma\) first), one for down-barrier-hit. Importance = \(|\beta_j^{\text{up}}| + |\beta_j^{\text{down}}|\). No walk-forward — single fit on all valid samples.
+**HITFIRST** (`hitfirst`) — Two L2 logistic regressions on logit-transformed miner probabilities: one for up-barrier-hit ($y=1$ if price hits $+\sigma$ first), one for down-barrier-hit. Importance = $|\beta_j^{\text{up}}| + |\beta_j^{\text{down}}|$. No walk-forward — single fit on all valid samples.
 
-**MULTI-BREAKOUT** (`range_breakout_multi`) — Operates on completed breakout events (not time series). Two-stage: (1) Empirical AUC gate — per-miner AUC on \(P_{\text{continuation}}\) vs realized label, requiring AUC > 0.5 and ≥ 2 temporal episodes. (2) L2 logistic on z-scored miner predictions with episode-balanced sample weighting (each temporal episode gets equal total weight regardless of event count). Importance = \(|\beta_j|\).
+**MULTI-BREAKOUT** (`range_breakout_multi`) — Operates on completed breakout events (not time series). Two-stage: (1) Empirical AUC gate — per-miner AUC on $P_{\text{continuation}}$ vs realized label, requiring AUC > 0.5 and ≥ 2 temporal episodes. (2) L2 logistic on z-scored miner predictions with episode-balanced sample weighting (each temporal episode gets equal total weight regardless of event count). Importance = $|\beta_j|$.
 
-**XSEC-RANK** (`xsec_rank`) — Cross-sectional binary reformulation: label = 1 if asset's forward return exceeds the cross-sectional median. All assets pooled (\(N_{\text{assets}} \times\) sample multiplier). Walk-forward meta-model: feature selection by per-miner univariate AUC, top-\(K\) (default 20) selected, L2 logistic meta-model. Importance per segment:
+**XSEC-RANK** (`xsec_rank`) — Cross-sectional binary reformulation: label = 1 if asset's forward return exceeds the cross-sectional median. All assets pooled ($N_{\text{assets}} \times$ sample multiplier). Walk-forward meta-model: feature selection by per-miner univariate AUC, top-$K$ (default 20) selected, L2 logistic meta-model. Importance per segment:
 
-\[
+$$
 w_j = |\beta_j| \cdot \max\!\Big(\frac{\text{AUC}_{\text{meta}} - 0.5}{0.5},\; 0\Big)
-\]
+$$
 
 Segments aggregated with exponential recency weighting.
 
-**FUNDING-XSEC** (`funding_xsec`) — Same structure as XSEC-RANK but on funding rate changes instead of price returns. Embargo = \(\max(\text{LAG}, \text{ahead})\) with explicit `train_cutoff = val_start - ahead` to prevent label leakage from forward-looking labels. Stale miners (temporal std < \(10^{-4}\) per asset column) zeroed before pooling.
+**FUNDING-XSEC** (`funding_xsec`) — Same structure as XSEC-RANK but on funding rate changes instead of price returns. Embargo = $\max(\text{LAG}, \text{ahead})$ with explicit `train_cutoff = val_start - ahead` to prevent label leakage from forward-looking labels. Stale miners (temporal std < $10^{-4}$ per asset column) zeroed before pooling.
 
 ### Sybil resistance
 
-L2 regularization splits coefficient mass among correlated miners. If \(n\) clones submit identical predictions, each receives \(\approx w/n\) weight. L1 (in binary challenges) or the uniqueness penalty (in LBFGS) drives zero-information or duplicate miners to zero.
+L2 regularization splits coefficient mass among correlated miners. If $n$ clones submit identical predictions, each receives $\approx w/n$ weight. L1 (in binary challenges) or the uniqueness penalty (in LBFGS) drives zero-information or duplicate miners to zero.
 
 ### Weight aggregation
 
 Per-challenge salience vectors are normalized to sum to 1, multiplied by challenge weight, and averaged:
 
-\[
+$$
 s_j = \frac{1}{\sum_c w_c} \sum_c w_c \cdot \hat{s}_{j,c}
-\]
+$$
 
-EMA smoothing (\(\alpha = 0.15\)) is applied across weight-setting intervals to reduce block-to-block variance. Degenerate distributions (near-uniform or zero-sum) are rejected.
+EMA smoothing ($\alpha = 0.15$) is applied across weight-setting intervals to reduce block-to-block variance. Degenerate distributions (near-uniform or zero-sum) are rejected.
 
 ---
 
@@ -115,7 +115,7 @@ Dual-path encryption ensures no party can observe predictions before maturation:
 1. **Owner path** — X25519 ECDH + ChaCha20-Poly1305 AEAD. The owner can decrypt immediately for trading.
 2. **Timelock path** — Drand IBE (BLS12-381). After the specified Drand round, validators decrypt via the published beacon signature.
 
-A SHA-256 binding hash over (hotkey, round, owner\_pk, ephemeral\_pk) is used as AAD, preventing replay, relay, and substitution attacks.
+A SHA-256 binding hash over (hotkey, round, owner_pk, ephemeral_pk) is used as AAD, preventing replay, relay, and substitution attacks.
 
 ---
 
@@ -189,7 +189,7 @@ See `MINER_GUIDE.md` for submission details per challenge type.
 
 ## Model Iteration Tool
 
-The [MANTIS Model Iteration Tool](https://github.com/BarbarianDev/mantis_model_iteration_tool) is a standalone framework for developing, backtesting, and iterating on MANTIS mining strategies. It provides autonomous agent-driven research, walk-forward evaluation with causal data access, and a web dashboard for tracking iterations across all crypto challenge types. See the [repository](https://github.com/BarbarianDev/mantis_model_iteration_tool) for setup and SDK documentation. 
+The [MANTIS Model Iteration Tool](https://github.com/BarbarianDev/mantis_model_iteration_tool) is a standalone framework for developing, backtesting, and iterating on MANTIS mining strategies. It provides autonomous agent-driven research, walk-forward evaluation with causal data access, and a web dashboard for tracking iterations across all challenge types. See the [repository](https://github.com/BarbarianDev/mantis_model_iteration_tool) for setup and SDK documentation.
 
 ---
 
