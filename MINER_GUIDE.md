@@ -213,7 +213,7 @@ FUNDING_ASSETS = [
 
 ```python
 import numpy as np
-from config import CHALLENGES, BREAKOUT_ASSETS, FUNDING_ASSETS
+from config import CHALLENGES, BREAKOUT_ASSETS, FUNDING_ASSETS, TRADE_MIX_ASSETS
 
 embeddings = {}
 
@@ -228,6 +228,10 @@ for spec in CHALLENGES:
 
     elif ticker == "FUNDINGXSEC":
         embeddings[ticker] = {a: 0.0 for a in FUNDING_ASSETS}
+
+    elif ticker == "TRADEMIX":
+        # Signed target position in [-1, 1] per asset. Held for ~1 hour.
+        embeddings[ticker] = {a: 0.0 for a in TRADE_MIX_ASSETS}
 
     else:
         embeddings[ticker] = np.zeros(spec["dim"]).tolist()
@@ -245,13 +249,16 @@ Per-challenge salience is normalized to sum to 1, then weighted:
 
 | Challenge | Weight | Share of total |
 |---|---|---|
-| MULTI-BREAKOUT | 5.0 | ~22% |
-| FUNDING-XSEC | 4.0 | ~17% |
-| ETHLBFGS | 3.5 | ~15% |
-| XSEC-RANK | 3.0 | ~13% |
-| BTCLBFGS | 2.875 | ~12% |
-| ETHHITFIRST | 2.5 | ~11% |
-| Binary (5x) | 1.0 each | ~22% total |
+| MULTI-BREAKOUT | 5.0 | ~16% |
+| TRADE-MIX | 4.566 | 15% |
+| FUNDING-XSEC | 4.0 | ~13% |
+| ETHLBFGS | 3.5 | ~12% |
+| XSEC-RANK | 3.0 | ~10% |
+| BTCLBFGS | 2.875 | ~9% |
+| ETHHITFIRST | 2.5 | ~8% |
+| Binary (5x) | 1.0 each | ~16% total |
+
+> **TRADE-MIX warm-up**: emits zero salience until the validator has accumulated at least 30 days of price history (≈ 43,200 sample indices at 1-minute sampling).  Your TRADE-MIX submission is collected from day 1 but only contributes to weight after the warm-up window.
 
 ### Scoring by challenge type
 
@@ -265,6 +272,7 @@ Not all challenges use the same scoring structure. Summary:
 | MULTI-BREAKOUT | AUC gate → L2 logreg on z-scored predictions, episode-balanced weighting | \(\|\beta_j\|\) |
 | XSEC-RANK | Walk-forward L2 meta-model, AUC-scaled coefficients, recency-weighted segments | \(\|\beta_j\| \cdot \text{AUC\_scale}\) |
 | FUNDING-XSEC | Same as XSEC-RANK + stale filter (\(\text{std} < 10^{-4}\)) + extended embargo | \(\|\beta_j\| \cdot \text{AUC\_scale}\) |
+| TRADE-MIX | Bayesian Sharpe luck filter → cosine-similarity dedup → skill-weighted meta-model → walk-forward leave-one-out OOS P&L | drop in OOS desk P&L when the cluster is removed |
 
 For challenges with walk-forward segments, recency weighting applies: \(w_i = \gamma^{n - 1 - i}\) where \(\gamma = 0.5^{1/\text{HALFLIFE}}\).
 
@@ -280,7 +288,7 @@ For challenges with walk-forward segments, recency weighting applies: \(w_i = \g
 ## 6. Validation Checklist
 
 ```python
-from config import CHALLENGES, BREAKOUT_ASSETS, FUNDING_ASSETS
+from config import CHALLENGES, BREAKOUT_ASSETS, FUNDING_ASSETS, TRADE_MIX_ASSETS
 
 def validate_embeddings(emb: dict) -> list[str]:
     errors = []
@@ -300,6 +308,14 @@ def validate_embeddings(emb: dict) -> list[str]:
                     errors.append(f"{tk}.{a}: need [p_cont, p_rev]")
                 elif not all(0 < x < 1 for x in v):
                     errors.append(f"{tk}.{a}: values must be in (0,1)")
+
+        elif tk == "TRADEMIX":
+            if not isinstance(val, dict):
+                errors.append(f"{tk}: expected dict"); continue
+            for a in TRADE_MIX_ASSETS:
+                v = val.get(a, None)
+                if not isinstance(v, (int, float)) or not (-1 <= v <= 1):
+                    errors.append(f"{tk}.{a}: need float in [-1,1]")
 
         elif tk == "MULTIXSEC":
             if not isinstance(val, dict):
