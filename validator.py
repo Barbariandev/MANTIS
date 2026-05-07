@@ -3,13 +3,16 @@
 
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("MALLOC_ARENA_MAX", "4")
+
+import config  # noqa: F401  Importing config first locks the cross-hardware env (BLAS threads, hash seed, CUDA visibility) before numpy/torch load.
+
 import argparse
 import ctypes
 import gc
 import logging
-import os
-
-os.environ.setdefault("MALLOC_ARENA_MAX", "4")
 import threading
 import time
 import asyncio
@@ -23,7 +26,6 @@ from dotenv import load_dotenv
 import numpy as np
 import pickle
 
-import config
 from cycle import get_miner_payloads
 from model import multi_salience as sal_fn
 from ledger import DataLog, ensure_datalog
