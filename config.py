@@ -25,6 +25,39 @@ THE SOFTWARE.
 
 import os
 
+# ---------------------------------------------------------------------------
+# Cross-hardware reproducibility env pinning.
+#
+# Every numerical module in MANTIS imports `config`, so this block runs before
+# numpy / sklearn / torch are loaded by any consumer.  BLAS libraries cache
+# their thread-count decision at load time, so these env vars MUST be set
+# before the first numpy import — placing them here is the only place that
+# guarantees that ordering across every entry point (validator, dashboard,
+# offline scoring scripts, etc.).
+#
+# Single-threaded BLAS makes parallel reductions associative-stable, which is
+# the dominant requirement for two validators on different hardware to agree
+# on weight vectors and therefore drive vtrust toward 1.0.
+# ---------------------------------------------------------------------------
+for _k, _v in (
+    ("OMP_NUM_THREADS", "1"),
+    ("MKL_NUM_THREADS", "1"),
+    ("OPENBLAS_NUM_THREADS", "1"),
+    ("BLIS_NUM_THREADS", "1"),
+    ("NUMEXPR_NUM_THREADS", "1"),
+    ("VECLIB_MAXIMUM_THREADS", "1"),
+    ("MKL_DYNAMIC", "FALSE"),
+    ("OMP_DYNAMIC", "FALSE"),
+    ("PYTHONHASHSEED", "0"),
+    ("CUBLAS_WORKSPACE_CONFIG", ":4096:8"),
+):
+    os.environ.setdefault(_k, _v)
+# CUDA is hidden by default — the scoring path is pure numpy/sklearn, so
+# disabling GPU at the env layer guarantees that GPU and CPU validators take
+# exactly the same numerical path.  Set MANTIS_ALLOW_CUDA=1 to opt in.
+if os.environ.get("MANTIS_ALLOW_CUDA", "").lower() not in ("1", "true", "yes"):
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
 DATALOG_ARCHIVE_URL = "https://pub-879ad825983e43529792665f4f510cd6.r2.dev/datalog.db"
 
 PRICE_DATA_URL = "https://pub-ba8c1b8edb8046edaccecbd26b5ca7f8.r2.dev/latest_prices.json"
