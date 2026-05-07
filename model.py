@@ -3,6 +3,9 @@
 # Copyright (c) 2024 MANTIS
 
 from __future__ import annotations
+
+import config  # noqa: F401  Importing config first locks BLAS / RNG / hash env vars before numpy loads.
+
 import logging
 import os
 import random
@@ -14,13 +17,25 @@ from tqdm import tqdm
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
-import config
 from bucket_forecast import compute_lbfgs_salience, compute_q_path_salience
 from hitfirst import compute_hitfirst_salience
 from range_breakout import compute_multi_breakout_salience
 from xsec_rank import compute_xsec_rank_salience
 from funding_xsec import compute_funding_xsec_salience
 from trade_mix import compute_trade_mix_salience
+
+
+def stable_argsort(a, *, axis: int = -1, descending: bool = False) -> np.ndarray:
+    """Argsort with stable, hardware-independent tie-breaking.
+
+    `np.argsort` defaults to a quicksort variant whose tie-breaking depends
+    on memory layout and array size.  Using `kind='stable'` (mergesort)
+    guarantees that two values with identical keys keep their original
+    relative order across every BLAS / NumPy build, eliminating a class of
+    drift that would otherwise reduce cross-validator vtrust.
+    """
+    arr = np.asarray(a)
+    return np.argsort(-arr if descending else arr, axis=axis, kind="stable")
 
 
 logger = logging.getLogger(__name__)
@@ -37,30 +52,61 @@ MAX_INDEX_HISTORY: int = int(MAX_DAYS * INDICES_PER_DAY)
 MAX_BLOCK_HISTORY: int = int(MAX_DAYS * BLOCKS_PER_DAY)
 HALFLIFE_DAYS: float = float(getattr(config, "HALFLIFE_DAYS", 15.0))
 
-try:
-    torch.set_num_threads(1)
-    torch.set_num_interop_threads(1)
-    logger.info("Torch thread pools pinned to 1 for determinism")
-except Exception as e:
-    logger.warning("Could not set torch thread counts: %s", e)
+def set_global_seed(seed: int) -> dict:
+    """Pin every runtime RNG and threading source for cross-hardware reproducibility.
 
-
-def set_global_seed(seed: int) -> None:
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    Env-var pinning (BLAS thread counts, PYTHONHASHSEED, CUDA visibility)
+    happens at the top of `config.py` so it lands before numpy is loaded.
+    This function complements that by:
+      * Seeding random / numpy / torch RNGs deterministically.
+      * Reaching into already-loaded BLAS libraries via threadpoolctl as a
+        runtime hammer — this is what catches the case where a transitive
+        import loaded numpy before the env vars took effect.
+      * Enabling torch deterministic algorithms and disabling cuDNN
+        benchmarking.
+    Returns a manifest of what was pinned, suitable for logging.
+    """
+    manifest: dict = {"seed": int(seed)}
     random.seed(seed)
     np.random.seed(seed)
+    manifest["numpy"] = np.__version__
+
+    try:
+        import threadpoolctl
+        threadpoolctl.threadpool_limits(limits=1)
+        manifest["threadpoolctl"] = threadpoolctl.__version__
+    except ImportError:
+        manifest["threadpoolctl"] = "not_installed"
+    except Exception as e:
+        manifest["threadpoolctl_error"] = str(e)
+
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     try:
-        torch.use_deterministic_algorithms(True)
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
         torch.backends.cudnn.benchmark = False
-        logger.info("Deterministic PyTorch algorithms enabled.")
+        torch.backends.cudnn.deterministic = True
     except (RuntimeError, AttributeError) as e:
-        logger.warning(f"Could not enable deterministic algorithms: {e}")
-    
+        manifest["torch_warning"] = str(e)
+    manifest["torch"] = torch.__version__
+    manifest["torch_cuda_visible"] = bool(torch.cuda.is_available())
 
-set_global_seed(config.SEED)
+    logger.info(
+        "Determinism manifest: numpy=%s torch=%s cuda_visible=%s threadpoolctl=%s seed=%s",
+        manifest.get("numpy"), manifest.get("torch"),
+        manifest.get("torch_cuda_visible"), manifest.get("threadpoolctl"),
+        manifest.get("seed"),
+    )
+    return manifest
+
+
+set_global_seed(int(getattr(config, "SEED", 42)))
 
 
 def _time_weights(T: int, indices_per_day: int = INDICES_PER_DAY,
