@@ -356,6 +356,21 @@ class DataLog:
                             (ticker, sidx, json.dumps(pd_map)),
                         )
                     continue
+                if ticker == "TRADEMIX":
+                    tm_assets = spec.get("assets") or []
+                    pd_map = {}
+                    for a in tm_assets:
+                        pv = prices.get(a)
+                        if isinstance(pv, (int, float)) and pv > 0:
+                            pd_map[a] = float(pv)
+                    if pd_map:
+                        c.execute(
+                            "INSERT INTO challenge_data (ticker, sidx, price_data, hotkeys, embeddings) "
+                            "VALUES (?, ?, ?, '[]', X'') "
+                            "ON CONFLICT(ticker, sidx) DO UPDATE SET price_data=excluded.price_data",
+                            (ticker, sidx, json.dumps(pd_map)),
+                        )
+                    continue
                 if ticker == "FUNDINGXSEC":
                     funding_rates = prices.get("_funding_rates", {})
                     if not isinstance(funding_rates, dict):
@@ -582,6 +597,18 @@ class DataLog:
                     flat.append(0.0)
             return flat
 
+        def _flatten_trademix_dict(d: dict) -> List[float]:
+            flat: List[float] = []
+            for asset in config.TRADE_MIX_ASSETS:
+                val = d.get(asset)
+                if isinstance(val, (int, float)) and -1 <= val <= 1:
+                    flat.append(float(val))
+                elif isinstance(val, list) and len(val) == 1 and isinstance(val[0], (int, float)):
+                    flat.append(float(np.clip(val[0], -1, 1)))
+                else:
+                    flat.append(0.0)
+            return flat
+
         if isinstance(sub, list) and len(sub) == len(config.CHALLENGES):
             out = {}
             for vec, c in zip(sub, config.CHALLENGES):
@@ -596,6 +623,9 @@ class DataLog:
                     continue
                 if ticker == "FUNDINGXSEC" and isinstance(vec, dict):
                     out[ticker] = _flatten_funding_xsec_dict(vec)
+                    continue
+                if ticker == "TRADEMIX" and isinstance(vec, dict):
+                    out[ticker] = _flatten_trademix_dict(vec)
                     continue
                 if isinstance(vec, list) and len(vec) == dim:
                     if spec and spec.get("loss_func") == "lbfgs":
@@ -623,6 +653,9 @@ class DataLog:
                     continue
                 if ticker == "FUNDINGXSEC" and isinstance(vec, dict):
                     out[ticker] = _flatten_funding_xsec_dict(vec)
+                    continue
+                if ticker == "TRADEMIX" and isinstance(vec, dict):
+                    out[ticker] = _flatten_trademix_dict(vec)
                     continue
                 dim = _get_storage_dim(ticker)
                 if not isinstance(vec, list) or len(vec) != dim:
@@ -865,6 +898,15 @@ class DataLog:
                 payload = DataLog._build_funding_xsec_from_db(
                     conn, dim, blocks_ahead, max_block_number,
                     active_hotkeys=active_hotkeys,
+                )
+                if payload:
+                    yield ticker, payload
+                continue
+
+            if loss_func == "trade_mix":
+                payload = DataLog._build_trade_mix_from_db(
+                    conn, ticker, blocks_ahead, max_block_number,
+                    active_hotkeys=active_hotkeys, spec=spec,
                 )
                 if payload:
                     yield ticker, payload
@@ -1140,6 +1182,71 @@ class DataLog:
         return {
             "hist": (np.stack(rows, axis=0), hk2idx),
             "funding_rates": np.array(funding_list, dtype=np.float64),
+            "sidx_arr": np.array(sidx_list, dtype=np.int64),
+            "blocks_ahead": blocks_ahead,
+        }
+
+    @staticmethod
+    def _build_trade_mix_from_db(conn, ticker, blocks_ahead, max_block_number, *, active_hotkeys=None, spec=None):
+        """Build training data for the TRADE-MIX challenge.
+
+        Returns dict with 'hist' (positions matrix), 'prices_multi'
+        (T x n_assets price array), 'sidx_arr', and 'blocks_ahead'.
+        Storage dim = len(assets) (one signed scalar position per asset).
+        """
+        if spec is None:
+            spec = config.CHALLENGE_MAP.get(ticker)
+        if not spec:
+            return None
+        assets = spec.get("assets") or []
+        n_assets = len(assets)
+        if n_assets == 0:
+            return None
+        storage_dim = int(spec.get("dim", 1)) * n_assets
+        c = conn.cursor()
+
+        all_hks_sorted, hk2idx = DataLog._collect_hotkeys(c, ticker, active_hotkeys)
+        if all_hks_sorted is None:
+            return None
+
+        rows: list[np.ndarray] = []
+        prices_list: list[list[float]] = []
+        sidx_list: list[int] = []
+
+        for sidx, price_data, emb_blob in c.execute(
+            "SELECT sidx, price_data, embeddings FROM challenge_data "
+            "WHERE ticker = ? ORDER BY sidx",
+            (ticker,),
+        ):
+            block = int(sidx) * SAMPLE_EVERY
+            if max_block_number and block > max_block_number:
+                break
+
+            if not price_data:
+                continue
+            pd_dict = json.loads(price_data)
+            price_vec = [float(pd_dict.get(a, 0.0)) for a in assets]
+            if not any(p > 0 for p in price_vec):
+                continue
+
+            emb = _unpack_embeddings(emb_blob, storage_dim) if emb_blob else {}
+            row = np.zeros((len(all_hks_sorted), storage_dim), dtype=np.float32)
+            for hk, vec in emb.items():
+                idx = hk2idx.get(hk)
+                if idx is not None:
+                    arr = np.asarray(vec, dtype=np.float32)
+                    if arr.size == storage_dim:
+                        row[idx] = arr.reshape(storage_dim)
+            rows.append(row.reshape(-1))
+            prices_list.append(price_vec)
+            sidx_list.append(int(sidx))
+            del emb
+
+        if not rows:
+            return None
+        return {
+            "hist": (np.stack(rows, axis=0), hk2idx),
+            "prices_multi": np.array(prices_list, dtype=np.float64),
             "sidx_arr": np.array(sidx_list, dtype=np.int64),
             "blocks_ahead": blocks_ahead,
         }
