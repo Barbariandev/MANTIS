@@ -15,6 +15,8 @@ Three-stage scoring pipeline:
 
 from __future__ import annotations
 
+import config  # noqa: F401  Importing config first locks the cross-hardware env (BLAS threads, hash seed) before numpy/sklearn load.
+
 import logging
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -310,7 +312,8 @@ def _cosine_dedup(
     """
     H = positions.shape[1]
     norms = np.linalg.norm(positions, axis=0) + 1e-12
-    order = np.argsort(-skill)
+    # Stable sort so equal-skill miners tie-break to the same hotkey across hosts.
+    order = np.argsort(-skill, kind="stable")
     cluster_id = -np.ones(H, dtype=np.int64)
     clusters: List[List[int]] = []
     for j in order:
@@ -872,7 +875,7 @@ def compute_trade_mix_salience(
         return ({}, {"reason": "no_positive_attribution", "info": info}) if return_diagnostics else {}
 
     if salience.size > cfg.top_k:
-        top_idx = np.argsort(-salience)[:cfg.top_k]
+        top_idx = np.argsort(-salience, kind="stable")[:cfg.top_k]
         mask = np.zeros_like(salience, dtype=bool)
         mask[top_idx] = True
         salience = np.where(mask, salience, 0.0)
