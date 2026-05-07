@@ -46,7 +46,7 @@ with open(my_hotkey, "w") as f:
 
 Tickers: `ETH`, `CADUSD`, `NZDUSD`, `CHFUSD`, `XAGUSD`
 
-Horizon: 300 blocks (1h). Two features in \([-1, 1]\). These are inputs to a logistic regression classifier, not probabilities. Scoring: feature selection (per-miner L2 logistic, AUC on held-out half, top-50 selected), then ElasticNet (L1 ratio 0.5) meta-model on walk-forward OOS base-model predictions. Importance = \(|\beta_j|\).
+Horizon: 300 blocks (1h). Two features in $[-1, 1]$. These are inputs to a logistic regression classifier, not probabilities. Scoring: feature selection (per-miner L2 logistic, AUC on held-out half, top-50 selected), then ElasticNet (L1 ratio 0.5) meta-model on walk-forward OOS base-model predictions. Importance = $|\beta_j|$.
 
 ```python
 embeddings["ETH"] = [0.3, -0.1]       # your model output
@@ -56,11 +56,11 @@ embeddings["CADUSD"] = [-0.5, 0.2]
 
 ### 3.2 HITFIRST (dim=3)
 
-Ticker: `ETHHITFIRST` (price\_key: `ETH`)
+Ticker: `ETHHITFIRST` (price_key: `ETH`)
 
-Horizon: 500 blocks. Three-way probability vector in \((0, 1)\) summing to 1: \([P(\text{up first}),\; P(\text{down first}),\; P(\text{neither})]\).
+Horizon: 500 blocks. Three-way probability vector in $(0, 1)$ summing to 1: $[P(\text{up first}),\; P(\text{down first}),\; P(\text{neither})]$.
 
-Barriers are set at \(\pm 1\sigma\) of recent returns. Scoring: two independent L2 logistic regressions on logit-transformed miner probabilities (one for up-barrier-hit, one for down). Single fit on all valid samples (no walk-forward). Importance = \(|\beta_j^{\text{up}}| + |\beta_j^{\text{down}}|\).
+Barriers are set at $\pm 1\sigma$ of recent returns. Scoring: two independent L2 logistic regressions on logit-transformed miner probabilities (one for up-barrier-hit, one for down). Single fit on all valid samples (no walk-forward). Importance = $|\beta_j^{\text{up}}| + |\beta_j^{\text{down}}|$.
 
 ```python
 embeddings["ETHHITFIRST"] = [0.4, 0.35, 0.25]
@@ -72,9 +72,9 @@ Tickers: `ETHLBFGS` (1h), `BTCLBFGS` (6h)
 
 Two scoring paths combined 75/25:
 
-**Classifier path (75%)** — `p[0:5]`: 5-bucket probability distribution over volatility regimes (boundaries at \(\pm 1\sigma\), \(\pm 2\sigma\)). Must be in \((0, 1)\), sum to 1. Scoring: per-class L2 logistic regressions on argmax predictions, walk-forward segmented. Importance = \(\sum_c \beta_{j,c}^2\). Uniqueness penalty suppresses miners with >85% argmax overlap with higher-ranked peers.
+**Classifier path (75%)** — `p[0:5]`: 5-bucket probability distribution over volatility regimes (boundaries at $\pm 1\sigma$, $\pm 2\sigma$). Must be in $(0, 1)$, sum to 1. Scoring: per-class L2 logistic regressions on argmax predictions, walk-forward segmented. Importance = $\sum_c \beta_{j,c}^2$. Uniqueness penalty suppresses miners with >85% argmax overlap with higher-ranked peers.
 
-**Q-path (25%)** — `q[5:17]`: 12 exceedance probabilities. For tail buckets 0, 1, 3, 4 (not the center bucket 2), predict \(P(|\text{return}| > k\sigma)\) at thresholds \(k \in \{0.5, 1.0, 2.0\}\). Scoring: 12 independent binary L2 logistic models on logit-transformed probabilities. Importance = averaged \(|\beta_j|\) across sub-models.
+**Q-path (25%)** — `q[5:17]`: 12 exceedance probabilities. For tail buckets 0, 1, 3, 4 (not the center bucket 2), predict $P(|\text{return}| > k\sigma)$ at thresholds $k \in \{0.5, 1.0, 2.0\}$. Scoring: 12 independent binary L2 logistic models on logit-transformed probabilities. Importance = averaged $|\beta_j|$ across sub-models.
 
 ```
 Index   Meaning
@@ -109,7 +109,7 @@ A state machine tracks rolling 4-day price ranges per asset. When price breaches
 | `barrier_pct` | 25% of range |
 | `min_range_pct` | 1% (skip tight ranges) |
 
-**Submission:** dict keyed by asset. Each value is \([P_{\text{continuation}},\; P_{\text{reversal}}]\) in \((0, 1)\).
+**Submission:** dict keyed by asset. Each value is $[P_{\text{continuation}},\; P_{\text{reversal}}]$ in $(0, 1)$.
 
 ```python
 from config import BREAKOUT_ASSETS
@@ -132,7 +132,7 @@ BREAKOUT_ASSETS = [
 ]
 ```
 
-**Scoring:** two-stage. (1) AUC gate — per-miner AUC on \(P_{\text{continuation}}\) vs realized label, requiring AUC > 0.5, ≥ 2 temporal episodes, and prediction std > 0.03. (2) L2 logistic regression on z-scored predictions from qualifying miners with episode-balanced sample weighting (each temporal episode gets equal total weight). Importance = \(|\beta_j|\).
+**Scoring:** two-stage. (1) AUC gate — per-miner AUC on $P_{\text{continuation}}$ vs realized label, requiring AUC > 0.5, ≥ 2 temporal episodes, and prediction std > 0.03. (2) L2 logistic regression on z-scored predictions from qualifying miners with episode-balanced sample weighting (each temporal episode gets equal total weight). Importance = $|\beta_j|$.
 
 **Breakouts are rare.** ~1-5 per asset per day. Submissions only matter at the instant a breakout triggers. Continuous submission is mandatory.
 
@@ -142,13 +142,13 @@ Ticker: `MULTIXSEC`
 
 Horizon: 1200 blocks (4h). Predict which assets will have above-median forward returns relative to the cross-section.
 
-**Submission:** dict keyed by asset. Each value is a single score in \([-1, 1]\).
+**Submission:** dict keyed by asset. Each value is a single score in $[-1, 1]$.
 
 **Label construction:** for each (timestep, asset) pair:
 
-\[
+$$
 y_{t,a} = \mathbf{1}\!\Big[r_{t \to t+h}^{(a)} > \text{median}_a\big(r_{t \to t+h}\big)\Big]
-\]
+$$
 
 All 33 assets are pooled into a single binary classification (33x sample multiplier). Walk-forward meta-model with AUC-scaled coefficients.
 
@@ -169,16 +169,17 @@ Horizon: 2400 blocks (8h). Predict which assets' perpetual funding rates will ch
 
 **Label construction:**
 
-\[
+$$
 \Delta f_a = f_{t+h}^{(a)} - f_t^{(a)}
-\]
-\[
+$$
+
+$$
 y_{t,a} = \mathbf{1}\!\Big[\Delta f_a > \text{median}_a(\Delta f)\Big]
-\]
+$$
 
-Using changes rather than levels destroys the high autocorrelation in funding rate levels (\(\phi \approx 0.97\)) and isolates asset-specific deviations. The cross-sectional median subtraction removes the market-wide funding factor (beta). Base rate is exactly 50% by construction.
+Using changes rather than levels destroys the high autocorrelation in funding rate levels ($\phi \approx 0.97$) and isolates asset-specific deviations. The cross-sectional median subtraction removes the market-wide funding factor (beta). Base rate is exactly 50% by construction.
 
-**Submission:** dict keyed by asset. Each value is a single score in \([-1, 1]\). Positive = expect above-median funding change. Magnitude matters (used as logistic regression feature). Missing assets default to 0.0 (neutral).
+**Submission:** dict keyed by asset. Each value is a single score in $[-1, 1]$. Positive = expect above-median funding change. Magnitude matters (used as logistic regression feature). Missing assets default to 0.0 (neutral).
 
 ```python
 from config import FUNDING_ASSETS
@@ -198,7 +199,7 @@ FUNDING_ASSETS = [
 ]
 ```
 
-**Scoring:** identical structure to XSEC-RANK. All 20 assets pooled (20x sample multiplier). Walk-forward meta-model with embargo \(= \max(\text{LAG}, \text{ahead})\). Stale miners (temporal std < \(10^{-4}\) per asset column) are zeroed before pooling.
+**Scoring:** identical structure to XSEC-RANK. All 20 assets pooled (20x sample multiplier). Walk-forward meta-model with embargo $= \max(\text{LAG}, \text{ahead})$. Stale miners (temporal std < $10^{-4}$ per asset column) are zeroed before pooling.
 
 **Useful features:**
 - Current funding rate levels (mean reversion: extreme rates tend to normalize)
@@ -266,19 +267,19 @@ Not all challenges use the same scoring structure. Summary:
 
 | Challenge | Scoring method | Importance metric |
 |---|---|---|
-| Binary | Walk-forward ElasticNet (L1/L2) meta-model on OOS base-model predictions | \(\|\beta_j\|\) |
-| LBFGS | 75% classifier path (per-class L2 logreg, \(\beta_j^2\), uniqueness penalty) + 25% Q-path (12 sub-models, averaged \(\|\beta_j\|\)) | blended |
-| HITFIRST | Two single-fit L2 logistic regressions (up-hit, down-hit) — no walk-forward | \(\|\beta_j^{\text{up}}\| + \|\beta_j^{\text{down}}\|\) |
-| MULTI-BREAKOUT | AUC gate → L2 logreg on z-scored predictions, episode-balanced weighting | \(\|\beta_j\|\) |
-| XSEC-RANK | Walk-forward L2 meta-model, AUC-scaled coefficients, recency-weighted segments | \(\|\beta_j\| \cdot \text{AUC\_scale}\) |
-| FUNDING-XSEC | Same as XSEC-RANK + stale filter (\(\text{std} < 10^{-4}\)) + extended embargo | \(\|\beta_j\| \cdot \text{AUC\_scale}\) |
+| Binary | Walk-forward ElasticNet (L1/L2) meta-model on OOS base-model predictions | $\|\beta_j\|$ |
+| LBFGS | 75% classifier path (per-class L2 logreg, $\beta_j^2$, uniqueness penalty) + 25% Q-path (12 sub-models, averaged $\|\beta_j\|$) | blended |
+| HITFIRST | Two single-fit L2 logistic regressions (up-hit, down-hit) — no walk-forward | $\|\beta_j^{\text{up}}\| + \|\beta_j^{\text{down}}\|$ |
+| MULTI-BREAKOUT | AUC gate → L2 logreg on z-scored predictions, episode-balanced weighting | $\|\beta_j\|$ |
+| XSEC-RANK | Walk-forward L2 meta-model, AUC-scaled coefficients, recency-weighted segments | $\|\beta_j\| \cdot \text{AUC\_scale}$ |
+| FUNDING-XSEC | Same as XSEC-RANK + stale filter ($\text{std} < 10^{-4}$) + extended embargo | $\|\beta_j\| \cdot \text{AUC\_scale}$ |
 | TRADE-MIX | Bayesian Sharpe luck filter → cosine-similarity dedup → skill-weighted meta-model → walk-forward leave-one-out OOS P&L | drop in OOS desk P&L when the cluster is removed |
 
-For challenges with walk-forward segments, recency weighting applies: \(w_i = \gamma^{n - 1 - i}\) where \(\gamma = 0.5^{1/\text{HALFLIFE}}\).
+For challenges with walk-forward segments, recency weighting applies: $w_i = \gamma^{n - 1 - i}$ where $\gamma = 0.5^{1/\text{HALFLIFE}}$.
 
 ### What gets you zero weight
 
-- Submitting constant values (temporal std < \(10^{-4}\))
+- Submitting constant values (temporal std < $10^{-4}$)
 - Submitting all zeros
 - Random noise (AUC ≈ 0.5 → coefficient pushed to zero by L1/L2)
 - Copying a top miner (L2 splits coefficient mass among clones)
