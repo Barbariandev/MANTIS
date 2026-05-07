@@ -10,13 +10,6 @@ import logging
 import os
 
 os.environ.setdefault("MALLOC_ARENA_MAX", "4")
-
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("MKL_CBWR", "COMPATIBLE")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("BLIS_NUM_THREADS", "1")
-os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 import threading
 import time
 import asyncio
@@ -109,7 +102,9 @@ async def get_asset_prices(session: aiohttp.ClientSession) -> dict[str, float] |
                         out[ticker] = fv
                 except Exception:
                     pass
-            for asset in getattr(config, "BREAKOUT_ASSETS", []):
+            multi_asset_keys = set(getattr(config, "BREAKOUT_ASSETS", []))
+            multi_asset_keys |= set(getattr(config, "TRADE_MIX_ASSETS", []))
+            for asset in multi_asset_keys:
                 if asset not in out:
                     v = fetched.get(asset)
                     if isinstance(v, (int, float)) and 0 < v < float('inf'):
@@ -351,36 +346,9 @@ async def run_main_loop(
                             weights_logger.warning("Salience is empty. Cannot calculate weights - insufficient training data.")
                             return
 
-                        # Drop the bottom EXCLUDE_BOTTOM_N UIDs by averaged salience
-                        # before any young-UID handling. Tie-break deterministically
-                        # by UID so every validator drops the same set when ties
-                        # exist on the boundary. Only applied when there are strictly
-                        # more than EXCLUDE_BOTTOM_N salience-bearing UIDs so we
-                        # never zero everything out.
-                        EXCLUDE_BOTTOM_N = 50
-                        if len(sal) > EXCLUDE_BOTTOM_N:
-                            sorted_uids = sorted(
-                                sal.items(),
-                                key=lambda kv: (float(kv[1]), int(kv[0])),
-                            )
-                            excluded_uids = [int(uid) for uid, _ in sorted_uids[:EXCLUDE_BOTTOM_N]]
-                            excluded_total = sum(float(sal[uid]) for uid in excluded_uids)
-                            for uid in excluded_uids:
-                                del sal[uid]
-                            weights_logger.info(
-                                f"Excluded bottom {len(excluded_uids)} UIDs by averaged salience "
-                                f"(cumulative pre-norm weight {excluded_total:.6f}); "
-                                f"{len(sal)} UIDs remain before young-UID handling."
-                            )
-                        else:
-                            weights_logger.info(
-                                f"Skipping bottom-{EXCLUDE_BOTTOM_N} exclusion: only {len(sal)} "
-                                f"salience-bearing UIDs available."
-                            )
-
                         uids = metagraph.uids.tolist()
 
-                        young_threshold = 72000
+                        young_threshold = 36000
                         hotkey_first_block = DataLog.get_hotkey_first_blocks_from_db(
                             db_path, int(config.SAMPLE_EVERY),
                         )
