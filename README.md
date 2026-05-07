@@ -1,6 +1,6 @@
 # MANTIS
 
-Bittensor Subnet 123 The Ultimate Signal Machine
+Bittensor Subnet 123, The Ultimate Signal Machine
 
 ---
 
