@@ -6,14 +6,7 @@ from __future__ import annotations
 import logging
 import os
 import random
-from typing import Dict, FrozenSet, List, Tuple
-
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("MKL_CBWR", "COMPATIBLE")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("BLIS_NUM_THREADS", "1")
-os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -23,17 +16,11 @@ from sklearn.metrics import roc_auc_score
 
 import config
 from bucket_forecast import compute_lbfgs_salience, compute_q_path_salience
-from cluster import (
-    collapse_salience,
-    equalize_within_cluster,
-    find_clusters,
-    find_correlated_cohorts,
-    select_representatives,
-)
 from hitfirst import compute_hitfirst_salience
 from range_breakout import compute_multi_breakout_salience
 from xsec_rank import compute_xsec_rank_salience
 from funding_xsec import compute_funding_xsec_salience
+from trade_mix import compute_trade_mix_salience
 
 
 logger = logging.getLogger(__name__)
@@ -172,116 +159,6 @@ def _fit_meta_logistic_en(
     return meta
 
 
-def _fit_meta_logistic_bootstrap(
-    X_train_sel: np.ndarray,
-    y_train_head: np.ndarray,
-    seed: int,
-    *,
-    min_rows: int,
-    l1_ratio: float,
-    C: float,
-    max_iter: int,
-    class_weight: str | None,
-    sample_weight: np.ndarray | None = None,
-    n_bootstrap: int = 20,
-    block_size: int = 120,
-) -> np.ndarray | None:
-    """Stationary block-bootstrap ENet meta-fit, median-of-means aggregated.
-
-    A single fit on the OOS-prediction matrix is a draw from the
-    distribution of fits consistent with the data plus the per-validator
-    decryption / metagraph perturbation.  In the flat-loss regime that
-    dominates the meta-fit's V-trust contribution, that distribution has
-    sample-level variance large enough to swamp the underlying signal,
-    so two validators with even small data-state differences produce
-    coefficient vectors that diverge in L1 by orders of magnitude more
-    than the BLAS-axis numerical floor.
-
-    Block bootstrap re-samples contiguous timeline blocks of length
-    ``block_size`` (chosen to exceed the autocorrelation horizon implied
-    by ``LAG``) so the local dependency structure of the OOS predictions
-    is preserved within each replicate.  Median-of-means aggregation
-    across the ``n_bootstrap`` replicates further suppresses heavy-tailed
-    influence from any single bad fit.
-
-    Determinism: each replicate's RNG and ``random_state`` are seeded by
-    ``seed + b``, and block start positions are sorted before
-    concatenation so the sample order is canonical.
-
-    Returns the aggregated absolute-coefficient vector of length K, or
-    ``None`` if the data is too short / degenerate for bootstrapping
-    (in which case the caller falls back to a single fit).
-    """
-    row_has_any = np.any(~np.isnan(X_train_sel), axis=1)
-    if int(row_has_any.sum()) < int(min_rows):
-        return None
-    X = np.where(np.isnan(X_train_sel[row_has_any]), 0.0, X_train_sel[row_has_any])
-    y = y_train_head[row_has_any]
-    sw = sample_weight[row_has_any] if sample_weight is not None else None
-    if len(np.unique(y)) < 2:
-        return None
-
-    T = int(X.shape[0])
-    K = int(X.shape[1])
-    if T < int(block_size) * 2 or int(n_bootstrap) <= 1:
-        return None
-
-    n_blocks = max(1, T // int(block_size))
-
-    coefs: List[np.ndarray] = []
-    for b in range(int(n_bootstrap)):
-        rng = np.random.default_rng(int(seed) + b)
-        block_starts = np.sort(rng.integers(0, T - int(block_size) + 1, size=n_blocks))
-        idx_chunks = [np.arange(int(s), int(s) + int(block_size)) for s in block_starts]
-        idx = np.concatenate(idx_chunks)
-        idx = idx[idx < T]
-        if idx.size == 0:
-            continue
-        Xb = X[idx]
-        yb = y[idx]
-        swb = sw[idx] if sw is not None else None
-        if len(np.unique(yb)) < 2:
-            continue
-        try:
-            meta = LogisticRegression(
-                penalty="elasticnet",
-                l1_ratio=float(l1_ratio),
-                C=float(C),
-                solver="saga",
-                class_weight=class_weight,
-                max_iter=int(max_iter),
-                random_state=int(seed) + b,
-                n_jobs=1,
-                tol=1e-4,
-                fit_intercept=True,
-                warm_start=False,
-            )
-            meta.fit(Xb, yb, sample_weight=swb)
-            coefs.append(np.abs(np.asarray(meta.coef_, dtype=np.float64).ravel()))
-        except Exception:
-            continue
-
-    if not coefs:
-        return None
-
-    coefs_arr = np.stack(coefs, axis=0)
-    if coefs_arr.shape[1] != K:
-        # Defensive: a degenerate replicate would have produced a different
-        # shape; falling through to None forces the caller's single-fit path.
-        return None
-
-    n = int(coefs_arr.shape[0])
-    n_groups = min(4, n)
-    if n_groups < 2:
-        return coefs_arr.mean(axis=0)
-    group_size = n // n_groups
-    group_means = np.stack([
-        coefs_arr[i * group_size:(i + 1) * group_size].mean(axis=0)
-        for i in range(n_groups)
-    ], axis=0)
-    return np.median(group_means, axis=0)
-
-
 
 def salience_binary_prediction(
     hist: Tuple[np.ndarray, Dict[str, int]],
@@ -289,7 +166,7 @@ def salience_binary_prediction(
     ticker: str,
 ) -> Dict[str, float]:
     LAG = int(getattr(config, "LAG", 1))
-    CHUNK_SIZE = int(getattr(config, "CHUNK_SIZE", 8000))
+    CHUNK_SIZE = int(getattr(config, "CHUNK_SIZE", 4000))
     TOP_K = int(getattr(config, "TOP_K", 50))
     RET_EPS = float(getattr(config, "RET_EPS", 0.0))
     MIN_BASE_TRAIN = int(getattr(config, "MIN_BASE_TRAIN", 50))
@@ -412,29 +289,8 @@ def salience_binary_prediction(
         pbar.update(1)
     pbar.close()
 
-    # --- Bootstrap-aggregated meta-fit on all OOS predictions -----------
-    #
-    # The meta-fit operates on a (T, K) design where the K columns are
-    # OOS predictions from the per-miner base models.  Those columns are
-    # mutually correlated (all base models target the same y), so the
-    # ENet objective sees a flat coefficient subspace whose L2 minimum is
-    # sensitive to small perturbations in either the row sample or the
-    # numerical microkernel.  A single fit therefore lives at one
-    # arbitrary point in that subspace and two validators with slightly
-    # different data states land at points that differ by O(1) in
-    # normalised L1 — the dominant V-trust contributor on this challenge.
-    #
-    # The block-bootstrap aggregator below averages over n_bootstrap
-    # replicates of the meta-fit on resampled contiguous blocks of the
-    # timeline, which collapses the per-fit variance toward the data-
-    # independent signal while preserving the autocorrelation structure
-    # the IID row bootstrap would shatter.  Median-of-means aggregation
-    # across four sub-groups further suppresses heavy-tailed influence
-    # from any single degenerate replicate.
-    BOOTSTRAP_N = int(getattr(config, "META_BOOTSTRAP_N", 20))
-    BOOTSTRAP_BLOCK = int(getattr(config, "META_BOOTSTRAP_BLOCK", max(2 * LAG, 120)))
-
-    coef_vec = _fit_meta_logistic_bootstrap(
+    # --- Fit a single meta-model on all OOS predictions ---
+    meta_clf = _fit_meta_logistic_en(
         X_oos,
         y_train_head=y_bin,
         seed=SEED,
@@ -444,27 +300,11 @@ def salience_binary_prediction(
         max_iter=META_MAX_ITER,
         class_weight=META_CLASS_WEIGHT,
         sample_weight=tw,
-        n_bootstrap=BOOTSTRAP_N,
-        block_size=BOOTSTRAP_BLOCK,
     )
-    if coef_vec is None:
-        # Bootstrap declined (insufficient timeline length / degenerate
-        # data); fall back to the single-fit path so behaviour matches
-        # the previous contract on small histories.
-        meta_clf = _fit_meta_logistic_en(
-            X_oos,
-            y_train_head=y_bin,
-            seed=SEED,
-            min_rows=int(getattr(config, "MIN_META_TRAIN_ROWS", 50)),
-            l1_ratio=META_L1_RATIO,
-            C=META_C,
-            max_iter=META_MAX_ITER,
-            class_weight=META_CLASS_WEIGHT,
-            sample_weight=tw,
-        )
-        if meta_clf is None:
-            return {}
-        coef_vec = np.abs(np.asarray(meta_clf.coef_, dtype=np.float64).ravel())
+    if meta_clf is None:
+        return {}
+
+    coef_vec = np.abs(np.asarray(meta_clf.coef_, dtype=np.float64).ravel())
 
     imp_map: Dict[str, float] = {}
     for local_col, j in enumerate(selected_idx):
@@ -540,82 +380,6 @@ def multi_salience(
             return None
         return trimmed[0], trimmed[1], blocks_ahead
 
-    def _cluster_reps(hist_in, dim_in, ticker_for_log: str) -> Tuple[Dict[str, str], Dict[str, str]]:
-        """Two-tier clone/cohort detection for one challenge.
-
-        Returns ``(exact_reps, cohort_reps)``.
-
-        * ``exact_reps`` are the members of bit-tight clone clusters
-          discovered by ``find_clusters``.  These are operator-side
-          duplications that should collapse to a single representative;
-          the appropriate downstream operation is ``collapse_salience``
-          (sum-into-rep) so the cluster's mass concentrates onto one UID.
-        * ``cohort_reps`` are the members of soft-correlated cohorts
-          discovered by ``find_correlated_cohorts``.  These share a
-          common signal but are not byte-identical; the appropriate
-          downstream operation is ``equalize_within_cluster`` (mass-
-          conserving equal split) so per-key allocation is invariant
-          under the L2's nondeterministic mass split inside the cohort.
-
-        Cohort membership strictly contains exact-clone membership at the
-        limit ``tau → 1``; we run both detectors so the strict-clone path
-        keeps its existing semantics on the keys it covers, and the soft
-        path only equalises among keys that the strict path did not
-        already collapse.
-
-        Empty maps on any failure or trivial input.
-        """
-        if hist_in is None or dim_in is None or int(dim_in) <= 0:
-            return {}, {}
-
-        exact_reps: Dict[str, str] = {}
-        try:
-            clusters = find_clusters(hist_in, dim=int(dim_in))
-        except Exception:
-            logger.exception("[%s] exact cluster detection failed", ticker_for_log)
-            clusters = []
-        if clusters:
-            exact_reps = select_representatives(clusters)
-            logger.info(
-                "[%s] %d exact cluster(s) covering %d hotkeys; lex-min reps assigned",
-                ticker_for_log, len(clusters), len(exact_reps),
-            )
-
-        cohort_reps: Dict[str, str] = {}
-        try:
-            cohorts = find_correlated_cohorts(hist_in, dim=int(dim_in))
-        except Exception:
-            logger.exception("[%s] correlated cohort detection failed", ticker_for_log)
-            cohorts = []
-        if cohorts:
-            # Strip exact-clone members so the equalise step only fires on
-            # keys that the strict pass left distinct; this preserves the
-            # economic property of the strict pass (clones concentrate to
-            # one UID) while still removing per-key flicker among the
-            # remaining soft-correlated members.
-            stripped: List[FrozenSet[str]] = []
-            for c in cohorts:
-                remaining = frozenset(hk for hk in c if hk not in exact_reps)
-                if len(remaining) >= 2:
-                    stripped.append(remaining)
-            if stripped:
-                cohort_reps = select_representatives(stripped)
-                logger.info(
-                    "[%s] %d soft cohort(s) covering %d hotkeys; equalisation reps assigned",
-                    ticker_for_log, len(stripped), len(cohort_reps),
-                )
-
-        return exact_reps, cohort_reps
-
-    def _apply_reps(s: Dict[str, float], reps_pair: Tuple[Dict[str, str], Dict[str, str]]) -> Dict[str, float]:
-        """Apply exact-clone collapse then soft-cohort equalisation in order."""
-        exact_reps, cohort_reps = reps_pair
-        if exact_reps:
-            s = collapse_salience(s, exact_reps)
-        if cohort_reps:
-            s = equalize_within_cluster(s, cohort_reps)
-        return s
-
     per_challenge: List[Tuple[str, Dict[str, float], float]] = []
     breakdown: Dict[str, Dict[str, float]] = {}
     total_w = 0.0
@@ -633,8 +397,6 @@ def multi_salience(
             hist, y = payload
             del payload
             s = salience_binary_prediction(hist, y, ticker)
-            if s:
-                s = _apply_reps(s, _cluster_reps(hist, spec.get("dim"), ticker))
             del hist, y
         elif loss_type in ("lbfgs", "hitfirst"):
             extracted = _extract_hist_price(payload, spec)
@@ -646,10 +408,6 @@ def multi_salience(
                 se = int(config.SAMPLE_EVERY)
                 s_cls = compute_lbfgs_salience(hist, price, blocks_ahead=blocks_ahead, sample_every=se)
                 s_q = compute_q_path_salience(hist, price, blocks_ahead=blocks_ahead, sample_every=se)
-                if s_cls or s_q:
-                    reps_pair = _cluster_reps(hist, spec.get("dim"), ticker)
-                    s_cls = _apply_reps(s_cls, reps_pair)
-                    s_q = _apply_reps(s_q, reps_pair)
                 if _is_uniform_salience(s_cls):
                     s_cls = {}
                 if _is_uniform_salience(s_q):
@@ -669,8 +427,6 @@ def multi_salience(
                 s = compute_hitfirst_salience(
                     hist, price, blocks_ahead=blocks_ahead, sample_every=int(config.SAMPLE_EVERY),
                 )
-                if s:
-                    s = _apply_reps(s, _cluster_reps(hist, spec.get("dim"), ticker))
             del hist, price
         elif loss_type == "range_breakout_multi":
             completed = payload.get("completed_samples", [])
@@ -705,8 +461,6 @@ def multi_salience(
                 blocks_ahead=blocks_ahead,
                 sample_every=int(config.SAMPLE_EVERY),
             )
-            if s:
-                s = _apply_reps(s, _cluster_reps(hist_trimmed[0], len(config.BREAKOUT_ASSETS), ticker))
             del hist, prices_multi, prices_trimmed
         elif loss_type == "funding_xsec":
             if not isinstance(payload, dict):
@@ -737,9 +491,38 @@ def multi_salience(
                 sample_every=int(config.SAMPLE_EVERY),
                 sidx_arr=sidx_trimmed,
             )
-            if s:
-                s = _apply_reps(s, _cluster_reps(hist_trimmed[0], len(config.FUNDING_ASSETS), ticker))
             del hist, funding_rates, funding_trimmed, sidx_trimmed
+        elif loss_type == "trade_mix":
+            if not isinstance(payload, dict):
+                del payload
+                continue
+            hist = payload.get("hist")
+            prices_multi = payload.get("prices_multi")
+            sidx_arr = payload.get("sidx_arr")
+            blocks_ahead = int(spec.get("blocks_ahead", 0) or 0)
+            del payload
+            if (
+                not isinstance(hist, tuple)
+                or len(hist) != 2
+                or prices_multi is None
+                or blocks_ahead <= 0
+            ):
+                continue
+            hist_trimmed = _trim_hist_price(hist, prices_multi[:, 0])
+            if hist_trimmed[0] is None:
+                continue
+            trim_len = hist_trimmed[0][0].shape[0]
+            prices_trimmed = prices_multi[-trim_len:]
+            sidx_trimmed = sidx_arr[-trim_len:] if sidx_arr is not None else None
+            s = compute_trade_mix_salience(
+                (hist_trimmed[0][0], hist_trimmed[0][1]),
+                prices_trimmed,
+                blocks_ahead=blocks_ahead,
+                sample_every=int(config.SAMPLE_EVERY),
+                sidx_arr=sidx_trimmed,
+                spec=spec,
+            )
+            del hist, prices_multi, prices_trimmed, sidx_trimmed
         else:
             del payload
             continue
