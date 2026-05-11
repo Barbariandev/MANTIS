@@ -226,7 +226,7 @@ CHALLENGE_MAP = {c["ticker"]: c for c in CHALLENGES}
 CHALLENGE_NAME_TO_TICKER = {c["name"]: c["ticker"] for c in CHALLENGES}
 ASSET_EMBEDDING_DIMS = {c["ticker"]: c["dim"] for c in CHALLENGES}
 
-BURN_PCT = 0.30
+BURN_PCT = 0.45
 
 MAX_DAYS = 60
 
