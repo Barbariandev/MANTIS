@@ -85,7 +85,7 @@ CHALLENGES = [
         "dim": 3,
         "blocks_ahead": 500,
         "loss_func": "hitfirst",
-        "weight": 2.5,
+        "weight": 1.25,
     },
     {
         "name": "ETH-LBFGS",
@@ -111,7 +111,7 @@ CHALLENGES = [
         "dim": 2,
         "blocks_ahead": 300,
         "loss_func": "binary",
-        "weight": 1,
+        "weight": 0.5,
     },
     {
         "name": "NZDUSD-1H-BINARY",
@@ -119,7 +119,7 @@ CHALLENGES = [
         "dim": 2,
         "blocks_ahead": 300,
         "loss_func": "binary",
-        "weight": 1,
+        "weight": 0.5,
     },
     {
         "name": "CHFUSD-1H-BINARY",
