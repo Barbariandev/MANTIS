@@ -77,7 +77,7 @@ def _bootstrap_l2_abs_coef(
     n_bootstrap: int = _BOOTSTRAP_N,
     block_size: int = _BOOTSTRAP_BLOCK,
 ) -> np.ndarray | None:
-    """Block-bootstrap a single L2 binary logistic; return aggregated |coef|.
+    """Block-bootstrap a single L1 binary logistic; return aggregated |coef|.
 
     Returns ``None`` when the timeline is too short for block bootstrap or
     every replicate degenerated; the caller's single-fit fallback path
@@ -108,7 +108,7 @@ def _bootstrap_l2_abs_coef(
             continue
         try:
             clf = LogisticRegression(
-                penalty="l2",
+                penalty="l1",
                 C=float(C),
                 class_weight="balanced",
                 solver=solver,
@@ -308,9 +308,13 @@ def compute_linear_salience(
             # Per-class bootstrap: distinct seed per (segment, class) so the
             # sampling across the full walk-forward sweep stays independent
             # while remaining bit-deterministic given a fixed top-level
-            # seed.  Aggregator returns |coef|; we square to preserve the
-            # original L2-mass-splitting penalty semantics on cohorts that
-            # the cluster-collapse pass left intact.
+            # seed.  Aggregator returns |coef|; under L1 the coefficient
+            # vector is already sparse — one representative per correlated
+            # cohort survives with non-zero weight — so we accumulate
+            # |coef| linearly rather than squaring.  Squaring under L1
+            # would re-introduce the L2 mass-splitting pathology by over-
+            # weighting the few large entries and crushing the merely-
+            # informative ones.
             agg = _bootstrap_l2_abs_coef(
                 feat_fit, y_fit_c,
                 sample_weight=sw,
@@ -320,7 +324,7 @@ def compute_linear_salience(
             )
             if agg is None:
                 clf = LogisticRegression(
-                    penalty="l2",
+                    penalty="l1",
                     C=0.1,
                     class_weight="balanced",
                     solver="liblinear",
@@ -329,7 +333,7 @@ def compute_linear_salience(
                 )
                 clf.fit(feat_fit, y_fit_c, sample_weight=sw)
                 agg = np.abs(clf.coef_.ravel())
-            meta_imp_sel += agg ** 2
+            meta_imp_sel += agg
 
         meta_imp = np.zeros(n_active)
         meta_imp[selected] = meta_imp_sel
@@ -523,16 +527,16 @@ def compute_q_path_salience(
             agg = _bootstrap_l2_abs_coef(
                 x_logits, y_bin,
                 sample_weight=sw,
-                C=0.5, solver="lbfgs", max_iter=500,
+                C=0.5, solver="liblinear", max_iter=500,
                 seed=42 + 17 * int(c) + int(j),
                 n_bootstrap=_BOOTSTRAP_N, block_size=_BOOTSTRAP_BLOCK,
             )
             if agg is None:
                 clf = LogisticRegression(
-                    penalty="l2",
+                    penalty="l1",
                     C=0.5,
                     class_weight="balanced",
-                    solver="lbfgs",
+                    solver="liblinear",
                     max_iter=500,
                     random_state=42,
                 )
