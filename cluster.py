@@ -461,3 +461,163 @@ def equalize_within_cluster(
         out[hk] = float(v)
 
     return out
+
+
+# -- LBFGS-bucket joint-active cohort detection ----------------------------
+
+# |corr| merge threshold for joint-active bucket-clone cohorts.
+LBFGS_TAU: float = 0.80
+
+# Minimum joint-active and own-activity row counts. ~1 week at 60s cadence,
+# below which pairwise correlation is dominated by sample noise.
+LBFGS_MIN_JOINT: int = 10_080
+LBFGS_MIN_SUBMISSIONS: int = 10_080
+
+# Leading dims used for cohort identity. The LBFGS linear path scores the
+# per-class softmax (0..4); quantile dims (5..16) go to the q-path. Bucket-
+# only clustering keeps cohorts interchangeable for the linear L2 fit.
+LBFGS_BUCKET_DIMS: int = 5
+
+# Cheap per-class mean prefilter; pairs whose bucket means differ by more
+# than this on any class cannot satisfy tau >= 0.8.
+LBFGS_MEAN_PREFILTER: float = 0.10
+
+
+def find_lbfgs_joint_cohorts(
+    hist: Tuple[np.ndarray, Dict[str, int]],
+    *,
+    tau: float = LBFGS_TAU,
+    min_joint: int = LBFGS_MIN_JOINT,
+    min_submissions: int = LBFGS_MIN_SUBMISSIONS,
+    bucket_dims: int = LBFGS_BUCKET_DIMS,
+    mean_prefilter: float | None = LBFGS_MEAN_PREFILTER,
+) -> List[FrozenSet[str]]:
+    """Joint-active correlated cohorts on bucket-prob dims.
+
+    Differs from :func:`find_correlated_cohorts` in two ways relevant to
+    the LBFGS-bucket scorer: pairwise correlation is computed only over
+    timesteps where both miners are submitting (so late-joining clones
+    are not diluted by zero-padded rows), and only the leading
+    ``bucket_dims`` are used as features (the linear scorer ignores the
+    quantile dims, which are handled by the q-path).
+
+    Output schema matches :func:`find_correlated_cohorts`: non-singleton
+    cohorts as frozensets, consumed by :func:`select_representatives` and
+    :func:`equalize_within_cluster` unchanged.
+    """
+    X_flat, hk2idx = hist
+    if not hk2idx or X_flat is None:
+        return []
+    X_flat = np.asarray(X_flat)
+    if X_flat.ndim != 2:
+        return []
+    H = len(hk2idx)
+    if H < 2 or X_flat.shape[1] % H != 0:
+        return []
+    D = X_flat.shape[1] // H
+    if D <= 0 or bucket_dims <= 0 or bucket_dims > D:
+        return []
+    T = int(X_flat.shape[0])
+    if T < min_joint:
+        return []
+
+    X_3d = X_flat.reshape(T, H, D)
+
+    # Activity uses all D dims to match find_correlated_cohorts' convention.
+    nz_mask = np.any(X_3d != 0, axis=2)
+    sub_counts = nz_mask.sum(axis=0)
+    active_idx = np.where(sub_counts >= int(min_submissions))[0]
+    if active_idx.size < 2:
+        return []
+
+    Xb = X_3d[:, :, :int(bucket_dims)].astype(np.float32, copy=False)
+
+    Hd = int(bucket_dims)
+    means = np.zeros((H, Hd), dtype=np.float32)
+    if mean_prefilter is not None:
+        for i in active_idx:
+            mi = nz_mask[:, int(i)]
+            if mi.any():
+                means[int(i)] = Xb[mi, int(i), :].mean(axis=0)
+
+    # Union-find restricted to active miners.
+    parent: Dict[int, int] = {int(i): int(i) for i in active_idx}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return
+        parent[max(ra, rb)] = min(ra, rb)
+
+    n_active = int(active_idx.size)
+    n_pairs_checked = 0
+    n_pairs_matched = 0
+    n_pairs_skipped_mean = 0
+    n_pairs_skipped_joint = 0
+
+    for ii in range(n_active):
+        i = int(active_idx[ii])
+        nz_i = nz_mask[:, i]
+        Xb_i = Xb[:, i, :]
+        for jj in range(ii + 1, n_active):
+            j = int(active_idx[jj])
+            if mean_prefilter is not None:
+                if float(np.max(np.abs(means[i] - means[j]))) > float(mean_prefilter):
+                    n_pairs_skipped_mean += 1
+                    continue
+
+            joint = nz_i & nz_mask[:, j]
+            n_joint = int(joint.sum())
+            if n_joint < int(min_joint):
+                n_pairs_skipped_joint += 1
+                continue
+
+            xi = Xb_i[joint, :].ravel()
+            xj = Xb[joint, j, :].ravel()
+            ai = xi - float(xi.mean())
+            aj = xj - float(xj.mean())
+            ni = float(np.linalg.norm(ai))
+            nj = float(np.linalg.norm(aj))
+            if ni < 1e-9 or nj < 1e-9:
+                continue
+            corr = abs(float(ai @ aj) / (ni * nj))
+            n_pairs_checked += 1
+            if corr >= float(tau):
+                union(i, j)
+                n_pairs_matched += 1
+
+    by_root: Dict[int, List[int]] = {}
+    for i in active_idx:
+        r = find(int(i))
+        by_root.setdefault(r, []).append(int(i))
+
+    idx2hk: List[str | None] = [None] * H
+    for hk, k in hk2idx.items():
+        if 0 <= int(k) < H:
+            idx2hk[int(k)] = hk
+
+    out: List[FrozenSet[str]] = []
+    for members in by_root.values():
+        if len(members) < 2:
+            continue
+        hks = frozenset(idx2hk[m] for m in members if idx2hk[m] is not None)
+        if len(hks) >= 2:
+            out.append(hks)
+
+    if out or n_pairs_checked > 0:
+        logger.info(
+            "lbfgs joint cohort scan: H=%d active=%d pairs_checked=%d matched=%d "
+            "skipped_mean=%d skipped_joint=%d cohorts=%d total_members=%d "
+            "tau=%.3f bucket_dims=%d",
+            H, n_active, n_pairs_checked, n_pairs_matched,
+            n_pairs_skipped_mean, n_pairs_skipped_joint,
+            len(out), sum(len(c) for c in out), float(tau), int(bucket_dims),
+        )
+
+    return out
