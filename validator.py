@@ -429,7 +429,7 @@ async def run_main_loop(
                         old_weights_data = load_weights()
                         if old_weights_data is not None:
                             old_w = old_weights_data["weights"]
-                            alpha = 0.15
+                            alpha = 0.3
                             new_w_tensor = torch.zeros_like(final_w)
                             
                             if "hotkeys" in old_weights_data:
