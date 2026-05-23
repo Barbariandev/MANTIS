@@ -492,14 +492,14 @@ def find_lbfgs_joint_cohorts(
     bucket_dims: int = LBFGS_BUCKET_DIMS,
     mean_prefilter: float | None = LBFGS_MEAN_PREFILTER,
 ) -> List[FrozenSet[str]]:
-    """Joint-active correlated cohorts on bucket-prob dims.
+    """Joint-active correlated cohorts on bucket-prob dims (vectorized).
 
-    Differs from :func:`find_correlated_cohorts` in two ways relevant to
-    the LBFGS-bucket scorer: pairwise correlation is computed only over
-    timesteps where both miners are submitting (so late-joining clones
-    are not diluted by zero-padded rows), and only the leading
-    ``bucket_dims`` are used as features (the linear scorer ignores the
-    quantile dims, which are handled by the q-path).
+    Uses matrix operations instead of O(H^2) Python loops for the pairwise
+    correlation scan.  Centering is per-miner (over own non-zero rows);
+    dot products and norms are accumulated in chunks to bound memory.
+    The resulting correlation is exact on joint-active rows up to the
+    centering approximation, which is negligible for high-overlap pairs
+    (the clones this function targets).
 
     Output schema matches :func:`find_correlated_cohorts`: non-singleton
     cohorts as frozensets, consumed by :func:`select_representatives` and
@@ -530,18 +530,71 @@ def find_lbfgs_joint_cohorts(
     if active_idx.size < 2:
         return []
 
-    Xb = X_3d[:, :, :int(bucket_dims)].astype(np.float32, copy=False)
+    n_active = int(active_idx.size)
+    bd = int(bucket_dims)
+    nz_active = nz_mask[:, active_idx]  # (T, n_active) bool
 
-    Hd = int(bucket_dims)
-    means = np.zeros((H, Hd), dtype=np.float32)
+    # -- Vectorized per-miner means on non-zero rows -----------------------
+    nz_f32 = nz_active.astype(np.float32)
+    nz_counts = nz_f32.sum(axis=0)  # (n_active,)
+
+    _CHUNK = 50_000
+    miner_sums = np.zeros((n_active, bd), dtype=np.float64)
+    for t0 in range(0, T, _CHUNK):
+        t1 = min(t0 + _CHUNK, T)
+        Xb_c = X_3d[t0:t1][:, active_idx, :bd].astype(np.float32)
+        miner_sums += (Xb_c * nz_f32[t0:t1, :, None]).sum(axis=0).astype(np.float64)
+    miner_means = (miner_sums / np.maximum(nz_counts[:, None], 1.0)).astype(np.float32)
+
+    # -- Mean prefilter (vectorized) ---------------------------------------
     if mean_prefilter is not None:
-        for i in active_idx:
-            mi = nz_mask[:, int(i)]
-            if mi.any():
-                means[int(i)] = Xb[mi, int(i), :].mean(axis=0)
+        mean_diff = np.max(
+            np.abs(miner_means[:, None, :] - miner_means[None, :, :]), axis=2,
+        )
+        mean_pass = mean_diff <= float(mean_prefilter)
+    else:
+        mean_pass = np.ones((n_active, n_active), dtype=bool)
 
-    # Union-find restricted to active miners.
-    parent: Dict[int, int] = {int(i): int(i) for i in active_idx}
+    # -- Joint-active count matrix -----------------------------------------
+    nz_f64 = nz_active.astype(np.float64)
+    joint_counts = (nz_f64.T @ nz_f64).astype(np.int64)
+    joint_pass = joint_counts >= int(min_joint)
+
+    # -- Chunked correlation matrix ----------------------------------------
+    # Center each miner by its own non-zero mean, zero inactive rows.
+    # Dot product only accumulates over joint-active rows (inactive = 0).
+    # Per-pair norms are computed exactly via sq.T @ nz cross-product.
+    dot_matrix = np.zeros((n_active, n_active), dtype=np.float64)
+    norm_sq_joint = np.zeros((n_active, n_active), dtype=np.float64)
+
+    for t0 in range(0, T, _CHUNK):
+        t1 = min(t0 + _CHUNK, T)
+        Xb_c = X_3d[t0:t1][:, active_idx, :bd].astype(np.float32)
+        nz_c = nz_active[t0:t1]
+
+        centered = (Xb_c - miner_means[None, :, :]) * nz_c[:, :, None].astype(np.float32)
+
+        F_c = centered.transpose(1, 0, 2).reshape(n_active, -1).astype(np.float64)
+        dot_matrix += F_c @ F_c.T
+
+        sq = (centered ** 2).sum(axis=2).astype(np.float64)  # (chunk, n_active)
+        norm_sq_joint += sq.T @ nz_c.astype(np.float64)
+
+    denom = np.sqrt(norm_sq_joint * norm_sq_joint.T)
+    denom = np.maximum(denom, 1e-18)
+    corr_matrix = np.abs(dot_matrix) / denom
+
+    # -- Combine filters and extract matched pairs -------------------------
+    upper = np.triu(np.ones((n_active, n_active), dtype=bool), k=1)
+    match_mask = upper & mean_pass & joint_pass & (corr_matrix >= float(tau))
+
+    n_pairs_skipped_mean = int((upper & ~mean_pass).sum()) if mean_prefilter is not None else 0
+    n_pairs_skipped_joint = int((upper & mean_pass & ~joint_pass).sum())
+    n_pairs_checked = int((upper & mean_pass & joint_pass).sum())
+    n_pairs_matched = int(match_mask.sum())
+
+    # -- Union-find --------------------------------------------------------
+    parent = list(range(n_active))
 
     def find(x: int) -> int:
         while parent[x] != x:
@@ -551,51 +604,16 @@ def find_lbfgs_joint_cohorts(
 
     def union(a: int, b: int) -> None:
         ra, rb = find(a), find(b)
-        if ra == rb:
-            return
-        parent[max(ra, rb)] = min(ra, rb)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
 
-    n_active = int(active_idx.size)
-    n_pairs_checked = 0
-    n_pairs_matched = 0
-    n_pairs_skipped_mean = 0
-    n_pairs_skipped_joint = 0
-
-    for ii in range(n_active):
-        i = int(active_idx[ii])
-        nz_i = nz_mask[:, i]
-        Xb_i = Xb[:, i, :]
-        for jj in range(ii + 1, n_active):
-            j = int(active_idx[jj])
-            if mean_prefilter is not None:
-                if float(np.max(np.abs(means[i] - means[j]))) > float(mean_prefilter):
-                    n_pairs_skipped_mean += 1
-                    continue
-
-            joint = nz_i & nz_mask[:, j]
-            n_joint = int(joint.sum())
-            if n_joint < int(min_joint):
-                n_pairs_skipped_joint += 1
-                continue
-
-            xi = Xb_i[joint, :].ravel()
-            xj = Xb[joint, j, :].ravel()
-            ai = xi - float(xi.mean())
-            aj = xj - float(xj.mean())
-            ni = float(np.linalg.norm(ai))
-            nj = float(np.linalg.norm(aj))
-            if ni < 1e-9 or nj < 1e-9:
-                continue
-            corr = abs(float(ai @ aj) / (ni * nj))
-            n_pairs_checked += 1
-            if corr >= float(tau):
-                union(i, j)
-                n_pairs_matched += 1
+    for ii, jj in np.argwhere(match_mask):
+        union(int(ii), int(jj))
 
     by_root: Dict[int, List[int]] = {}
-    for i in active_idx:
-        r = find(int(i))
-        by_root.setdefault(r, []).append(int(i))
+    for i in range(n_active):
+        r = find(i)
+        by_root.setdefault(r, []).append(int(active_idx[i]))
 
     idx2hk: List[str | None] = [None] * H
     for hk, k in hk2idx.items():
