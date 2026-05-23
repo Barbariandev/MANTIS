@@ -6,6 +6,11 @@ from typing import Dict, Iterable, Optional, Tuple
 import numpy as np
 from sklearn.linear_model import LogisticRegression
 
+from cluster import (
+    equalize_within_cluster,
+    find_lbfgs_joint_cohorts,
+    select_representatives,
+)
 from utils import (
     EPS,
     MIN_REQUIRED_SAMPLES,
@@ -77,7 +82,7 @@ def _bootstrap_l2_abs_coef(
     n_bootstrap: int = _BOOTSTRAP_N,
     block_size: int = _BOOTSTRAP_BLOCK,
 ) -> np.ndarray | None:
-    """Block-bootstrap a single L1 binary logistic; return aggregated |coef|.
+    """Block-bootstrap a single L2 binary logistic; return aggregated |coef|.
 
     Returns ``None`` when the timeline is too short for block bootstrap or
     every replicate degenerated; the caller's single-fit fallback path
@@ -108,7 +113,7 @@ def _bootstrap_l2_abs_coef(
             continue
         try:
             clf = LogisticRegression(
-                penalty="l1",
+                penalty="l2",
                 C=float(C),
                 class_weight="balanced",
                 solver=solver,
@@ -308,13 +313,9 @@ def compute_linear_salience(
             # Per-class bootstrap: distinct seed per (segment, class) so the
             # sampling across the full walk-forward sweep stays independent
             # while remaining bit-deterministic given a fixed top-level
-            # seed.  Aggregator returns |coef|; under L1 the coefficient
-            # vector is already sparse — one representative per correlated
-            # cohort survives with non-zero weight — so we accumulate
-            # |coef| linearly rather than squaring.  Squaring under L1
-            # would re-introduce the L2 mass-splitting pathology by over-
-            # weighting the few large entries and crushing the merely-
-            # informative ones.
+            # seed.  Aggregator returns |coef|; we square to preserve the
+            # original L2-mass-splitting penalty semantics on cohorts that
+            # the cluster-collapse pass left intact.
             agg = _bootstrap_l2_abs_coef(
                 feat_fit, y_fit_c,
                 sample_weight=sw,
@@ -324,7 +325,7 @@ def compute_linear_salience(
             )
             if agg is None:
                 clf = LogisticRegression(
-                    penalty="l1",
+                    penalty="l2",
                     C=0.1,
                     class_weight="balanced",
                     solver="liblinear",
@@ -333,7 +334,7 @@ def compute_linear_salience(
                 )
                 clf.fit(feat_fit, y_fit_c, sample_weight=sw)
                 agg = np.abs(clf.coef_.ravel())
-            meta_imp_sel += agg
+            meta_imp_sel += agg ** 2
 
         meta_imp = np.zeros(n_active)
         meta_imp[selected] = meta_imp_sel
@@ -394,6 +395,66 @@ def compute_linear_salience(
     return {inv_map[i]: float(pruned[i]) for i in range(H) if pruned[i] > 0 and i in inv_map}
 
 
+def _reduce_hist_to_cohort_reps(
+    hist: Tuple[np.ndarray, Dict[str, int]],
+) -> Tuple[Tuple[np.ndarray, Dict[str, int]], Dict[str, str]]:
+    """Collapse near-clones in ``hist`` to their lex-min representatives.
+
+    Operates on the hotkey axis only; the temporal and per-miner feature
+    axes pass through unchanged. Returns the original hist and an empty
+    map when no cohorts are detected, making the downstream broadcast a
+    no-op on inputs without clones.
+    """
+    X_flat, hk2idx = hist
+    if not isinstance(hk2idx, dict) or not hk2idx or X_flat is None:
+        return hist, {}
+    X_arr = np.asarray(X_flat)
+    if X_arr.ndim != 2:
+        return hist, {}
+    H = int(len(hk2idx))
+    if H < 2 or X_arr.shape[1] % H != 0:
+        return hist, {}
+    D = int(X_arr.shape[1] // H)
+    if D <= 0:
+        return hist, {}
+
+    cohorts = find_lbfgs_joint_cohorts(hist)
+    if not cohorts:
+        return hist, {}
+
+    rep_map = select_representatives(cohorts)
+    if not rep_map:
+        return hist, {}
+
+    full_to_rep: Dict[str, str] = {hk: rep_map.get(hk, hk) for hk in hk2idx.keys()}
+    rep_hks = sorted(set(full_to_rep.values()))
+    keep_idx = np.array([int(hk2idx[hk]) for hk in rep_hks], dtype=np.int64)
+
+    T = int(X_arr.shape[0])
+    X_3d = X_arr.reshape(T, H, D)
+    X_red = X_3d[:, keep_idx, :].reshape(T, len(rep_hks) * D)
+    hk2idx_red: Dict[str, int] = {hk: i for i, hk in enumerate(rep_hks)}
+
+    return (X_red, hk2idx_red), full_to_rep
+
+
+# Single-entry cache so the q-path reuses the linear path's cohort scan
+# (both receive the same hist object within a single calc_worker cycle).
+_cohort_cache_key: object = None
+_cohort_cache_val: object = None
+
+
+def _cached_reduce(hist: Tuple[np.ndarray, Dict[str, int]]):
+    global _cohort_cache_key, _cohort_cache_val
+    key = id(hist[0])
+    if key == _cohort_cache_key and _cohort_cache_val is not None:
+        return _cohort_cache_val
+    result = _reduce_hist_to_cohort_reps(hist)
+    _cohort_cache_key = key
+    _cohort_cache_val = result
+    return result
+
+
 def compute_lbfgs_salience(
     hist: Tuple[np.ndarray, Dict[str, int]],
     price_data: np.ndarray,
@@ -404,15 +465,51 @@ def compute_lbfgs_salience(
     half_life_days: float = 5.0,
     use_class_weights: bool = True,
 ) -> Dict[str, float]:
-    return compute_linear_salience(
-        hist,
+    reduced_hist, full_to_rep = _cached_reduce(hist)
+    s = compute_linear_salience(
+        reduced_hist,
         price_data,
         blocks_ahead=blocks_ahead,
         sample_every=sample_every,
     )
+    if full_to_rep:
+        s = equalize_within_cluster(s, full_to_rep)
+    return s
 
 
 def compute_q_path_salience(
+    hist: Tuple[np.ndarray, Dict[str, int]],
+    price_data: np.ndarray,
+    blocks_ahead: int,
+    sample_every: int,
+    min_days: float = 5.0,
+    half_life_days: float = 5.0,
+    sigma_minutes: int = 60,
+    gating_classes: Iterable[int] = (0, 1, 3, 4),
+) -> Dict[str, float]:
+    """Q-path scorer with cohort collapse on the hotkey axis.
+
+    Cohorts are detected on bucket dims (shared with the linear path);
+    the inner 12-model L2 fit runs on the collapsed set and the per-rep
+    salience is equalised across cohort members on the way out.
+    """
+    reduced_hist, full_to_rep = _cached_reduce(hist)
+    s = _compute_q_path_salience_impl(
+        reduced_hist,
+        price_data,
+        blocks_ahead=blocks_ahead,
+        sample_every=sample_every,
+        min_days=min_days,
+        half_life_days=half_life_days,
+        sigma_minutes=sigma_minutes,
+        gating_classes=gating_classes,
+    )
+    if full_to_rep:
+        s = equalize_within_cluster(s, full_to_rep)
+    return s
+
+
+def _compute_q_path_salience_impl(
     hist: Tuple[np.ndarray, Dict[str, int]],
     price_data: np.ndarray,
     blocks_ahead: int,
@@ -533,7 +630,7 @@ def compute_q_path_salience(
             )
             if agg is None:
                 clf = LogisticRegression(
-                    penalty="l1",
+                    penalty="l2",
                     C=0.5,
                     class_weight="balanced",
                     solver="liblinear",
