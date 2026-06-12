@@ -12,6 +12,64 @@ logger = logging.getLogger(__name__)
 
 __all__ = ("compute_hitfirst_salience",)
 
+# Leave-one-block-out replicates for the L2 importance fits.  The single
+# fit over ~340 collinear miner columns sits in a flat loss subspace whose
+# minimum moves O(1) in normalised L1 under small row perturbations (the
+# per-validator datalog skew).  Averaging |coef| across n deterministic
+# leave-block-out replicates estimates a smooth functional of the data
+# distribution instead of one arbitrary point in the flat subspace.
+# Deterministic (no RNG): block boundaries are proportional to T, so two
+# validators with slightly different row counts produce nearly identical
+# replicate sets.  Set to 0 or 1 to recover the single-fit behaviour.
+HITFIRST_LBO_BLOCKS: int = 4
+
+
+def _lbo_l2_importance(
+    X: np.ndarray,
+    y: np.ndarray,
+    *,
+    n_blocks: int = HITFIRST_LBO_BLOCKS,
+    seed: int = 42,
+) -> np.ndarray | None:
+    """Leave-one-block-out aggregated |coef| of an L2 logistic fit.
+
+    Fits ``n_blocks`` replicates, each excluding one contiguous timeline
+    block (preserving autocorrelation structure within the kept rows),
+    and returns the mean absolute coefficient vector.  Falls back to a
+    single full fit when ``n_blocks <= 1`` or replicates degenerate.
+    """
+
+    def _fit(Xf: np.ndarray, yf: np.ndarray) -> np.ndarray | None:
+        if len(np.unique(yf)) < 2:
+            return None
+        clf = LogisticRegression(
+            penalty="l2",
+            C=1.0,
+            solver="lbfgs",
+            class_weight="balanced",
+            max_iter=500,
+            tol=1e-4,
+            random_state=seed,
+        )
+        clf.fit(Xf, yf)
+        return np.abs(np.asarray(clf.coef_, dtype=float).ravel())
+
+    T = int(X.shape[0])
+    if int(n_blocks) <= 1 or T < 2 * int(n_blocks):
+        return _fit(X, y)
+
+    bounds = np.linspace(0, T, int(n_blocks) + 1).astype(int)
+    reps: list[np.ndarray] = []
+    for b in range(int(n_blocks)):
+        keep = np.ones(T, dtype=bool)
+        keep[bounds[b]:bounds[b + 1]] = False
+        coef = _fit(X[keep], y[keep])
+        if coef is not None:
+            reps.append(coef)
+    if not reps:
+        return _fit(X, y)
+    return np.mean(np.stack(reps, axis=0), axis=0)
+
 
 def compute_hitfirst_salience(
     hist: Tuple[np.ndarray, Dict[str, int]],
@@ -100,32 +158,14 @@ def compute_hitfirst_salience(
     importance = np.zeros(H, dtype=float)
 
     if np.unique(y_up).size == 2 and up_scores.shape[0] > 0:
-        clf_up = LogisticRegression(
-            penalty="l2",
-            C=1.0,
-            solver="lbfgs",
-            class_weight="balanced",
-            max_iter=500,
-            tol=1e-4,
-            random_state=42,
-        )
-        clf_up.fit(up_scores, y_up)
-        coef_up = np.asarray(clf_up.coef_, dtype=float).ravel()
-        importance += np.abs(coef_up)
+        coef_up = _lbo_l2_importance(up_scores, y_up)
+        if coef_up is not None:
+            importance += coef_up
 
     if np.unique(y_dn).size == 2 and dn_scores.shape[0] > 0:
-        clf_dn = LogisticRegression(
-            penalty="l2",
-            C=1.0,
-            solver="lbfgs",
-            class_weight="balanced",
-            max_iter=500,
-            tol=1e-4,
-            random_state=42,
-        )
-        clf_dn.fit(dn_scores, y_dn)
-        coef_dn = np.asarray(clf_dn.coef_, dtype=float).ravel()
-        importance += np.abs(coef_dn)
+        coef_dn = _lbo_l2_importance(dn_scores, y_dn)
+        if coef_dn is not None:
+            importance += coef_dn
 
     total = float(np.sum(importance))
     if total <= 0.0:
