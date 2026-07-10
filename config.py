@@ -192,9 +192,10 @@ CHALLENGES.append(FUNDING_XSEC_CHALLENGE)
 
 TRADE_MIX_ASSETS = ["BTC", "ETH", "TAO", "SOL"]
 
-# Sized so TRADEMIX = 15% of total emissions weight.
-# Recompute as: 0.15 * sum(other weights) / 0.85
-_TRADE_MIX_TARGET_FRACTION = 0.15
+# v2 IM starts at a 10% emissions share and is ratcheted toward 15% as the
+# pool of statistically gated miners grows (see TRADE_MIX_V2_IM_DESIGN.md).
+# Recompute as: f * sum(other weights) / (1 - f)
+_TRADE_MIX_TARGET_FRACTION = 0.10
 _TRADE_MIX_WEIGHT = (
     _TRADE_MIX_TARGET_FRACTION * sum(c["weight"] for c in CHALLENGES) /
     (1.0 - _TRADE_MIX_TARGET_FRACTION)
@@ -208,16 +209,19 @@ TRADE_MIX_CHALLENGE = {
     "blocks_ahead": 300,
     "loss_func": "trade_mix",
     "weight": _TRADE_MIX_WEIGHT,
-    "luck_filter": "shrunk_sharpe",
-    "meta_model": "skillw",
-    "min_skill_prob": 0.65,
-    "horizon_bars": 60,
-    "rebal_period": 60,
-    "fee_bps": 20.0,
-    "loo_folds": 5,
-    "max_oos_window_bars": 43200,
-    "min_history_window_bars": 43200,
+    # --- v2 incentive mechanism (all horizons/windows in hours on the
+    # hourly evaluation grid; see TRADE_MIX_V2_IM_DESIGN.md)
+    "horizons_hours": [12, 24, 48],
+    "blend_weights": [0.25, 0.50, 0.25],
+    "beta_horizon_hours": 24,
+    "channel_split_rv": 0.75,       # RV channel share; beta channel gets the rest
+    "fdr_q": 0.05,
+    "probation_hours": 504,         # 21 days
+    "probation_coverage": 0.9,
+    "seniority_cosine": 0.20,
     "dedup_cosine_threshold": 0.95,
+    "fee_bps": 10.0,                # per side, used in costed attribution
+    "miner_cap": 0.20,              # max share of a channel pool per miner
 }
 
 CHALLENGES.append(TRADE_MIX_CHALLENGE)
@@ -226,7 +230,10 @@ CHALLENGE_MAP = {c["ticker"]: c for c in CHALLENGES}
 CHALLENGE_NAME_TO_TICKER = {c["name"]: c["ticker"] for c in CHALLENGES}
 ASSET_EMBEDDING_DIMS = {c["ticker"]: c["dim"] for c in CHALLENGES}
 
-BURN_PCT = 0.45
+# Lowered from 0.45 alongside the TRADE-MIX v2 launch: the v2 mechanism
+# burns the unearned share of its 10% pool, so the effective total burn
+# stays roughly where it was.
+BURN_PCT = 0.35
 
 MAX_DAYS = 60
 
