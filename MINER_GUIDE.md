@@ -250,16 +250,18 @@ Per-challenge salience is normalized to sum to 1, then weighted:
 
 | Challenge | Weight | Share of total |
 |---|---|---|
-| MULTI-BREAKOUT | 5.0 | ~16% |
-| TRADE-MIX | 4.566 | 15% |
-| FUNDING-XSEC | 4.0 | ~13% |
+| MULTI-BREAKOUT | 5.0 | ~18% |
+| FUNDING-XSEC | 4.0 | ~14% |
 | ETHLBFGS | 3.5 | ~12% |
-| XSEC-RANK | 3.0 | ~10% |
-| BTCLBFGS | 2.875 | ~9% |
-| ETHHITFIRST | 2.5 | ~8% |
-| Binary (5x) | 1.0 each | ~16% total |
+| XSEC-RANK | 3.0 | ~11% |
+| BTCLBFGS | 2.875 | ~10% |
+| ETHHITFIRST | 2.5 | ~9% |
+| TRADE-MIX | 2.625 | 10% (ratchets toward 15%) |
+| Binary (5x) | 1.0 each | ~18% total |
 
-> **TRADE-MIX warm-up**: emits zero salience until the validator has accumulated at least 30 days of price history (≈ 43,200 sample indices at 1-minute sampling).  Your TRADE-MIX submission is collected from day 1 but only contributes to weight after the warm-up window.
+> **TRADE-MIX v2 emissions**: the challenge starts at a 10% emissions share and is ratcheted toward 15% as the pool of statistically proven (gated) miners grows. Within the challenge, any pool share not earned by gated miners is **burned** (routed to UID 0), not redistributed to noise.
+>
+> **TRADE-MIX probation**: new hotkeys must accumulate 21 days of ≥90% submission coverage before they are considered for payment. Evidence accrues from your first submission and is **never reset** — skill compounds across the full history of your submissions.
 
 ### Scoring by challenge type
 
@@ -273,7 +275,7 @@ Not all challenges use the same scoring structure. Summary:
 | MULTI-BREAKOUT | AUC gate → L2 logreg on z-scored predictions, episode-balanced weighting | $\|\beta_j\|$ |
 | XSEC-RANK | Walk-forward L2 meta-model, AUC-scaled coefficients, recency-weighted segments | $\|\beta_j\| \cdot \text{AUC\_scale}$ |
 | FUNDING-XSEC | Same as XSEC-RANK + stale filter ($\text{std} < 10^{-4}$) + extended embargo | $\|\beta_j\| \cdot \text{AUC\_scale}$ |
-| TRADE-MIX | Bayesian Sharpe luck filter → cosine-similarity dedup → skill-weighted meta-model → walk-forward leave-one-out OOS P&L | drop in OOS desk P&L when the cluster is removed |
+| TRADE-MIX (v2) | Positions decomposed into market-timing + relative-value channels → per-channel evidence vs a circular block-shift null at 12h/24h/48h → Benjamini–Hochberg FDR gate → seniority residualization of near-duplicate books → convex payment on trailing costed attribution | studentized cross-moment $t$ vs shift null; unearned pool burned |
 
 For challenges with walk-forward segments, recency weighting applies: $w_i = \gamma^{n - 1 - i}$ where $\gamma = 0.5^{1/\text{HALFLIFE}}$.
 
