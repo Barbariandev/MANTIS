@@ -28,6 +28,7 @@ import pickle
 
 from cycle import get_miner_payloads
 from model import multi_salience as sal_fn
+from trade_mix import BURN_KEY as TRADE_MIX_BURN_KEY
 from ledger import DataLog, ensure_datalog
 
 LOG_DIR = os.path.join(os.getcwd(), "logs")
@@ -341,8 +342,15 @@ async def run_main_loop(
                             weights_logger.info("Salience computation returned empty.")
 
                         hk2uid = {hk: uid for uid, hk in zip(metagraph.uids.tolist(), metagraph.hotkeys)}
-                        general_sal = {hk2uid.get(hk, -1): s for hk, s in general_sal_hk.items() if hk in hk2uid}
-                        sal = {uid: score for uid, score in general_sal.items() if uid != -1}
+                        # The unearned TRADE-MIX pool is emitted under the
+                        # "__burn__" pseudo-hotkey and routed to UID 0 on top
+                        # of the global BURN_PCT.
+                        hk2uid[TRADE_MIX_BURN_KEY] = 0
+                        sal = {}
+                        for hk, s in general_sal_hk.items():
+                            uid = hk2uid.get(hk)
+                            if uid is not None:
+                                sal[uid] = sal.get(uid, 0.0) + s
 
                         if not sal:
                             weights_logger.warning("Salience is empty. Cannot calculate weights - insufficient training data.")
