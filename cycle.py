@@ -26,6 +26,8 @@ from __future__ import annotations
 import asyncio, bittensor as bt, requests, config, comms, logging, os
 from urllib.parse import urlparse
 
+import bt_compat
+
 logger = logging.getLogger(__name__)
 
 NETWORK = "finney"
@@ -37,7 +39,7 @@ MAX_PAYLOAD_BYTES = 25 * 1024 * 1024
 def _get_subtensor():
     global _sub
     if _sub is None:
-        _sub = bt.Subtensor(network=NETWORK)
+        _sub = bt_compat.Subtensor(network=NETWORK)
     return _sub
 
 
@@ -56,10 +58,10 @@ def _is_valid_r2_url(url: str) -> bool:
         return False
 
 async def get_miner_payloads(
-    netuid: int = 123, mg: bt.Metagraph = None
+    netuid: int = 123, mg: "bt_compat.Metagraph" = None
 ) -> dict[str, dict]:
     if mg is None:
-        mg = bt.Metagraph(netuid=netuid, network=NETWORK, sync=True)
+        mg = bt_compat.Metagraph(netuid=netuid, network=NETWORK, sync=True)
     
     for attempt in range(2):
         s = _get_subtensor()
