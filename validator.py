@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 import numpy as np
 import pickle
 
+import bt_compat
 from cycle import get_miner_payloads
 from model import multi_salience as sal_fn
 from trade_mix import BURN_KEY as TRADE_MIX_BURN_KEY
@@ -158,9 +159,9 @@ def main():
 
     while True:
         try:
-            sub = bt.Subtensor(network=args.network)
+            sub = bt_compat.Subtensor(network=args.network)
             wallet = bt.Wallet(name=getattr(args, "wallet.name"), hotkey=getattr(args, "wallet.hotkey"))
-            mg = bt.Metagraph(netuid=args.netuid, network=args.network, sync=True)
+            mg = bt_compat.Metagraph(netuid=args.netuid, network=args.network, sync=True, subtensor=sub)
             break
         except Exception as e:
             logging.exception("Subtensor connect failed")
@@ -220,7 +221,7 @@ async def save_loop(datalog: DataLog, do_save: bool, save_every_seconds: int, st
 subtensor_lock = threading.Lock()
 
 
-async def get_current_block_with_retry(sub: bt.Subtensor, lock: threading.Lock, timeout: int = 10) -> int:
+async def get_current_block_with_retry(sub: "bt_compat.Subtensor", lock: threading.Lock, timeout: int = 10) -> int:
     retry_delay = 5
     while True:
         try:
@@ -248,9 +249,9 @@ async def get_current_block_with_retry(sub: bt.Subtensor, lock: threading.Lock, 
 
 async def run_main_loop(
     args: argparse.Namespace,
-    sub: bt.Subtensor,
+    sub: "bt_compat.Subtensor",
     wallet: bt.Wallet,
-    mg: bt.Metagraph,
+    mg: "bt_compat.Metagraph",
     datalog: DataLog,
     stop_event: asyncio.Event,
 ):
