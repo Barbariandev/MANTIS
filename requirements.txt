@@ -1,4 +1,4 @@
-bittensor==10.2.0
+bittensor
 torch==2.7.1
 requests==2.32.5
 aiohttp==3.13.3
