@@ -51,16 +51,21 @@ All challenges are defined in `config.py` under `CHALLENGES`. Each specifies a `
 | Challenge | Ticker | dim | Horizon | loss_func | Weight | Description |
 |---|---|---|---|---|---|---|
 | ETH-1H-BINARY | `ETH` | 2 | 300 (1h) | `binary` | 1.0 | Binary direction prediction |
-| CADUSD-1H-BINARY | `CADUSD` | 2 | 300 | `binary` | 1.0 | " |
-| NZDUSD-1H-BINARY | `NZDUSD` | 2 | 300 | `binary` | 1.0 | " |
+| CADUSD-1H-BINARY | `CADUSD` | 2 | 300 | `binary` | 0.5 | " |
+| NZDUSD-1H-BINARY | `NZDUSD` | 2 | 300 | `binary` | 0.5 | " |
 | CHFUSD-1H-BINARY | `CHFUSD` | 2 | 300 | `binary` | 1.0 | " |
 | XAGUSD-1H-BINARY | `XAGUSD` | 2 | 300 | `binary` | 1.0 | " |
-| ETH-HITFIRST | `ETHHITFIRST` | 3 | 500 | `hitfirst` | 2.5 | Barrier-hit direction |
+| ETH-HITFIRST | `ETHHITFIRST` | 3 | 500 | `hitfirst` | 1.25 | Barrier-hit direction |
 | ETH-LBFGS | `ETHLBFGS` | 17 | 300 (1h) | `lbfgs` | 3.5 | Volatility regime + quantile paths |
 | BTC-LBFGS-6H | `BTCLBFGS` | 17 | 1800 (6h) | `lbfgs` | 2.875 | " |
 | MULTI-BREAKOUT | `MULTIBREAKOUT` | 2/asset | event | `range_breakout_multi` | 5.0 | Range breakout continuation/reversal (33 assets) |
 | XSEC-RANK | `MULTIXSEC` | 1/asset | 1200 (4h) | `xsec_rank` | 3.0 | Cross-sectional return ranking (33 assets) |
 | FUNDING-XSEC | `FUNDINGXSEC` | 1/asset | 2400 (8h) | `funding_xsec` | 4.0 | Cross-sectional funding rate ranking (20 assets) |
+| FLOW-BTC | `FLOW` | 28 | horizon-driven, 1–336h | `flow` | 0.0 (7.875 = 25% at emission turn-on, 2026-09-14) | Capital-at-risk BTC bracket trades, evidence-gated payment |
+
+TRADE-MIX is deprecated as of the FLOW launch (2026-08-17): off the
+active roster, historical challenge data purged from validator
+datalogs on open.
 
 ---
 
@@ -91,6 +96,8 @@ $$
 Segments aggregated with exponential recency weighting.
 
 **FUNDING-XSEC** (`funding_xsec`) — Same structure as XSEC-RANK but on funding rate changes instead of price returns. Embargo = $\max(\text{LAG}, \text{ahead})$ with explicit `train_cutoff = val_start - ahead` to prevent label leakage from forward-looking labels. Stale miners (temporal std < $10^{-4}$ per asset column) zeroed before pooling.
+
+**FLOW** (`flow`) — Not a regression challenge: miners submit bracket trades (direction, Kelly fraction, stop, two targets, horizon) across four horizon regimes, resolved against multi-venue klines. Per-trade R is path-penalized, tail-amplified, and Kelly-weighted into a per-regime EWMA, and payment is gated behind a significance statistic, the max of the full-history and rolling last-4-block $t$ on 168h block sums (clear $t \geq 1.25$, latch at $0.5$): cleared keys split the pool pro rata, uncleared keys split a 2% dust tier, the remainder burns. Once the collateral pool is configured, emission weight and settlement money are both priced by the posted bet, with a weekly zero-sum settlement. Full spec, math, and simulation evidence: the FLOW release paper (`FLOW_RELEASE.pdf`, published on the MANTIS site).
 
 ### Sybil resistance
 
@@ -133,7 +140,72 @@ A SHA-256 binding hash over (hotkey, round, owner_pk, ephemeral_pk) is used as A
 | `range_breakout.py` | MULTI-BREAKOUT state machine + scoring |
 | `bucket_forecast.py` | LBFGS classifier + Q-path salience |
 | `hitfirst.py` | HITFIRST barrier-hit scoring |
-| `price_service.py` | Fetches spot prices (Polygon) + funding rates (OKX/HL/CoinGlass), uploads to R2 |
+| `flow.py` | FLOW bracket-trade resolution, scoring, significance gate, payment split |
+| `flow_collateral.py` | Client for the FLOW collateral pool: hotkey-signed position open (`addCollateralSigned`, so a slot cannot be squatted), `evict`, bet posting, the `TradePosted` bet feed that prices all money and emission skin |
+| `flow_post.py` | Miner-side CLI: `fund` / `evict` / `book` / `post` / `status` / `audit` — open the slot with your hotkey, post bets for a payload vector, prove from event logs that no debit ever exceeded a bet |
+| `flow_sim/` | FLOW simulation evidence: mechanism replica, adversary studies, release figures |
+| `../flow_collateral/src/FlowCollateralPool.sol` | The on-chain pool (one contract, this copy only). Live at `0xD9c805202b16671A2901307fBC9A8750E2453427` |
+A public read-only settlement console (books, withdrawability, pools,
+settlement history — straight `eth_call`/`eth_getLogs`, no keys) is
+served on the MANTIS site; it is deployed from the site's own project
+rather than shipped here. There is deliberately no bundled submission
+UI: `generate_and_encrypt.py` and `flow_post.py` are the supported
+surface, and anything interactive you build on top runs your code
+with your credentials, not ours.
+
+The FLOW **settlement daemon is not in this repo**: it is owner
+tooling, kept and run separately by the team (it holds the owner keys,
+which must never sit in a public tree). What it does is fully
+specified below and in the release paper (§3.3), and every number it
+posts is recomputable from public data one week later.
+
+---
+
+## The owner settlement process (run separately, not in this repo)
+
+**THE MODEL: miners post their own bets, by hand, on chain — the
+owner can only resolve them.** The team runs a settlement daemon on
+two boxes (primary + staleness-gated standby). Each cycle it:
+
+1. **Ingests** every `TradePosted` / `TradeClosed` / `TradeExpired`
+   event from the live FlowCollateralPool at
+   `0xD9c805202b16671A2901307fBC9A8750E2453427` — that sync is how
+   bets enter it; it never opens, resizes, or extends anything.
+2. **Decrypts payloads at arrival** through the envelope's owner leg
+   (`W_owner`), so trade resolutions exist the moment they happen.
+   The public timelock (`W_time`) opens the same plaintexts to
+   everyone one week later — validators and miners never need the
+   owner key, and this validator codebase only ever decrypts the
+   public way.
+3. **Closes** each resolved bet: `closeBatch` debits
+   `max(−R, 0) × bet` (wins and flats close at 0 and free the
+   reserve). The contract bounds every debit by the bet the miner
+   posted and by the period circuit breaker (≤ ¼ of a book per real
+   week). A bet posted after its trade opened is voided both ways
+   (free-look guard, 900 s grace).
+4. **Settles** each week after a 24 h straggler lag: refunds
+   gross-over-net collections, then pays the pool to net winners pro
+   rata — zero-sum, enforced on chain, period ids strictly in order.
+
+**What miners should expect, and when:**
+
+| When | What you see |
+| --- | --- |
+| you post the bet (before the trade opens) | reserve held on chain, immutable; free collateral = balance − reserves stays withdrawable instantly |
+| trade resolves (SL / TP / horizon) | a `TradeClosed` event within minutes–hours; losses debit ≤ your bet, wins/flats release the reserve at loss 0 |
+| week end + 24 h | `Settled`: the week's loss pool pays net winners pro rata; refunds land in the same batch |
+| one week after each payload | the timelock opens: anyone can recompute every close and settle from the public panel, the tape, and the bets |
+| regime ceiling + 48 h with no close | owner outage path: the reserve self-releases; `sweepExpired` is permissionless, so no owner failure can lock your collateral |
+
+The owner cannot touch anything you did not put at risk: no bet means
+no debit and no claim, ever; free collateral is unreachable; there is no
+slash. Opening a position is hotkey-authorized (`addCollateralSigned`):
+nobody can squat a registered hotkey's slot by funding it first, and
+a hotkey-signed `evict` can only pay a flat book back to its recorded
+refund coldkey. Emission weighting uses the same basis — each trade's
+pay is priced by its posted bet (read from public `TradePosted` logs),
+so idle balance earns nothing and post-open deposits or withdrawals
+move nothing.
 
 ---
 
@@ -148,6 +220,20 @@ SQLite with WAL mode. Tables:
 - **`drand_cache`** — Cached beacon signatures
 - **`breakout_state`** — Serialized range tracker state
 
+FLOW rows live in a separate file, `flow_datalog.db`, attached to
+every connection as schema `inv` (its only table is `challenge_data`).
+It is published to the same bucket as its own, much smaller object
+(`FLOW_DATALOG_ARCHIVE_URL`); the legacy `datalog.db` keeps the old
+tickers. Shared state (blocks, raw payloads, drand cache) stays in the
+main DB because one raw payload covers every challenge.
+
+Publishing FLOW: upload the file produced by
+`DataLog.snapshot_for_publish(dest_dir)`, never the live DB file. A
+live WAL database (file + `-wal` + `-shm`) copied mid-write is a torn
+read; the snapshot method uses `VACUUM INTO` for a consistent,
+standalone copy. The main `datalog.db` keeps its existing save and
+publish flow unchanged.
+
 Training data is streamed via generator iteration, not loaded into memory.
 
 ---
@@ -161,10 +247,12 @@ Training data is streamed via generator iteration, not loaded into memory.
 | `TASK_INTERVAL` | 500 blocks | `config.py` |
 | `WEIGHT_CALC_INTERVAL` | 1000 blocks | `config.py` |
 | `WEIGHT_SET_INTERVAL` | 360 blocks | `config.py` |
-| `BURN_PCT` | 0.30 (UID 0) | `config.py` |
+| `BURN_PCT` | 0.35 (UID 0) | `config.py` |
 | `MAX_DAYS` | 60 | `config.py` |
 | `EMA alpha` | 0.15 | `validator.py` |
 | `TOP_K` (feature selection) | 20 | `funding_xsec.py`, `xsec_rank.py` |
+| `FLOW_COLLATERAL_ADDRESS` | `0xD9c805202b16671A2901307fBC9A8750E2453427` | `config.py` (Bittensor EVM, chain 964) |
+| `FLOW_COLLATERAL_PERIOD_ZERO` | 1787004000 (2026-08-17 22:00 UTC) | `config.py` / on-chain immutable |
 
 ---
 
@@ -184,6 +272,18 @@ Commit constraints:
 Declared in `pyproject.toml`. Core: `bittensor`, `torch`, `scikit-learn`, `numpy`, `requests`, `aiohttp`, `tqdm`, `boto3`.
 
 See `MINER_GUIDE.md` for submission details per challenge type.
+
+---
+
+## Updating
+
+Releases are distributed as a zip archive, not via git. To update:
+stop the validator (`pm2 stop validator`), unpack the new archive
+over the old directory (your `.env`, datalog files, and logs are
+untouched — the archive contains only code and docs), re-run
+`./install_reqs.sh` if the release notes say requirements changed,
+and restart (`pm2 restart validator`). Do not rely on git-based
+auto-updating against the GitHub remote.
 
 ---
 

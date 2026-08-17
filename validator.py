@@ -29,8 +29,9 @@ import pickle
 import bt_compat
 from cycle import get_miner_payloads
 from model import multi_salience as sal_fn
-from trade_mix import BURN_KEY as TRADE_MIX_BURN_KEY
-from ledger import DataLog, ensure_datalog
+from flow import BURN_KEY as CHALLENGE_BURN_KEY
+from ledger import (DataLog, ensure_datalog, ensure_flow_datalog,
+                    flow_db_path)
 
 LOG_DIR = os.path.join(os.getcwd(), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -159,9 +160,9 @@ def main():
 
     while True:
         try:
-            sub = bt_compat.Subtensor(network=args.network)
+            chain = ChainConnection(network=args.network)
             wallet = bt.Wallet(name=getattr(args, "wallet.name"), hotkey=getattr(args, "wallet.hotkey"))
-            mg = bt_compat.Metagraph(netuid=args.netuid, network=args.network, sync=True, subtensor=sub)
+            mg = bt_compat.Metagraph(netuid=args.netuid, network=args.network, sync=True, subtensor=chain.sub)
             break
         except Exception as e:
             logging.exception("Subtensor connect failed")
@@ -175,13 +176,16 @@ def main():
             logging.info("Downloaded datalog to local storage.")
         except Exception:
             logging.info("Remote datalog unavailable; starting with a new, empty ledger.")
+    # FLOW lives in its own, much smaller archive (same bucket);
+    # download failure is non-fatal (fresh challenge, starts empty)
+    ensure_flow_datalog(flow_db_path(DATALOG_PATH))
     logging.info(f"Loading datalog from {DATALOG_PATH}...")
     datalog = DataLog.load(DATALOG_PATH)
         
     stop_event = asyncio.Event()
 
     try:
-        asyncio.run(run_main_loop(args, sub, wallet, mg, datalog, stop_event))
+        asyncio.run(run_main_loop(args, chain, wallet, mg, datalog, stop_event))
     except KeyboardInterrupt:
         logging.info("Exit signal received. Shutting down.")
     finally:
@@ -218,12 +222,44 @@ async def save_loop(datalog: DataLog, do_save: bool, save_every_seconds: int, st
     logging.info("Save loop stopped.")
 
 
-subtensor_lock = threading.Lock()
+RECONNECT_AFTER_TIMEOUTS = 3
 
 
-async def get_current_block_with_retry(sub: "bt_compat.Subtensor", lock: threading.Lock, timeout: int = 10) -> int:
-    retry_delay = 5
+class ChainConnection:
+    """The subtensor client and its lock, replaced together on reconnect.
+
+    When the websocket dies silently (node restart, idle NAT drop), a
+    read blocks inside the dead socket forever.  asyncio.wait_for can
+    abandon that call but cannot kill its thread, so the thread keeps
+    holding the lock and every retry just queues behind it -- the loop
+    can never recover without a process restart.  A reconnect therefore
+    swaps in a fresh lock along with the fresh connection; the stuck
+    thread keeps the abandoned pair and unwinds whenever its socket
+    call finally returns.
+    """
+
+    def __init__(self, network: str):
+        self.network = network
+        self.sub = bt_compat.Subtensor(network=network)
+        self.lock = threading.Lock()
+
+    def reconnect(self) -> None:
+        old = self.sub
+        self.sub = bt_compat.Subtensor(network=self.network)
+        self.lock = threading.Lock()
+        try:
+            old._client.close()  # best effort; may unblock a stuck reader
+        except Exception:
+            pass
+
+
+async def get_current_block_with_retry(chain: "ChainConnection",
+                                       timeout: int = 10,
+                                       retry_delay: float = 5.0) -> int:
+    failures = 0
     while True:
+        sub, lock = chain.sub, chain.lock
+
         try:
             def get_block():
                 with lock:
@@ -235,27 +271,42 @@ async def get_current_block_with_retry(sub: "bt_compat.Subtensor", lock: threadi
             )
             return current_block
         except asyncio.TimeoutError:
+            failures += 1
             logging.warning(
                 f"Getting current block timed out after {timeout}s. "
                 f"Retrying in {retry_delay}s..."
             )
         except Exception as e:
+            failures += 1
             logging.error(
                 f"An unexpected error occurred while getting current block: {e}. "
                 f"Retrying in {retry_delay}s..."
             )
+        if failures % RECONNECT_AFTER_TIMEOUTS == 0:
+            logging.warning(
+                "%d consecutive failures reading the chain: connection "
+                "presumed stale, rebuilding the websocket (and its lock).",
+                failures,
+            )
+            try:
+                await asyncio.to_thread(chain.reconnect)
+                logging.info("Chain connection rebuilt.")
+            except Exception:
+                logging.exception(
+                    "Reconnect failed; will retry with the old connection."
+                )
         await asyncio.sleep(retry_delay)
 
 
 async def run_main_loop(
     args: argparse.Namespace,
-    sub: "bt_compat.Subtensor",
+    chain: "ChainConnection",
     wallet: bt.Wallet,
     mg: "bt_compat.Metagraph",
     datalog: DataLog,
     stop_event: asyncio.Event,
 ):
-    last_block = await get_current_block_with_retry(sub, subtensor_lock)
+    last_block = await get_current_block_with_retry(chain)
     weight_thread: threading.Thread | None = None
 
     tasks = [
@@ -266,7 +317,7 @@ async def run_main_loop(
     async with aiohttp.ClientSession() as session:
         while not stop_event.is_set():
             try:
-                current_block = await get_current_block_with_retry(sub, subtensor_lock)
+                current_block = await get_current_block_with_retry(chain)
                 
                 if current_block == last_block:
                     await asyncio.sleep(1)
@@ -278,7 +329,8 @@ async def run_main_loop(
                 logging.info(f"Sampled block {current_block}")
 
                 if current_block % 100 == 0:
-                    with subtensor_lock:
+                    sub, lock = chain.sub, chain.lock
+                    with lock:
                         mg.sync(subtensor=sub)
                     logging.info("Metagraph synced.")
 
@@ -343,10 +395,10 @@ async def run_main_loop(
                             weights_logger.info("Salience computation returned empty.")
 
                         hk2uid = {hk: uid for uid, hk in zip(metagraph.uids.tolist(), metagraph.hotkeys)}
-                        # The unearned TRADE-MIX pool is emitted under the
-                        # "__burn__" pseudo-hotkey and routed to UID 0 on top
-                        # of the global BURN_PCT.
-                        hk2uid[TRADE_MIX_BURN_KEY] = 0
+                        # The unearned FLOW pool (uncleared keys' share)
+                        # is emitted under the "__burn__" pseudo-hotkey and
+                        # routed to UID 0 on top of the global BURN_PCT.
+                        hk2uid[CHALLENGE_BURN_KEY] = 0
                         sal = {}
                         for hk, s in general_sal_hk.items():
                             uid = hk2uid.get(hk)
@@ -502,7 +554,7 @@ async def run_main_loop(
                             if list(saved_uids) != mg.uids.tolist():
                                 weights_logger.warning("UID mismatch between saved weights and current metagraph, skipping.")
                             else:
-                                sub.set_weights(
+                                chain.sub.set_weights(
                                     netuid=args.netuid,
                                     wallet=wallet,
                                     uids=mg.uids,

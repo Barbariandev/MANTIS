@@ -43,6 +43,12 @@ SAMPLE_EVERY = config.SAMPLE_EVERY
 
 DRAND_SIGNATURE_RETRIES = 3
 DRAND_SIGNATURE_RETRY_DELAY = 1.0
+# A matured payload whose drand round cannot be fetched is RETAINED and
+# retried on later passes rather than consumed as zeros: a transient
+# beacon/network outage must not destroy submissions.  The grace window
+# bounds the retry so a payload carrying a garbage round number cannot
+# pin raw_payloads forever (one extra week past maturity, in blocks).
+DRAND_RETAIN_GRACE_BLOCKS = 50_400
 
 # Storage dim for MULTIBREAKOUT: 2 floats per asset, flattened across all BREAKOUT_ASSETS.
 # config.MULTI_BREAKOUT_CHALLENGE["dim"] stays 2 (the per-asset dimension) but storage
@@ -102,11 +108,22 @@ def _ensure_price_data_col(conn):
         conn.commit()
 
 
-def _pack_embeddings(emb: Dict[str, np.ndarray]) -> bytes:
+def _emb_dtype(ticker: str):
+    # FLOW carries an integer trade_id and horizons up to 336 in its
+    # embedding; float16 represents integers exactly only to 2048, so
+    # ids above that collide (2049->2048) or overflow.  FLOW is stored
+    # float32 (exact integers to 2**24); every other challenge, whose
+    # values live in [-1,1], stays float16.
+    return np.float32 if ticker == "FLOW" else np.float16
+
+
+def _pack_embeddings(emb: Dict[str, np.ndarray],
+                     dtype=np.float16) -> bytes:
     if not emb:
         return b""
     hk_list = sorted(emb.keys())
-    vecs = np.array([np.asarray(emb[hk], dtype=np.float16) for hk in hk_list], dtype=np.float16)
+    vecs = np.array([np.asarray(emb[hk], dtype=dtype) for hk in hk_list],
+                    dtype=dtype)
     return json.dumps(hk_list).encode() + b"\x00" + vecs.tobytes()
 
 
@@ -117,10 +134,34 @@ def _unpack_embeddings(blob: bytes, dim: int) -> Dict[str, np.ndarray]:
     hk_list = json.loads(blob[:sep].decode())
     raw = blob[sep + 1:]
     n = len(hk_list)
-    if n == 0 or len(raw) != n * dim * 2:
+    if n == 0 or dim == 0:
         return {}
-    vecs = np.frombuffer(raw, dtype=np.float16).reshape(n, dim)
+    # self-describing by byte length: float16 (2B/val) or float32 (4B),
+    # so the stored width need not be threaded through every reader
+    if len(raw) == n * dim * 2:
+        dtype = np.float16
+    elif len(raw) == n * dim * 4:
+        dtype = np.float32
+    else:
+        return {}
+    vecs = np.frombuffer(raw, dtype=dtype).reshape(n, dim)
     return {hk: vecs[i].copy() for i, hk in enumerate(hk_list)}
+
+
+def _sqlite_ok(path: str) -> bool:
+    """True iff the file opens as SQLite and passes a quick integrity
+    check.  Used for publish snapshots only; downloads are deliberately
+    NOT gated on this (the live prod archive carries known transient
+    corruption in the payloads region that quick_check would flag)."""
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            row = conn.execute("PRAGMA quick_check").fetchone()
+            return bool(row) and row[0] == "ok"
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
 
 
 def ensure_datalog(path: str) -> str:
@@ -138,6 +179,103 @@ def ensure_datalog(path: str) -> str:
         os.replace(tmp, path)
         return path
     raise SystemExit(f"Failed to download datalog from {url}")
+
+
+# --------------------------------------------------------------------------
+# FLOW storage split.  FLOW challenge_data lives in its own SQLite
+# file next to the main datalog, published to the same bucket as a much
+# smaller object (the legacy datalog has grown too large to keep
+# re-shipping for one challenge).  The file is ATTACHed to every
+# connection as schema `inv`, so all existing SQL keeps working with the
+# table name routed through _cd_table().  Shared state (blocks,
+# raw_payloads, drand_cache) stays in the main DB: a raw payload is one
+# blob covering every challenge, so it cannot be split per ticker.
+
+_FLOW_DB_TICKERS = frozenset({"FLOW"})
+_FLOW_DB_FILENAME = "flow_datalog.db"
+
+_FLOW_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS challenge_data (
+    ticker TEXT NOT NULL,
+    sidx INTEGER NOT NULL,
+    price REAL,
+    price_data TEXT,
+    hotkeys TEXT,
+    embeddings BLOB,
+    PRIMARY KEY (ticker, sidx)
+);
+"""
+
+
+def _cd_table(ticker: str) -> str:
+    """challenge_data table for a ticker: the attached FLOW DB or main."""
+    return ("inv.challenge_data" if ticker in _FLOW_DB_TICKERS
+            else "challenge_data")
+
+
+def flow_db_path(db_path: str) -> str:
+    """The FLOW DB sits next to the main datalog file."""
+    return os.path.join(os.path.dirname(db_path) or ".", _FLOW_DB_FILENAME)
+
+
+def ensure_flow_datalog(path: str) -> str:
+    """Download the FLOW archive if the local file is missing.
+
+    Non-fatal on failure: the challenge is young and a fresh, empty
+    local file is a valid starting point (unlike the main datalog,
+    where history is load-bearing for the other tickers).
+    """
+    if os.path.exists(path):
+        return path
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    url = getattr(config, "FLOW_DATALOG_ARCHIVE_URL", "")
+    if url:
+        try:
+            r = requests.get(url, timeout=1500, stream=True)
+            if r.status_code == 200:
+                tmp = path + ".tmp"
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                os.replace(tmp, path)
+                return path
+            logger.warning("FLOW datalog download failed (HTTP %s); "
+                           "starting empty", r.status_code)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("FLOW datalog download failed (%s); "
+                           "starting empty", e)
+    return path
+
+
+def _attach_flow(conn, db_path: str) -> str:
+    """Create the FLOW DB if needed and ATTACH it as `inv`.
+
+    A corrupt side file is quarantined (renamed aside) and replaced
+    with a fresh, empty one instead of crashing the validator: the
+    FLOW DB is young and re-downloadable, unlike the main datalog
+    where history is load-bearing and corruption must fail loudly."""
+    inv_path = flow_db_path(db_path)
+
+    def _prepare() -> None:
+        side = sqlite3.connect(inv_path)
+        try:
+            side.execute("PRAGMA journal_mode=WAL")
+            side.executescript(_FLOW_SCHEMA_SQL)
+            side.commit()
+        finally:
+            side.close()
+
+    try:
+        _prepare()
+    except sqlite3.DatabaseError:
+        quarantine = f"{inv_path}.corrupt-{int(time.time())}"
+        os.replace(inv_path, quarantine)
+        logger.warning("FLOW datalog corrupt; quarantined to %s and "
+                       "recreated empty", quarantine)
+        _prepare()
+    conn.execute("ATTACH DATABASE ? AS inv", (inv_path,))
+    return inv_path
 
 
 def _sha256(*parts: bytes) -> bytes:
@@ -164,13 +302,7 @@ def _derive_pke(ske_raw: bytes) -> bytes:
 
 
 def _convert_tlock_ct(ct_bytes: bytes) -> bytes:
-    """Convert old ark-serialize 0.4.x TLECiphertext format (372 bytes) to 0.5.x (356 bytes).
-
-    In ark-serialize 0.4, the IBECiphertext's [u8; 32] fields (v, w) were
-    serialized with u64 length prefixes. In 0.5, fixed-size arrays are
-    written directly without length prefixes. This strips the two 8-byte
-    prefixes so the current timelock_wasm_wrapper can deserialize them.
-    """
+    """372-byte ark-serialize 0.4 TLECiphertext -> 356-byte 0.5 form."""
     import struct
     if len(ct_bytes) != 372:
         return ct_bytes
@@ -183,6 +315,44 @@ def _convert_tlock_ct(ct_bytes: bytes) -> bytes:
     w = ct_bytes[144:176]
     rest = ct_bytes[176:]
     return u + v + w + rest
+
+
+def _expand_tlock_ct(ct_bytes: bytes) -> bytes:
+    """356-byte ark-serialize 0.5 TLECiphertext -> 372-byte 0.4 form."""
+    import struct
+    if len(ct_bytes) != 356:
+        return ct_bytes
+    u = ct_bytes[0:96]
+    v = ct_bytes[96:128]
+    w = ct_bytes[128:160]
+    rest = ct_bytes[160:]
+    return u + struct.pack('<Q', 32) + v + struct.pack('<Q', 32) + w + rest
+
+
+def _tld_skeK(tlock: Timelock, ct_bytes: bytes, sig: bytes):
+    """Unlock W_time against whichever wasm this process loaded.
+
+    Later timelock wants the 356-byte form and *panics* (not a Python
+    exception) on a raw 372-byte blob.  Older wasm wants the 372-byte
+    form and raises on 356.  Always try 356 first so a new wasm never
+    sees the 372; fall back to 372 (native or expanded) so an old
+    install can still unlock live 356-byte miner payloads.
+    """
+    form_356 = _convert_tlock_ct(ct_bytes)
+    form_372 = _expand_tlock_ct(ct_bytes)
+    last = None
+    seen: set[bytes] = set()
+    for ct in (form_356, form_372):
+        if ct in seen:
+            continue
+        seen.add(ct)
+        try:
+            return tlock.tld(ct, sig)
+        except Exception as e:
+            last = e
+    if last is not None:
+        raise last
+    return None
 
 
 def _decrypt_v2_payload(payload: dict, sig: bytes | None, tlock: Timelock) -> bytes | None:
@@ -200,8 +370,8 @@ def _decrypt_v2_payload(payload: dict, sig: bytes | None, tlock: Timelock) -> by
         binding = _binding(payload["hk"], int(payload["round"]), owner_pk, pke)
         if binding != bytes.fromhex(payload["binding"]):
             return None
-        ct_bytes = _convert_tlock_ct(bytes.fromhex(payload["W_time"]["ct"]))
-        skeK_raw = tlock.tld(ct_bytes, sig)
+        skeK_raw = _tld_skeK(
+            tlock, bytes.fromhex(payload["W_time"]["ct"]), sig)
         if isinstance(skeK_raw, str):
             try:
                 skeK = bytes.fromhex(skeK_raw)
@@ -259,12 +429,44 @@ class DataLog:
         self._conn.executescript(_SCHEMA_SQL)
 
         _ensure_price_data_col(self._conn)
+        self._flow_db_path = _attach_flow(self._conn, db_path)
+
+        # one-time migration: any FLOW rows written to the main DB
+        # before the storage split move to the attached DB (idempotent)
+        n_stray = self._conn.execute(
+            "SELECT COUNT(*) FROM challenge_data WHERE ticker='FLOW'"
+        ).fetchone()[0]
+        if n_stray:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO inv.challenge_data "
+                "(ticker, sidx, price, price_data, hotkeys, embeddings) "
+                "SELECT ticker, sidx, price, price_data, hotkeys, embeddings "
+                "FROM challenge_data WHERE ticker='FLOW'")
+            self._conn.execute(
+                "DELETE FROM challenge_data WHERE ticker='FLOW'")
+            self._conn.commit()
+            logger.info("Migrated %d FLOW rows to %s (storage split)",
+                        n_stray, self._flow_db_path)
 
         for spec in config.CHALLENGES:
             self._conn.execute(
                 "INSERT OR REPLACE INTO challenge_meta (ticker, dim, blocks_ahead) VALUES (?, ?, ?)",
                 (spec["ticker"], spec["dim"], spec.get("blocks_ahead", 0)),
             )
+
+        # TRADE-MIX deprecation (FLOW launch, 2026-08-10): the challenge
+        # is off the roster and its historical data is scrapped, not
+        # archived.  Runs on every open; a no-op once purged.
+        for _dep in ("TRADEMIX",):
+            n_purged = self._conn.execute(
+                "DELETE FROM challenge_data WHERE ticker=?", (_dep,)
+            ).rowcount
+            self._conn.execute(
+                "DELETE FROM challenge_meta WHERE ticker=?", (_dep,)
+            )
+            if n_purged:
+                logger.info("Purged %d %s rows (challenge deprecated)",
+                            n_purged, _dep)
         self._conn.commit()
 
         self.tlock = Timelock(config.DRAND_PUBLIC_KEY)
@@ -356,16 +558,36 @@ class DataLog:
                             (ticker, sidx, json.dumps(pd_map)),
                         )
                     continue
-                if ticker == "TRADEMIX":
+                if ticker in ("TRADEMIX", "FLOW"):
+                    # Prices are recorded at BLOCK ARRIVAL, before payloads
+                    # decrypt.  For FLOW this is what fixes the entry
+                    # price E: miners commit brackets as fractions under
+                    # timelock, and E is the validator's own price at the
+                    # submission row — never a miner-reported value.
                     tm_assets = spec.get("assets") or []
                     pd_map = {}
                     for a in tm_assets:
                         pv = prices.get(a)
                         if isinstance(pv, (int, float)) and pv > 0:
                             pd_map[a] = float(pv)
+                            if ticker != "FLOW":
+                                continue
+                            # Wick channels for spec-1.3 resolution: the
+                            # price service may publish per-asset 1-minute
+                            # consensus wicks ("BTC_HIGH" = min of venue
+                            # highs, "BTC_LOW" = max of venue lows).  Stored
+                            # when present and sane; a row without them
+                            # resolves close-only (release section 6.14).
+                            hi = prices.get(f"{a}_HIGH")
+                            lo = prices.get(f"{a}_LOW")
+                            if (isinstance(hi, (int, float))
+                                    and isinstance(lo, (int, float))
+                                    and 0 < float(lo) <= float(hi)):
+                                pd_map[f"{a}_HIGH"] = float(hi)
+                                pd_map[f"{a}_LOW"] = float(lo)
                     if pd_map:
                         c.execute(
-                            "INSERT INTO challenge_data (ticker, sidx, price_data, hotkeys, embeddings) "
+                            f"INSERT INTO {_cd_table(ticker)} (ticker, sidx, price_data, hotkeys, embeddings) "
                             "VALUES (?, ?, ?, '[]', X'') "
                             "ON CONFLICT(ticker, sidx) DO UPDATE SET price_data=excluded.price_data",
                             (ticker, sidx, json.dumps(pd_map)),
@@ -562,6 +784,20 @@ class DataLog:
             out = np.concatenate([p, q]).astype(float)
             return out.tolist()
 
+        def _sanitize_flow_vec(vec: List[float]) -> List[float]:
+            # FLOW fields per regime are [d, f, sl, tp1, tp2, h, trade_id]:
+            # horizons (up to 336) and the integer trade_id legitimately
+            # exceed 1, so the generic [-1,1] gate must not apply here.
+            # Keep finite values verbatim (decode_trades in flow.py does
+            # the real per-field validation); nan/inf collapse to 0.
+            out: List[float] = []
+            for v in vec:
+                if isinstance(v, (int, float)) and np.isfinite(v):
+                    out.append(float(v))
+                else:
+                    out.append(0.0)
+            return out
+
         def _flatten_multibreakout_dict(d: dict) -> List[float]:
             flat: List[float] = []
             for asset in config.BREAKOUT_ASSETS:
@@ -630,6 +866,8 @@ class DataLog:
                 if isinstance(vec, list) and len(vec) == dim:
                     if spec and spec.get("loss_func") == "lbfgs":
                         out[ticker] = _sanitize_lbfgs_vec(vec) if dim == 17 else [0.0] * dim
+                    elif spec and spec.get("loss_func") == "flow":
+                        out[ticker] = _sanitize_flow_vec(vec)
                     else:
                         ok = all(isinstance(v, (int, float)) and -1 <= v <= 1 for v in vec)
                         out[ticker] = [float(v) for v in vec] if ok else [0.0] * dim
@@ -663,6 +901,8 @@ class DataLog:
                 spec = config.CHALLENGE_MAP.get(ticker)
                 if spec and spec.get("loss_func") == "lbfgs" and dim == 17:
                     out[ticker] = _sanitize_lbfgs_vec(vec)
+                elif spec and spec.get("loss_func") == "flow":
+                    out[ticker] = _sanitize_flow_vec(vec)
                 else:
                     if not all(isinstance(v, (int, float)) and -1 <= v <= 1 for v in vec):
                         continue
@@ -683,8 +923,8 @@ class DataLog:
                 "SELECT rp.ts, rp.hotkey, rp.payload, b.block "
                 "FROM raw_payloads rp "
                 "JOIN blocks b ON rp.ts = b.idx "
-                "WHERE ? - b.block >= 300",
-                (current_block,),
+                "WHERE ? - b.block >= ?",
+                (current_block, int(config.PAYLOAD_MATURITY_BLOCKS)),
             ).fetchall()
 
         if not mature_rows:
@@ -722,6 +962,8 @@ class DataLog:
             return
 
         dec = {}
+        retained: set = set()
+        retain_before = int(config.PAYLOAD_MATURITY_BLOCKS) + DRAND_RETAIN_GRACE_BLOCKS
 
         async def _work(rnd, items, sess: aiohttp.ClientSession):
             sig = None
@@ -741,6 +983,12 @@ class DataLog:
             for ts, hk, data, version in items:
                 vecs = self._zero_vecs()
                 if not sig:
+                    # valid round, transient fetch failure: keep the
+                    # payload pending and retry next pass (within grace)
+                    age = current_block - ts_to_block.get(ts, current_block)
+                    if rnd > 0 and age < retain_before:
+                        retained.add((ts, hk))
+                        continue
                     dec.setdefault(ts, {})[hk] = vecs
                     continue
                 if version == 2:
@@ -767,6 +1015,14 @@ class DataLog:
                 await asyncio.gather(*(_work(r, items, sess) for r, items in batch))
                 await asyncio.sleep(0.1)
 
+        if retained:
+            mature -= retained
+            logger.warning(
+                "Retained %d matured payloads pending drand signatures "
+                "(will retry next pass)", len(retained))
+        if not mature:
+            return
+
         emb_updates: Dict[tuple, Dict[str, np.ndarray]] = defaultdict(dict)
         for ts, by_hk in dec.items():
             block = ts_to_block.get(ts)
@@ -776,14 +1032,15 @@ class DataLog:
             for hk, vecs in by_hk.items():
                 for ticker, vec in vecs.items():
                     if any(v != 0.0 for v in vec):
-                        emb_updates[(ticker, sidx)][hk] = np.array(vec, dtype=np.float16)
+                        emb_updates[(ticker, sidx)][hk] = np.array(
+                            vec, dtype=_emb_dtype(ticker))
 
         async with self._lock:
             c = self._conn.cursor()
             for (ticker, sidx), new_embs in emb_updates.items():
                 dim = _get_storage_dim(ticker)
                 row = c.execute(
-                    "SELECT hotkeys, embeddings FROM challenge_data WHERE ticker=? AND sidx=?",
+                    f"SELECT hotkeys, embeddings FROM {_cd_table(ticker)} WHERE ticker=? AND sidx=?",
                     (ticker, sidx),
                 ).fetchone()
                 if row:
@@ -799,9 +1056,9 @@ class DataLog:
                         existing_hks.append(hk)
 
                 hks_json = json.dumps(existing_hks)
-                emb_blob = _pack_embeddings(existing_emb)
+                emb_blob = _pack_embeddings(existing_emb, _emb_dtype(ticker))
                 c.execute(
-                    "INSERT INTO challenge_data (ticker, sidx, price, hotkeys, embeddings) "
+                    f"INSERT INTO {_cd_table(ticker)} (ticker, sidx, price, hotkeys, embeddings) "
                     "VALUES (?, ?, NULL, ?, ?) "
                     "ON CONFLICT(ticker, sidx) DO UPDATE SET hotkeys=excluded.hotkeys, embeddings=excluded.embeddings",
                     (ticker, sidx, hks_json, emb_blob),
@@ -847,11 +1104,37 @@ class DataLog:
         async with self._lock:
             self._flush_breakout_state()
             self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            self._conn.execute("PRAGMA inv.wal_checkpoint(PASSIVE)")
         elapsed = time.monotonic() - t0
         logger.info(
             "Full save: breakout state (%d trackers) + WAL checkpoint [%.1fs]",
             len(self._breakout_trackers), elapsed,
         )
+
+    async def snapshot_for_publish(self, dest_dir: str) -> Dict[str, str]:
+        """Write a consistent, point-in-time copy of the FLOW DB.
+
+        Copying a live WAL database (file + -wal + -shm) is a torn read:
+        the copy can be internally inconsistent.  `VACUUM INTO` runs a
+        single read transaction, so the snapshot is a valid standalone
+        database regardless of concurrent writes.  Upload THIS file to
+        the bucket, never the live one.  Returns {object_name: path}.
+
+        FLOW only: the main datalog keeps its existing save/publish
+        flow untouched.
+        """
+        os.makedirs(dest_dir, exist_ok=True)
+        t0 = time.monotonic()
+        dest = os.path.join(dest_dir, _FLOW_DB_FILENAME)
+        tmp = dest + ".tmp"
+        async with self._lock:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            self._conn.execute("VACUUM inv INTO ?", (tmp,))
+            os.replace(tmp, dest)
+        logger.info("Publish snapshot: %s [%.1fs]",
+                    dest, time.monotonic() - t0)
+        return {_FLOW_DB_FILENAME: dest}
 
     @staticmethod
     def iter_challenge_training_data(
@@ -861,6 +1144,7 @@ class DataLog:
     ):
         conn = sqlite3.connect(db_path, check_same_thread=False)
         _ensure_price_data_col(conn)
+        _attach_flow(conn, db_path)
 
         for spec in config.CHALLENGES:
             ticker = spec["ticker"]
@@ -903,7 +1187,9 @@ class DataLog:
                     yield ticker, payload
                 continue
 
-            if loss_func == "trade_mix":
+            if loss_func in ("trade_mix", "flow"):
+                # FLOW reuses the trade-mix payload shape: per-hotkey
+                # embeddings (dim x assets) + per-row prices + sidx.
                 payload = DataLog._build_trade_mix_from_db(
                     conn, ticker, blocks_ahead, max_block_number,
                     active_hotkeys=active_hotkeys, spec=spec,
@@ -925,7 +1211,7 @@ class DataLog:
     def _collect_hotkeys(conn, ticker, active_hotkeys=None):
         hks: set[str] = set()
         for (hks_json,) in conn.execute(
-            "SELECT hotkeys FROM challenge_data WHERE ticker = ? AND hotkeys != '[]'",
+            f"SELECT hotkeys FROM {_cd_table(ticker)} WHERE ticker = ? AND hotkeys != '[]'",
             (ticker,),
         ):
             for hk in json.loads(hks_json):
@@ -1187,12 +1473,33 @@ class DataLog:
         }
 
     @staticmethod
-    def _build_trade_mix_from_db(conn, ticker, blocks_ahead, max_block_number, *, active_hotkeys=None, spec=None):
-        """Build training data for the TRADE-MIX challenge.
+    def _build_trade_mix_from_db(conn, ticker, blocks_ahead, max_block_number, *, active_hotkeys=None, spec=None,
+                                 emb_overlay=None):
+        """Build training data for the TRADE-MIX / FLOW challenges.
 
         Returns dict with 'hist' (positions matrix), 'prices_multi'
         (T x n_assets price array), 'sidx_arr', and 'blocks_ahead'.
         Storage dim = len(assets) (one signed scalar position per asset).
+
+        `emb_overlay` ({sidx: {hotkey: vec}}, default None) fills
+        embeddings the DB does not have yet — the owner-side live
+        feed (team settlement tooling, kept outside this repo) passes
+        payloads it decrypted before the public tlock matured.  DB
+        values win on overlap (the matured plaintext is the same
+        bytes), rows the DB has no price for are skipped exactly as
+        without the overlay, and None keeps this builder
+        byte-identical to the public path.  This repo itself only
+        ever decrypts the public way.
+
+        FLOW wick channels: when any stored row carries the price
+        service's per-asset wick keys ("BTC_HIGH"/"BTC_LOW"),
+        'prices_multi' is emitted as [close, high, low] columns for
+        spec-1.3 wick resolution (flow.py).  Rows without wicks fall
+        back per row (channel = close, exactly close-only for that row),
+        and each channel is clamped to contain its own close, so a
+        skewed publisher print can never place the close outside the
+        row's own range.  With no wick data anywhere the shape stays
+        T x 1 and resolution is close-only end to end.
         """
         if spec is None:
             spec = config.CHALLENGE_MAP.get(ticker)
@@ -1203,18 +1510,32 @@ class DataLog:
         if n_assets == 0:
             return None
         storage_dim = int(spec.get("dim", 1)) * n_assets
+        wick_asset = assets[0] if (ticker in _FLOW_DB_TICKERS
+                                   and n_assets == 1) else None
         c = conn.cursor()
 
         all_hks_sorted, hk2idx = DataLog._collect_hotkeys(c, ticker, active_hotkeys)
+        if emb_overlay:
+            # union: a miner whose first payload has not matured yet
+            # exists only in the overlay, and must still get a column
+            overlay_hks = {hk for by_hk in emb_overlay.values() for hk in by_hk}
+            if active_hotkeys is not None:
+                overlay_hks &= active_hotkeys
+            merged = sorted(set(all_hks_sorted or []) | overlay_hks)
+            if merged:
+                all_hks_sorted = merged
+                hk2idx = {hk: i for i, hk in enumerate(merged)}
         if all_hks_sorted is None:
             return None
 
         rows: list[np.ndarray] = []
         prices_list: list[list[float]] = []
+        wick_list: list[tuple] = []      # (hi | None, lo | None) per row
+        any_wicks = False
         sidx_list: list[int] = []
 
         for sidx, price_data, emb_blob in c.execute(
-            "SELECT sidx, price_data, embeddings FROM challenge_data "
+            f"SELECT sidx, price_data, embeddings FROM {_cd_table(ticker)} "
             "WHERE ticker = ? ORDER BY sidx",
             (ticker,),
         ):
@@ -1229,8 +1550,26 @@ class DataLog:
             if not any(p > 0 for p in price_vec):
                 continue
 
+            if wick_asset is not None:
+                hi = pd_dict.get(f"{wick_asset}_HIGH")
+                lo = pd_dict.get(f"{wick_asset}_LOW")
+                if (isinstance(hi, (int, float))
+                        and isinstance(lo, (int, float))
+                        and 0 < float(lo) <= float(hi)):
+                    wick_list.append((float(hi), float(lo)))
+                    any_wicks = True
+                else:
+                    wick_list.append((None, None))
+
             emb = _unpack_embeddings(emb_blob, storage_dim) if emb_blob else {}
             row = np.zeros((len(all_hks_sorted), storage_dim), dtype=np.float32)
+            if emb_overlay:
+                for hk, vec in (emb_overlay.get(int(sidx)) or {}).items():
+                    idx = hk2idx.get(hk)
+                    if idx is not None and hk not in emb:
+                        arr = np.asarray(vec, dtype=np.float32)
+                        if arr.size == storage_dim:
+                            row[idx] = arr.reshape(storage_dim)
             for hk, vec in emb.items():
                 idx = hk2idx.get(hk)
                 if idx is not None:
@@ -1244,9 +1583,21 @@ class DataLog:
 
         if not rows:
             return None
+
+        prices_multi = np.array(prices_list, dtype=np.float64)
+        if wick_asset is not None and any_wicks:
+            close = prices_multi[:, 0]
+            hi_col = np.array([h if h is not None else c_
+                               for (h, _), c_ in zip(wick_list, close)])
+            lo_col = np.array([l if l is not None else c_
+                               for (_, l), c_ in zip(wick_list, close)])
+            hi_col = np.maximum(hi_col, close)   # channel contains its close
+            lo_col = np.minimum(lo_col, close)
+            prices_multi = np.column_stack([close, hi_col, lo_col])
+
         return {
             "hist": (np.stack(rows, axis=0), hk2idx),
-            "prices_multi": np.array(prices_list, dtype=np.float64),
+            "prices_multi": prices_multi,
             "sidx_arr": np.array(sidx_list, dtype=np.int64),
             "blocks_ahead": blocks_ahead,
         }
@@ -1488,9 +1839,13 @@ class DataLog:
     @staticmethod
     def get_hotkey_first_blocks_from_db(db_path: str, sample_every: int) -> dict[str, int]:
         conn = sqlite3.connect(db_path, check_same_thread=False)
+        _attach_flow(conn, db_path)
         hotkey_first_block: dict[str, int] = {}
         for sidx, hks_json in conn.execute(
             "SELECT sidx, hotkeys FROM challenge_data "
+            "WHERE hotkeys != '[]' "
+            "UNION ALL "
+            "SELECT sidx, hotkeys FROM inv.challenge_data "
             "WHERE hotkeys != '[]' ORDER BY sidx ASC",
         ):
             block = int(sidx) * sample_every

@@ -29,7 +29,61 @@ from hitfirst import compute_hitfirst_salience
 from range_breakout import compute_multi_breakout_salience
 from xsec_rank import compute_xsec_rank_salience
 from funding_xsec import compute_funding_xsec_salience
-from trade_mix import compute_trade_mix_salience
+from flow import compute_flow_salience
+
+_FLOW_POOL_CLIENT = None
+_FLOW_POOL_TRIED = False
+
+
+def _flow_collateral_client():
+    global _FLOW_POOL_CLIENT, _FLOW_POOL_TRIED
+    if not _FLOW_POOL_TRIED:
+        _FLOW_POOL_TRIED = True
+        try:
+            from flow_collateral import client_from_env
+            _FLOW_POOL_CLIENT = client_from_env()
+        except Exception:
+            _FLOW_POOL_CLIENT = None
+            try:
+                from config import FLOW_COLLATERAL_ADDRESS as _addr
+            except ImportError:
+                _addr = os.environ.get("FLOW_COLLATERAL_ADDRESS", "")
+            if _addr and _addr.lower() not in ("0", "none", "off", "-"):
+                # a configured contract that cannot be reached must be
+                # loud: silently weighting f-only while the operator
+                # believes collateral weighting is on is a divergence risk
+                logging.getLogger(__name__).exception(
+                    "FLOW collateral client failed to initialize "
+                    "(is web3 installed?); falling back to f-only weights")
+    return _FLOW_POOL_CLIENT
+
+
+def _flow_bet_collateral_fn(sidx_arr) -> "object | None":
+    """Per-trade skin pricer from the bets on chain, or None (f-only).
+
+    THE POSTED BET is the only skin emissions see: each trade's pay
+    contribution is priced bet/f (flow.compute_flow_salience then
+    multiplies by f, landing back on the bet), so a trade the miner
+    never posted — or posted after its open (free-look) — earns
+    nothing, idle balance earns nothing, and no deposit or withdrawal
+    after an open moves what a past trade pays.  Emissions and
+    settlement money share one basis.  Bets come from TradePosted
+    event logs (immutable, append-only, fail-static on RPC error)."""
+    client = _flow_collateral_client()
+    if client is None or sidx_arr is None or len(sidx_arr) == 0:
+        return None
+    try:
+        from flow_collateral import make_bet_collateral_fn
+        bets = client.bets_map()
+        chain_ts = float(client.w3.eth.get_block("latest")["timestamp"])
+        now_hour = float(int(sidx_arr[-1]) * int(config.SAMPLE_EVERY)
+                         * 12 / 3600.0)
+        return make_bet_collateral_fn(bets, chain_ts=chain_ts,
+                                 now_hour=now_hour)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "FLOW bet feed failed; weighting f-only this pass")
+        return None
 
 
 def stable_argsort(a, *, axis: int = -1, descending: bool = False) -> np.ndarray:
@@ -846,21 +900,15 @@ def multi_salience(
                 sidx_arr=sidx_trimmed,
             )
             del hist, funding_rates, funding_trimmed, sidx_trimmed
-        elif loss_type == "trade_mix":
+        elif loss_type == "flow":
             if not isinstance(payload, dict):
                 del payload
                 continue
             hist = payload.get("hist")
             prices_multi = payload.get("prices_multi")
             sidx_arr = payload.get("sidx_arr")
-            blocks_ahead = int(spec.get("blocks_ahead", 0) or 0)
             del payload
-            if (
-                not isinstance(hist, tuple)
-                or len(hist) != 2
-                or prices_multi is None
-                or blocks_ahead <= 0
-            ):
+            if not isinstance(hist, tuple) or len(hist) != 2 or prices_multi is None:
                 continue
             hist_trimmed = _trim_hist_price(hist, prices_multi[:, 0])
             if hist_trimmed[0] is None:
@@ -868,13 +916,13 @@ def multi_salience(
             trim_len = hist_trimmed[0][0].shape[0]
             prices_trimmed = prices_multi[-trim_len:]
             sidx_trimmed = sidx_arr[-trim_len:] if sidx_arr is not None else None
-            s = compute_trade_mix_salience(
+            s = compute_flow_salience(
                 (hist_trimmed[0][0], hist_trimmed[0][1]),
                 prices_trimmed,
-                blocks_ahead=blocks_ahead,
                 sample_every=int(config.SAMPLE_EVERY),
                 sidx_arr=sidx_trimmed,
                 spec=spec,
+                collateral_fn=_flow_bet_collateral_fn(sidx_trimmed),
             )
             del hist, prices_multi, prices_trimmed, sidx_trimmed
         else:

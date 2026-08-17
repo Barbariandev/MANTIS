@@ -3,11 +3,18 @@
 ## 1. Setup
 
 ```bash
-pip install timelock requests cryptography boto3 python-dotenv
+pip install requests cryptography boto3 python-dotenv maturin
+# Do not `pip install timelock` from PyPI — that is the old 372-byte
+# stack and will not match live subnet payloads (356-byte W_time).
+git clone https://github.com/ideal-lab5/timelock.git
+cd timelock && git checkout ccccca019409c89f31fd687352db8060bfb4aae6
+pip install ./py
+cd wasm && maturin build --features python --release
+pip install ../target/wheels/timelock_wasm_wrapper-0.3.0-*.whl
 ```
 
 Requirements:
-- Python 3.10+
+- Python 3.10+ (Rust + maturin to build the timelock wasm wrapper)
 - Registered hotkey on subnet 123
 - Cloudflare R2 bucket (commit URLs must be `*.r2.dev` or `*.r2.cloudflarestorage.com`, object key = your hotkey)
 
@@ -208,13 +215,165 @@ FUNDING_ASSETS = [
 - Liquidation volume and order book skew
 - Cross-asset lead-lag (BTC funding often leads alts by 1-2 settlement periods)
 
+### 3.7 FLOW (dim=28)
+
+Ticker: `FLOW`. Live 2026-08-17; emissions turn on 2026-09-14 at a
+25% pool allocation. Full specification, math, and simulation
+evidence: the FLOW release paper (`FLOW_RELEASE.pdf`, published on
+the MANTIS site).
+
+Capital-at-risk BTC bracket trades instead of predictions. 28 floats,
+seven per regime, in regime order A, B, C, D:
+
+```python
+# per regime: [d, f, sl, tp1, tp2, h, trade_id]
+#   d         -1.0 short, +1.0 long, 0.0 no trade
+#   f         Kelly fraction in [0.01, 0.25] (max bet: a quarter of collateral)
+#   sl        stop distance as a fraction of entry (0 < sl <= 0.5)
+#   tp1, tp2  target distances as fractions of entry (tp1 < tp2 <= 0.5)
+#   h         horizon in hours, within the regime's bounds
+#   trade_id  miner-chosen positive integer; bump it to open a new trade
+```
+
+Regime horizon bounds: A = 1–24h, B = 24–48h, C = 72–168h,
+D = 168–336h. Entry prices are recorded by the validator from its own
+feed at the observed open; nothing in the payload can set a price.
+Semantics are constant-emission: repeat your current intent every
+payload and bump `trade_id` to open. A dropped payload delays an open
+by at most one sampling interval and never cancels a live trade. Opens
+are rate-limited to one per hour per regime; implied win probability
+$p = (fb + 1)/(b + 1)$ must lie in $[0.01, 0.99]$ or the submission is
+rejected.
+
+**Payment is evidence-gated, not score-proportional.** Realized
+per-trade R sums into 168h blocks; with ≥ 4 blocks a t-statistic is
+computed, a key clears at $t \geq 1.25$ (on the better of its full
+history and its last four blocks) and stays cleared while
+$t \geq 0.5$. Cleared keys split 98% of the challenge pool pro rata;
+uncleared keys with positive score split a 2% dust tier; the remainder
+burns. New keys earn nothing for their first 168h (probation). There
+is no entry deposit. Once the collateral pool is configured, emission
+weight and settlement money are both priced by the bet you posted
+(see the owner-settlement section of `README.md`), and every 7 days
+the alpha lost on losing trades is redistributed to winners; there is
+no slash mechanic on posted alpha.
+
+**THE MODEL: you post your own bets, by hand, on chain — we can only
+resolve them.** Every trade the money layer will ever touch exists
+because you personally put it there: `postTrade(hotkey, tradeKey,
+collateral)` reserves the bet's worst case (Kelly f × your collateral)
+behind the trade id, before the payload that carries it uploads. We
+have no way to open, resize, or extend a bet — our entire write
+surface over your capital is resolving your bets (each debit
+hard-bounded by the bet you posted), settling the weekly pool
+(zero-sum, enforced), and repairing rounding dust. What you never
+post can never lose — or win — anything.
+
+**Opening the position is hotkey-authorized.** Each registered hotkey
+has one slot. Whoever opens it becomes the depositor (the only key
+that can later top up or withdraw) and fixes the refund coldkey that
+receives exits. If opening were unsigned, anyone could fund 1 alpha
+against every registered hotkey and lock those slots — the squat.
+So the only way to create a position is `addCollateralSigned`: your
+hotkey signs a digest binding chain, contract, hotkey, the funder
+(`msg.sender`, who becomes the depositor), the refund coldkey, the
+amount, and a strictly increasing nonce. Without that signature there
+is no position. Top-ups after that are depositor-only
+(`addCollateral`) and do not need the hotkey again. `flow_post.py
+fund` does both.
+
+```bash
+# Get alpha under your EVM key's mirror coldkey first
+# (btcli evm stake, or transfer_stake to the mirror ss58 of the H160).
+export FLOW_RPC=https://lite.chain.opentensor.ai
+export FLOW_CONTRACT=0xD9c805202b16671A2901307fBC9A8750E2453427
+export FLOW_EVM_KEY=0x...           # funder; becomes the depositor
+python3 flow_post.py fund --hotkey 5F... --alpha 10 \
+    --wallet mywallet --wallet-hotkey myhotkey
+    # optional: --refund-coldkey 5G...  (defaults to the EVM key's mirror)
+python3 flow_post.py book --hotkey 5F...
+# later top-up from the same depositor: no --wallet needed
+python3 flow_post.py fund --hotkey 5F... --alpha 5
+```
+
+A hotkey-signed `evict` force-exits a *flat* position (no open bets,
+no parked pool rao) and frees the slot. The payout can go only to the
+**recorded** refund coldkey — it cannot redirect a rao, whoever signs
+or relays. Two uses: you lost the depositor EVM key and want your
+alpha back on your own coldkey so you can re-open with a fresh key;
+or a position exists against your wishes and you want the slot back
+(the funder just gets their own alpha). Open reserves expire on-chain
+in at most 384h, so an evict is never blocked for long.
+
+```bash
+python3 flow_post.py evict --hotkey 5F... \
+    --wallet mywallet --wallet-hotkey myhotkey
+```
+
+A stolen hotkey still cannot steal capital: the refund was fixed
+under your signature at open, top-ups and withdrawals stay
+depositor-only, and the worst a compromised hotkey can do is
+force-exit *your money to your own coldkey*.
+
+Your hotkey IS an sr25519 public key, and it is the key your position
+is booked to, so you post the native way: sign the bet with the same
+hotkey you mine with, and the contract verifies the signature through
+the chain's sr25519 precompile (`postTradeSigned`). Any EVM account
+can relay the transaction — it only pays gas and has no authority:
+the signed digest binds chain, contract, hotkey, trade id, size and a
+strictly increasing nonce, so a relayer can neither alter a bet nor
+replay one. (The depositor EVM key that funded the position can also
+post directly as a fallback.) Bets are immutable once posted — no
+resize, no cancel. Direction and levels are not on chain: they live
+in the encrypted payload on your R2 object and stay under the public
+timelock, so you already know them while everyone else waits. Each
+reserve expires on-chain by its
+regime's horizon ceiling plus 48h, with `sweepExpired` permissionless,
+so nothing can lock your margin. Post the bet BEFORE (or as) you
+upload the payload with the matching trade id: settlement only
+credits bets that were on chain when the trade opened — a bet posted
+after the fact is voided both ways, since late posting would be a
+free look at the tape. A bet reveals size only — direction and levels
+stay under the timelock. `flow_post.py` is the supported miner surface: `fund` (open the
+slot with your hotkey, or top up), `book`, `post` with `--wallet`
+(signs each bet with your local hotkey), `status`, `audit` (replays
+the contract's event log and proves every debit stayed within the
+bet you posted), and `evict` (flat-only recovery). Wire `post` into
+your submission loop so the bet and the payload go out together;
+whatever UI you want on top is yours to build (and yours to trust
+with your credentials).
+
+**The clock: what happens to your bet, and when.** Settlement is run
+by the team (the contract owner) as a separate process — its code is
+not in this repo, but everything it may do is bounded on chain and
+recomputable by you. The team decrypts payloads at arrival through
+the envelope's owner leg (`W_owner`, §2.2 of the release doc), so
+resolution is live; the public timelock opens the same plaintexts to
+everyone a week later. Expect:
+
+| When | What you see on chain |
+| --- | --- |
+| you open the position (`flow_post.py fund`) | `CollateralAdded`: your hotkey signed the funder and refund coldkey; nobody else can occupy this slot |
+| you post the bet (before the trade opens; ≤ 15 min pipeline grace) | `TradePosted`: the reserve is held, the bet is immutable; everything above your reserves stays instantly withdrawable |
+| your trade resolves (SL / TP1+horizon / TP2 / horizon) | `TradeClosed`, typically within minutes to a few hours: a loss debits `max(−R,0) × bet` — never more than the bet, never more than ¼ of your book per week — and a win or flat closes at loss 0, freeing the reserve |
+| each week end + 24 h straggler lag | `Settled`: the week's collected losses pay that week's net winners pro rata, over-collections are refunded in the same batch, exactly zero-sum |
+| one week after each payload | the drand timelock opens it publicly: you (or anyone) can recompute every close and settle from the panel, the tape, and the bets, and `flow_post.py audit` proves no debit exceeded a bet |
+| regime ceiling + 48 h with no close | owner-outage escape hatch: the reserve self-releases and `sweepExpired` is permissionless — no team failure can lock your margin |
+
+A bet posted after its trade opened is voided both ways (the
+free-look guard is symmetric — it costs the late poster the win too).
+Money and emissions share one basis: your posted bet. A trade with no
+bet scores for evidence but carries no money and earns no emission;
+idle balance behind unposted trades earns nothing; deposits or
+withdrawals after a trade opened change nothing about it.
+
 ---
 
 ## 4. Full Embedding Assembly
 
 ```python
 import numpy as np
-from config import CHALLENGES, BREAKOUT_ASSETS, FUNDING_ASSETS, TRADE_MIX_ASSETS
+from config import CHALLENGES, BREAKOUT_ASSETS, FUNDING_ASSETS
 
 embeddings = {}
 
@@ -230,11 +389,9 @@ for spec in CHALLENGES:
     elif ticker == "FUNDINGXSEC":
         embeddings[ticker] = {a: 0.0 for a in FUNDING_ASSETS}
 
-    elif ticker == "TRADEMIX":
-        # Signed target position in [-1, 1] per asset. Held for ~1 hour.
-        embeddings[ticker] = {a: 0.0 for a in TRADE_MIX_ASSETS}
-
     else:
+        # Flat vectors, including FLOW (28 floats, see 3.7;
+        # all-zeros = no open trades).
         embeddings[ticker] = np.zeros(spec["dim"]).tolist()
 
 # Replace all zeros above with your actual model outputs.
@@ -250,18 +407,20 @@ Per-challenge salience is normalized to sum to 1, then weighted:
 
 | Challenge | Weight | Share of total |
 |---|---|---|
-| MULTI-BREAKOUT | 5.0 | ~18% |
-| FUNDING-XSEC | 4.0 | ~14% |
-| ETHLBFGS | 3.5 | ~12% |
-| XSEC-RANK | 3.0 | ~11% |
-| BTCLBFGS | 2.875 | ~10% |
-| ETHHITFIRST | 2.5 | ~9% |
-| TRADE-MIX | 2.625 | 10% (ratchets toward 15%) |
-| Binary (5x) | 1.0 each | ~18% total |
+| MULTI-BREAKOUT | 5.0 | ~21% |
+| FUNDING-XSEC | 4.0 | ~17% |
+| ETHLBFGS | 3.5 | ~15% |
+| XSEC-RANK | 3.0 | ~13% |
+| BTCLBFGS | 2.875 | ~12% |
+| ETHHITFIRST | 1.25 | ~5% |
+| Binary (ETH, CHFUSD, XAGUSD at 1.0; CADUSD, NZDUSD at 0.5) | 4.0 total | ~17% total |
+| FLOW | 0.0 until 2026-09-14, then 7.875 | 0% → 25% |
 
-> **TRADE-MIX v2 emissions**: the challenge starts at a 10% emissions share and is ratcheted toward 15% as the pool of statistically proven (gated) miners grows. Within the challenge, any pool share not earned by gated miners is **burned** (routed to UID 0), not redistributed to noise.
+> **TRADE-MIX is deprecated** as of the FLOW launch (2026-08-17): removed from the active roster, superseded by FLOW, historical challenge data purged from validator datalogs. Submissions to it are ignored.
 >
-> **TRADE-MIX probation**: new hotkeys must accumulate 21 days of ≥90% submission coverage before they are considered for payment. Evidence accrues from your first submission and is **never reset** — skill compounds across the full history of your submissions.
+> **FLOW emissions**: zero until 2026-09-14, then 25% of the pool. Within the challenge, everything the significance gate withholds is **burned**, not redistributed: uncleared miners split a 2% dust tier at most. Gate evidence accrues from your first submission and is never reset, so miners submitting from August 17th arrive at emission turn-on with four weeks of evidence banked.
+>
+> **FLOW probation**: a new hotkey earns nothing for its first 168h of history; the gate statistic needs at least 4 completed 168h blocks before it is defined at all.
 
 ### Scoring by challenge type
 
@@ -275,7 +434,7 @@ Not all challenges use the same scoring structure. Summary:
 | MULTI-BREAKOUT | AUC gate → L2 logreg on z-scored predictions, episode-balanced weighting | $\|\beta_j\|$ |
 | XSEC-RANK | Walk-forward L2 meta-model, AUC-scaled coefficients, recency-weighted segments | $\|\beta_j\| \cdot \text{AUC\_scale}$ |
 | FUNDING-XSEC | Same as XSEC-RANK + stale filter ($\text{std} < 10^{-4}$) + extended embargo | $\|\beta_j\| \cdot \text{AUC\_scale}$ |
-| TRADE-MIX (v2) | Positions decomposed into market-timing + relative-value channels → per-channel evidence vs a circular block-shift null at 12h/24h/48h → Benjamini–Hochberg FDR gate → seniority residualization of near-duplicate books → convex payment on trailing costed attribution | studentized cross-moment $t$ vs shift null; unearned pool burned |
+| FLOW | Bracket trades resolved against multi-venue klines (stop-first ties) → path-penalized, tail-amplified, Kelly-weighted R → per-regime EWMA → significance gate on 168h block sums (clear $t \geq 1.25$ on the max of full-history and rolling last-4 statistics, latch $t \geq 0.5$) → cleared keys split the pool pro rata, uncleared split 2% dust, remainder burned | block-sum $t$-statistic (full history or last 4 blocks, whichever is stronger); unearned pool burned |
 
 For challenges with walk-forward segments, recency weighting applies: $w_i = \gamma^{n - 1 - i}$ where $\gamma = 0.5^{1/\text{HALFLIFE}}$.
 
@@ -291,7 +450,7 @@ For challenges with walk-forward segments, recency weighting applies: $w_i = \ga
 ## 6. Validation Checklist
 
 ```python
-from config import CHALLENGES, BREAKOUT_ASSETS, FUNDING_ASSETS, TRADE_MIX_ASSETS
+from config import CHALLENGES, BREAKOUT_ASSETS, FUNDING_ASSETS
 
 def validate_embeddings(emb: dict) -> list[str]:
     errors = []
@@ -311,14 +470,6 @@ def validate_embeddings(emb: dict) -> list[str]:
                     errors.append(f"{tk}.{a}: need [p_cont, p_rev]")
                 elif not all(0 < x < 1 for x in v):
                     errors.append(f"{tk}.{a}: values must be in (0,1)")
-
-        elif tk == "TRADEMIX":
-            if not isinstance(val, dict):
-                errors.append(f"{tk}: expected dict"); continue
-            for a in TRADE_MIX_ASSETS:
-                v = val.get(a, None)
-                if not isinstance(v, (int, float)) or not (-1 <= v <= 1):
-                    errors.append(f"{tk}.{a}: need float in [-1,1]")
 
         elif tk == "MULTIXSEC":
             if not isinstance(val, dict):

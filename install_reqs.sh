@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # install_reqs.sh
-# Sets up a Python venv at .venv and installs the 'timelock' Python package.
-# Strategy:
-#   1) Try to install prebuilt wheels from PyPI (works on Python 3.10).
-#   2) If that fails, build from source (Rust + maturin) for the active interpreter.
+# Sets up a Python venv at .venv and installs project deps + timelock.
+# Timelock is always built from the pinned ideal-lab5/timelock revision.
+# PyPI `timelock==0.0.1.dev0` + `timelock-wasm-wrapper==0.0.2` is the old
+# 372-byte stack and cannot decrypt live (356-byte) miner payloads.
 #
 # Env vars:
 #   PY_BIN        : Python interpreter to use (default: auto-detect, prefers 3.10)
 #   SRC           : Where to clone timelock sources (default: ./timelock-src)
+#   TIMELOCK_GIT  : timelock repo URL
+#   TIMELOCK_REV  : pinned commit (must ship wasm wrapper 0.3.0)
 #   INSTALL_NODE  : If "1", also install Node.js 20 + pm2 (default: 0/disabled)
 
 set -Eeuo pipefail
@@ -23,11 +25,26 @@ trap 'die "Error on or near line $LINENO. Aborting."' ERR
 ROOT="$(pwd)"
 VENV="$ROOT/.venv"
 SRC="${SRC:-$ROOT/timelock-src}"
+TIMELOCK_GIT="${TIMELOCK_GIT:-https://github.com/ideal-lab5/timelock.git}"
+# Known-good: python 0.0.2.dev0 + wasm wrapper 0.3.0 (356-byte W_time).
+TIMELOCK_REV="${TIMELOCK_REV:-ccccca019409c89f31fd687352db8060bfb4aae6}"
+
+timelock_stack_ok() {
+  "$PY" -c '
+from importlib.metadata import version
+try:
+    wasm = version("timelock_wasm_wrapper")
+    py = version("timelock")
+except Exception:
+    raise SystemExit(1)
+parts = [int(x) for x in wasm.split(".")[:2]]
+raise SystemExit(0 if parts >= [0, 3] and py.startswith("0.0.2") else 1)
+' >/dev/null 2>&1
+}
 
 # ── Choose interpreter ──────────────────────────────────────────────
-# Preferred: python3.10 (best tested, PyPI wheels for timelock exist).
-# Fallbacks: python3.11, python3.12, python3 -- will work but timelock
-# may need to be built from source and some deps may need adjustment.
+# Preferred: python3.10. Fallbacks: python3.11, python3.12, python3.
+# Timelock wasm is built from source for the active interpreter.
 if [[ -n "${PY_BIN:-}" ]]; then
   command -v "$PY_BIN" >/dev/null 2>&1 || die "PY_BIN=$PY_BIN not found on PATH"
 elif command -v python3.10 >/dev/null 2>&1; then
@@ -118,29 +135,15 @@ else
   warn "Skipping Node.js + pm2 install (set INSTALL_NODE=1 to enable)"
 fi
 
-# Fast path: try prebuilt wheels from PyPI (works on Python 3.10)
-step "Attempting timelock install from PyPI (prebuilt wheels)"
-PREBUILT=0
-if "$PY" -c 'import importlib.util,sys; sys.exit(0 if importlib.util.find_spec("timelock") else 1)' >/dev/null 2>&1; then
-  ok "timelock already installed in venv"
-  PREBUILT=1
-else
-  if $PY -m pip install -q --no-input timelock; then
-    if "$PY" -c 'import timelock' >/dev/null 2>&1; then
-      ok "Installed timelock from PyPI"
-      PREBUILT=1
-    else
-      warn "timelock import failed after PyPI install; will build from source"
-      PREBUILT=0
-    fi
-  else
-    warn "PyPI install did not succeed; will build from source"
-    PREBUILT=0
-  fi
+# Live subnet W_time is 356 bytes. Skip PyPI (old 372-byte stack).
+step "Checking timelock stack (need wasm wrapper >= 0.3.0)"
+NEED_TIMELOCK=1
+if timelock_stack_ok; then
+  ok "timelock 0.0.2.dev0 + wasm wrapper >= 0.3.0 already installed"
+  NEED_TIMELOCK=0
 fi
 
-# Build from source (Rust + maturin) if needed
-if [[ "$PREBUILT" -eq 0 ]]; then
+if [[ "$NEED_TIMELOCK" -eq 1 ]]; then
   step "Installing system build dependencies"
   if command -v apt-get >/dev/null 2>&1; then
     $SUDO apt-get update -qq || true
@@ -166,12 +169,14 @@ if [[ "$PREBUILT" -eq 0 ]]; then
   rustup toolchain install stable 2>/dev/null
   rustup default stable 2>/dev/null
 
-  step "Cloning/updating timelock sources"
+  step "Cloning/updating timelock sources ($TIMELOCK_REV)"
   if [[ ! -d "$SRC/.git" ]]; then
-    git clone --depth 1 https://github.com/ideal-lab5/timelock.git "$SRC"
+    git clone "$TIMELOCK_GIT" "$SRC"
   else
-    git -C "$SRC" pull --ff-only
+    git -C "$SRC" remote set-url origin "$TIMELOCK_GIT"
   fi
+  git -C "$SRC" fetch origin "$TIMELOCK_REV"
+  git -C "$SRC" checkout --detach FETCH_HEAD
 
   # Backward-compat fix for ark_std rename (no-op if not needed)
   if [[ -d "$SRC/wasm/src" ]]; then
@@ -201,6 +206,8 @@ if [[ "$PREBUILT" -eq 0 ]]; then
   ok "Built and installed timelock from source"
 fi
 
+timelock_stack_ok || die "timelock stack must be 0.0.2.dev0 + wasm wrapper >= 0.3.0 (not PyPI 0.0.1.dev0)"
+
 # ── Project requirements ────────────────────────────────────────────
 if [[ -f "$ROOT/requirements.txt" ]]; then
   step "Installing project requirements into .venv"
@@ -224,7 +231,7 @@ fi
 # ── Validate key imports ────────────────────────────────────────────
 step "Verifying critical packages import correctly"
 FAILED_IMPORTS=()
-for pkg in numpy scipy sklearn pandas torch bittensor requests aiohttp shap xgboost; do
+for pkg in numpy scipy sklearn pandas torch bittensor requests aiohttp shap xgboost timelock; do
   if ! $PY -c "import $pkg" 2>/dev/null; then
     FAILED_IMPORTS+=("$pkg")
   fi
@@ -292,11 +299,14 @@ echo
 ok "Installation complete in $VENV"
 $PY -c "
 import sys, numpy, scipy, sklearn, pandas, torch
+from importlib.metadata import version
 print(f'  Python     {sys.version.split()[0]}')
 print(f'  numpy      {numpy.__version__}')
 print(f'  scipy      {scipy.__version__}')
 print(f'  sklearn    {sklearn.__version__}')
 print(f'  pandas     {pandas.__version__}')
 print(f'  torch      {torch.__version__}')
+print(f'  timelock   {version(\"timelock\")}')
+print(f'  tlock-wasm {version(\"timelock_wasm_wrapper\")}')
 "
 echo "Activate with:  source \"$VENV/bin/activate\""

@@ -4,7 +4,7 @@ This guide focuses on the LBFGS challenge (17-dim per bar). For general mining s
 
 - Embedding dim is 17
 - Validators aggregate all miners into a matrix and compute two saliences: a p-only 5-bucket classifier salience and a Q-only path salience.
-- Within the LBFGS challenge, final per-hotkey score = 50% classifier + 50% Q; then weighted by the challenge weight in `config.py` and normalised across challenges.
+- Within the LBFGS challenge, final per-hotkey score = 75% classifier + 25% Q; then weighted by the challenge weight in `config.py` and normalised across challenges.
 
 Submit 17 probabilities in this exact layout:
 
@@ -44,7 +44,7 @@ Requirements per submission
 
 ### How you’re scored
 
-We compute two out-of-sample saliences in a walk-forward loop (daily steps, with an embargo). Your final salience is the average of the two.
+We compute two out-of-sample saliences in a walk-forward loop (daily steps, with an embargo). Your final salience is 75% classifier + 25% Q.
 
 1) Classifier salience (p-only)
 
@@ -64,7 +64,7 @@ We compute two out-of-sample saliences in a walk-forward loop (daily steps, with
 
 Final salience
 
-- S_final(hotkey) = 0.5 * S_classifier + 0.5 * S_Q
+- S_final(hotkey) = 0.75 * S_classifier + 0.25 * S_Q
 - We renormalize across all miners to sum to 1.0.
 
 ### Data volume and when you start getting credit

@@ -1,6 +1,7 @@
 """FLOW challenge scoring (capital-at-risk BTC trades, evidence-gated).
 
-Spec: FLOW_RELEASE.md sections 1.1-1.8.  Parameters mirror the launch
+Spec: the FLOW release paper (FLOW_RELEASE.pdf, on the MANTIS site),
+sections 1.1-1.8.  Parameters mirror the launch
 table and the simulation defaults behind the published results
 (same-candle ties resolve stop-first; a stop printed after TP1 but
 before TP2 resolves as SL; no path penalty on stop-outs).
@@ -39,18 +40,24 @@ hysteresis, dust tier) and returns the trailing-24h mean allocation,
 remainder under "__burn__".  Everything, including latch state, is a
 pure function of the shared datalog, so validators agree stateless.
 
-Collateral weighting: pass `stakes` (hotkey -> posted alpha, from
-flow_stake.StakeClient.stakes_map, read at a pinned block so every
-validator weights from the same snapshot) and each miner's emission
-score scales with the alpha behind the positions; zero stake earns
-zero.  The gate statistic never sees stake: proof of edge is
-stake-free, only the split among paid keys scales with skin.
+Collateral weighting: THE POSTED BET is the only money.  Live, pass
+`collateral_fn` (flow_collateral.make_bet_collateral_fn over TradePosted event logs):
+each trade's pay contribution is sized by the bet its miner posted on
+chain before the open — an unposted or late-posted (free-look) trade
+earns nothing, and no deposit or withdrawal after the open can move
+what a past trade pays.  The gate statistic never sees collateral:
+proof of edge is evidence-only, and only the split among paid keys
+scales with skin.  The static `collateral` map (hotkey -> alpha) remains for
+simulations and pre-deployment weighting.
 
-Live settlement: `trade_events` yields one record per decoded trade for
-the feed daemon (open -> markOpen, resolution -> closeBatch) and
-`compute_stake_settlement` aggregates one period: losers forfeit
-realized R x f x stake-at-open (capped at the position), winners split
-exactly that pool pro rata.  Posted through flow_stake.StakeClient.
+Live settlement: miners post their own bets on chain (FlowCollateralPool
+postTrade); `trade_events` yields one record per decoded trade so the
+resolution daemon can close each posted bet (closeBatch) at its
+realized loss, and `compute_collateral_settlement` aggregates one period.
+With the live `collateral_fn`, both legs are symmetric in the bet:
+loss = max(-R,0) x bet, claim = max(+R,0) x bet.  Winners split
+exactly what the losers forfeited.  Posted through
+flow_collateral.CollateralClient.
 """
 
 from __future__ import annotations
@@ -66,7 +73,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-__all__ = ("compute_flow_salience", "compute_stake_settlement",
+__all__ = ("compute_flow_salience", "compute_collateral_settlement",
            "trade_events", "FlowConfig", "BURN_KEY", "decode_trades",
            "Trade")
 
@@ -387,10 +394,22 @@ def compute_flow_salience(
     sidx_arr: Optional[np.ndarray] = None,
     spec: Optional[dict] = None,
     cfg: Optional[FlowConfig] = None,
-    stakes: Optional[Dict[str, float]] = None,
+    collateral: Optional[Dict[str, float]] = None,
+    collateral_fn: Optional[Callable[..., float]] = None,
     return_diagnostics: bool = False,
 ) -> Dict[str, float] | Tuple[Dict[str, float], dict]:
-    """hotkey -> fraction of the FLOW pool (+ BURN_KEY; sums to 1)."""
+    """hotkey -> fraction of the FLOW pool (+ BURN_KEY; sums to 1).
+
+    Skin: with `collateral_fn` (the live rule; see flow_collateral.
+    make_bet_collateral_fn) each trade's pay contribution is priced by the
+    bet posted on chain for that trade — f x (bet/f) = the bet — so
+    emissions and settlement money share one basis and an unposted or
+    late-posted trade earns nothing.  Gate evidence is computed before
+    the skin multiplier, so an unposted key still latches; it just is
+    not paid.  Without `collateral_fn`, the static `collateral` map multiplies
+    the paid score (simulation / pre-deployment behavior); with
+    neither, weighting is f-only (paper).
+    """
     if cfg is None:
         cfg = FlowConfig.from_spec(spec)
 
@@ -425,6 +444,14 @@ def compute_flow_salience(
             for tr in resolved:                      # tail amp + Kelly weight
                 amp = 1.0 + cfg.tau * float(tail_flag[tr.resolve_row])
                 tr.s_weighted = tr.s_weighted * amp * tr.f
+                if collateral_fn is not None:
+                    # the live rule: pay is sized by THE POSTED BET —
+                    # f x (bet/f) = the bet — so a trade with no bet
+                    # (or a voided late one) earns nothing.  s_base is
+                    # untouched: the gate still sees the evidence.
+                    tr.s_weighted *= _price_collateral(
+                        collateral_fn, hk, tr.open_hour, tr.regime, tr.tid,
+                        tr.f)
             per_miner[hk] = resolved
 
     # ---- hourly emission timeline ------------------------------------
@@ -481,10 +508,12 @@ def compute_flow_salience(
             s = float(np.sum(st["ewma"]))            # additive, no floor
             if s <= 0:
                 continue
-            if stakes is not None:
-                # real skin: weight by the alpha behind the positions;
-                # zero stake earns zero (gate evidence is unaffected)
-                skin = max(float(stakes.get(hk, 0.0)), 0.0)
+            if collateral_fn is None and collateral is not None:
+                # legacy/simulation skin: weight by a static per-hotkey
+                # balance; zero collateral earns zero (gate unaffected).
+                # With collateral_fn the skin is already inside the EWMA,
+                # per trade, priced by the posted bet.
+                skin = max(float(collateral.get(hk, 0.0)), 0.0)
                 if skin <= 0.0:
                     continue
                 s *= skin
@@ -534,6 +563,23 @@ def compute_flow_salience(
 
 # --------------------------------------------------------------- settlement
 
+def _price_collateral(collateral_fn, hk: str, open_hour: float, regime: int,
+                 tid: int, f: float) -> float:
+    """Call a collateral_fn across its historical signatures.
+
+    Preferred protocol is 5-arg (hk, open_hour, regime, tid, f) — the
+    bet-basis rule needs f to return bet/f — with 4-arg and 2-arg
+    callables still accepted."""
+    try:
+        priced = collateral_fn(hk, open_hour, regime, tid, f)
+    except TypeError:
+        try:
+            priced = collateral_fn(hk, open_hour, regime, tid)
+        except TypeError:
+            priced = collateral_fn(hk, open_hour)
+    return max(float(priced), 0.0)
+
+
 def _money_r(tr: Trade, price: np.ndarray) -> float:
     """Realized monetary R-multiple of a resolved trade.
 
@@ -562,20 +608,21 @@ def trade_events(
 
     The settlement daemon replays the full expanding panel each cycle
     (the decode is a stateful machine: busy windows and id dedup need
-    history), diffs against what it already posted, and feeds the
-    contract: an open posts `markOpen` with exposure f x stake at the
-    open, a resolution posts `closeBatch` with the realized loss.  One
-    record per decoded trade:
+    history), matches each trade against the bet its miner posted on
+    chain, and resolves it: `closeBatch` debits the realized loss,
+    bounded by the bet.  One record per decoded trade:
 
         dict(hotkey, regime, tid, open_hour, horizon_hour, f,
              resolve_hour,   # None while the trade is still live
              event,          # "" / SL / TP1 / TP2 / F
              money_r)        # None while live; realized monetary R
 
-    Monetary loss in alpha = max(-money_r, 0) x f x stake at open;
-    monetary win = max(money_r, 0) x f x stake at open.  Deterministic
-    from the datalog and the tape, so anyone can recompute every posted
-    open and close.
+    Money is symmetric in THE POSTED BET: loss in alpha =
+    max(-money_r, 0) x bet, win = max(money_r, 0) x bet (the daemon
+    closes with the bet directly; settlement claims price through
+    collateral_fn = bet/f so f x collateral lands back on the bet).
+    Deterministic from the datalog, the tape, and the bets on chain,
+    so anyone can recompute every posted open and close.
     """
     if cfg is None:
         cfg = FlowConfig.from_spec(spec)
@@ -605,11 +652,11 @@ def trade_events(
     return out
 
 
-def compute_stake_settlement(
+def compute_collateral_settlement(
     hist: Tuple[np.ndarray, Dict[str, int]],
     prices_multi: np.ndarray,
     *,
-    stakes: Dict[str, float],
+    collateral: Dict[str, float],
     period_start_h: float,
     period_end_h: float,
     carry_losses: Optional[Dict[str, float]] = None,
@@ -617,25 +664,27 @@ def compute_stake_settlement(
     sidx_arr: Optional[np.ndarray] = None,
     spec: Optional[dict] = None,
     cfg: Optional[FlowConfig] = None,
-    stake_fn: Optional[Callable[[str, float], float]] = None,
+    collateral_fn: Optional[Callable[[str, float], float]] = None,
 ) -> dict:
     """One settlement period's loss pool, in alpha.
 
     Decodes the same expanding panel as the salience path and settles
     every trade whose resolution falls in [period_start_h, period_end_h):
-    per trade, alpha P&L = realized monetary R x f x the alpha staked
+    per trade, alpha P&L = realized monetary R x f x the alpha held
     behind the hotkey at the trade's open.  Losing hotkeys forfeit
     |P&L|, capped per trade by the exposure the contract reserved at
     the open and clamped to the position on-chain; winning hotkeys hold
     claims.  The batch pays winners pro rata by claim out of exactly
     what the losers forfeited — more or less than the notional win.
 
-    Stake pricing: pass `stake_fn(hotkey, open_hour) -> alpha` to price
-    each trade at its open (the live-feed rule; the daemon reads the
-    chain at the open block, and anyone can re-read the same historical
-    state).  Without it, the static `stakes` map prices every trade,
-    which is exact whenever the stake did not move within the period
-    and is what the simulations use.
+    Collateral pricing: pass `collateral_fn(hotkey, open_hour[, regime, tid, f])
+    -> alpha` to price each trade (the live rule is
+    flow_collateral.make_bet_collateral_fn: bet/f, so P&L = R x bet — claims and
+    debits share the posted bet as their one basis, and a trade with
+    no bet or a voided late bet prices at zero).  Two- and
+    four-argument callables still work.  Without it, the static
+    `collateral` map prices every trade, which is exact whenever the collateral
+    did not move within the period and is what the simulations use.
 
     `carry_losses` holds debits deferred from a period that had no
     winners (the zero-sum contract rolls such a pool into the next
@@ -648,7 +697,7 @@ def compute_stake_settlement(
     this period has no winners either.  Deterministic from the datalog,
     the tape, and chain state, so anyone can recompute a posted batch.
     Pro-rata rao amounts are computed at posting time
-    (flow_stake.StakeClient.settle_period) so integer rounding is
+    (flow_collateral.CollateralClient.settle_period) so integer rounding is
     exactly zero-sum.
     """
     if cfg is None:
@@ -664,8 +713,8 @@ def compute_stake_settlement(
         X = np.asarray(X_flat, dtype=np.float64).reshape(len(price),
                                                          len(hk2idx), DIM)
         for hk, idx in hk2idx.items():
-            static_stake = max(float(stakes.get(hk, 0.0)), 0.0)
-            if stake_fn is None and static_stake <= 0.0:
+            static_col = max(float(collateral.get(hk, 0.0)), 0.0)
+            if collateral_fn is None and static_col <= 0.0:
                 continue                     # no skin, no settlement
             cols = X[:, idx, :]
             if not np.any(cols):
@@ -676,12 +725,15 @@ def compute_stake_settlement(
                     continue
                 if not (period_start_h <= tr.resolve_hour < period_end_h):
                     continue
-                stake = (max(float(stake_fn(hk, tr.open_hour)), 0.0)
-                         if stake_fn is not None else static_stake)
-                if stake <= 0.0:
+                if collateral_fn is not None:
+                    col = _price_collateral(collateral_fn, hk, tr.open_hour,
+                                            tr.regime, tr.tid, tr.f)
+                else:
+                    col = static_col
+                if col <= 0.0:
                     continue
                 resolved.append((float(tr.resolve_hour),
-                                 _money_r(tr, price) * tr.f * stake, stake))
+                                 _money_r(tr, price) * tr.f * col, col))
             if not resolved:
                 continue
             resolved.sort(key=lambda r: r[0])
@@ -710,7 +762,7 @@ def compute_stake_settlement(
     # cap every loss at the position (the contract independently bounds
     # each debit by the trade's reserved exposure and the live balance)
     for hk in list(losses):
-        cap = loss_caps.get(hk, max(float(stakes.get(hk, 0.0)), 0.0))
+        cap = loss_caps.get(hk, max(float(collateral.get(hk, 0.0)), 0.0))
         losses[hk] = min(losses[hk], cap)
         if losses[hk] <= 0.0:
             del losses[hk]

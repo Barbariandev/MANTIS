@@ -32,7 +32,7 @@ import os
 # numpy / sklearn / torch are loaded by any consumer.  BLAS libraries cache
 # their thread-count decision at load time, so these env vars MUST be set
 # before the first numpy import — placing them here is the only place that
-# guarantees that ordering across every entry point (validator, dashboard,
+# guarantees that ordering across every entry point (validator,
 # offline scoring scripts, etc.).
 #
 # Single-threaded BLAS makes parallel reductions associative-stable, which is
@@ -59,6 +59,16 @@ if os.environ.get("MANTIS_ALLOW_CUDA", "").lower() not in ("1", "true", "yes"):
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 DATALOG_ARCHIVE_URL = "https://pub-879ad825983e43529792665f4f510cd6.r2.dev/datalog.db"
+
+# FLOW lives in its own SQLite file, published to the same bucket.
+# The legacy datalog has grown too large to keep re-shipping for one
+# challenge; the split keeps the FLOW archive small (its own rows
+# only) while the old tickers stay where they are.  The validator
+# attaches it alongside the main DB (see ledger.py); a missing remote
+# archive is non-fatal (fresh challenge, empty local file).
+FLOW_DATALOG_ARCHIVE_URL = (
+    "https://pub-879ad825983e43529792665f4f510cd6.r2.dev/flow_datalog.db"
+)
 
 PRICE_DATA_URL = "https://pub-ba8c1b8edb8046edaccecbd26b5ca7f8.r2.dev/latest_prices.json"
 
@@ -190,41 +200,84 @@ FUNDING_XSEC_CHALLENGE = {
 
 CHALLENGES.append(FUNDING_XSEC_CHALLENGE)
 
+# TRADE-MIX is DEPRECATED as of the FLOW launch (2026-08-17): removed
+# from the active roster, superseded by FLOW, and its historical
+# challenge_data is purged on datalog open (see ledger.py).  The assets
+# constant stays because the datalog price rows still carry them.
 TRADE_MIX_ASSETS = ["BTC", "ETH", "TAO", "SOL"]
 
-# v2 IM starts at a 10% emissions share and is ratcheted toward 15% as the
-# pool of statistically gated miners grows (see TRADE_MIX_V2_IM_DESIGN.md).
-# Recompute as: f * sum(other weights) / (1 - f)
-_TRADE_MIX_TARGET_FRACTION = 0.10
-_TRADE_MIX_WEIGHT = (
-    _TRADE_MIX_TARGET_FRACTION * sum(c["weight"] for c in CHALLENGES) /
-    (1.0 - _TRADE_MIX_TARGET_FRACTION)
+# FLOW: capital-at-risk BTC trades with the evidence-gated payment layer.
+# Spec + simulation evidence: the FLOW release paper
+# (FLOW_RELEASE.pdf, on the MANTIS site).  Parameters below are the
+# launch table (section 1.8); scoring implementation is flow.py; the
+# collateral-pool client is flow_collateral.py (bet-basis score
+# weighting reads the live pool below; set FLOW_COLLATERAL_ADDRESS=off
+# to force f-only).  There is no entry bond: posted bets plus the
+# significance gate carry deterrence (release section 6).
+#
+# Wick feed: when latest_prices.json carries "BTC_HIGH"/"BTC_LOW"
+# (per-minute consensus wicks: min of venue highs, max of venue lows),
+# the validator stores them per row and resolution runs on the wick
+# channels (release sections 1.3, 2.4).  Rows without them resolve
+# close-only, a priced degradation (section 6.14), so the publisher
+# must ship the keys from challenge start.
+#
+# Timeline (announced 2026-07-31):
+#   2026-08-17  challenge live: validators collect and score payloads,
+#               gate evidence accrues, emission weight 0 (nothing paid).
+#   2026-09-14  after four weeks of payload collection, emissions turn on
+#               at FLOW_TARGET_FRACTION of the pool.  That flip is a
+#               deliberate one-line PR: set "weight" below to
+#               _FLOW_WEIGHT_AT_TURNON.  It is NOT automatic.
+FLOW_TARGET_FRACTION = 0.25
+_FLOW_WEIGHT_AT_TURNON = (
+    FLOW_TARGET_FRACTION * sum(c["weight"] for c in CHALLENGES) /
+    (1.0 - FLOW_TARGET_FRACTION)
 )
 
-TRADE_MIX_CHALLENGE = {
-    "name": "TRADE-MIX",
-    "ticker": "TRADEMIX",
-    "assets": TRADE_MIX_ASSETS,
-    "dim": 1,
-    "blocks_ahead": 300,
-    "loss_func": "trade_mix",
-    "weight": _TRADE_MIX_WEIGHT,
-    # --- v2 incentive mechanism (all horizons/windows in hours on the
-    # hourly evaluation grid; see TRADE_MIX_V2_IM_DESIGN.md)
-    "horizons_hours": [12, 24, 48],
-    "blend_weights": [0.25, 0.50, 0.25],
-    "beta_horizon_hours": 24,
-    "channel_split_rv": 0.75,       # RV channel share; beta channel gets the rest
-    "fdr_q": 0.05,
-    "probation_hours": 504,         # 21 days
-    "probation_coverage": 0.9,
-    "seniority_cosine": 0.20,
-    "dedup_cosine_threshold": 0.95,
-    "fee_bps": 10.0,                # per side, used in costed attribution
-    "miner_cap": 0.20,              # max share of a channel pool per miner
+FLOW_CHALLENGE = {
+    "name": "FLOW-BTC",
+    "ticker": "FLOW",
+    "assets": ["BTC"],
+    "dim": 28,                    # 4 regimes x [d, f, sl, tp1, tp2, h, trade_id]
+    "blocks_ahead": 0,            # resolution is horizon-driven, not fixed-lag
+    "loss_func": "flow",
+    "weight": float(os.environ.get("MANTIS_FLOW_WEIGHT", "0.0")),
+    # --- launch parameters (release paper section 1.8)
+    "delta": 0.30,
+    "lam": 0.50,
+    "gamma": 0.25,
+    "tau": 1.00,
+    "ewma_alpha": 0.05,
+    "kappa_hours": 672.0,
+    "probation_hours": 168.0,
+    "gate_block_h": 168.0,
+    "gate_min_n": 4,
+    "gate_z_in": 1.25,
+    "gate_z_out": 0.50,
+    "dust": 0.02,
 }
 
-CHALLENGES.append(TRADE_MIX_CHALLENGE)
+CHALLENGES.append(FLOW_CHALLENGE)
+
+# Live FlowCollateralPool on Bittensor EVM mainnet (chain id 964).
+# Deployed 2026-08-16 in block 8859422; week 1 opens at periodZero.
+# Env overrides; FLOW_COLLATERAL_ADDRESS=off disables collateral reads.
+FLOW_COLLATERAL_ADDRESS = os.environ.get(
+    "FLOW_COLLATERAL_ADDRESS",
+    "0xD9c805202b16671A2901307fBC9A8750E2453427",
+).strip()
+FLOW_COLLATERAL_RPC = os.environ.get(
+    "FLOW_COLLATERAL_RPC",
+    "https://lite.chain.opentensor.ai",
+)
+FLOW_COLLATERAL_PERIOD_ZERO = 1787004000  # 2026-08-17 22:00:00 UTC
+FLOW_COLLATERAL_NETUID = 123
+FLOW_COLLATERAL_OWNER = "0x5186318Ba00Ca115d92C37D2b646eA3867C2c754"
+FLOW_COLLATERAL_MIRROR_COLDKEY = (
+    "0x379d4712e9902a9ca2ba1b827f4cb2c48ec03b510b107bf700c92592d9df067a"
+)
+FLOW_COLLATERAL_DEPLOY_BLOCK = 8859422
 
 CHALLENGE_MAP = {c["ticker"]: c for c in CHALLENGES}
 CHALLENGE_NAME_TO_TICKER = {c["name"]: c["ticker"] for c in CHALLENGES}
@@ -255,7 +308,18 @@ WEIGHT_SET_INTERVAL = 360
 
 OWNER_HPKE_PUBLIC_KEY_HEX="fbfe185ded7a4e6865effceb23cbac32894170587674e751ac237a06f72b3067"
 TLOCK_DEFAULT_LOCK_SECONDS = int(os.getenv("TLOCK_DEFAULT_LOCK_SECONDS", "30"))
-TLOCK_PROD_SUGGESTED_LOCK_SECONDS = int(os.getenv("TLOCK_PROD_SUGGESTED_LOCK_SECONDS", "3600"))
+TLOCK_PROD_SUGGESTED_LOCK_SECONDS = int(os.getenv("TLOCK_PROD_SUGGESTED_LOCK_SECONDS", "604800"))
+
+# Blocks a raw payload must age before the validator attempts decryption.
+# One week (matching the suggested tlock horizon above): a payload becomes
+# publicly readable one week after its entry, which covers regimes A-C
+# entirely; a regime-D trade at the top of its band (up to 336h) can still
+# be live when its opening payload decrypts.  The owner-wrapped key path
+# (W_owner) is unaffected — copy-trade execution reads payloads
+# immediately.  Prices are recorded at submission time and embeddings
+# backfill onto those rows after decryption, so entry pricing is
+# unaffected by the delay.
+PAYLOAD_MATURITY_BLOCKS = int(os.getenv("PAYLOAD_MATURITY_BLOCKS", "50400"))
 ALG_LABEL_V2 = "x25519-hkdf-sha256+chacha20poly1305+drand-tlock"
 SUPPORTED_PAYLOAD_VERSIONS = {1, 2}
 
