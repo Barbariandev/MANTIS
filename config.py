@@ -267,9 +267,11 @@ FLOW_COLLATERAL_ADDRESS = os.environ.get(
     "FLOW_COLLATERAL_ADDRESS",
     "0xD9c805202b16671A2901307fBC9A8750E2453427",
 ).strip()
+# archive, not lite: lite prunes event logs and returns [] without error,
+# which silently prices every bet at zero (all FLOW emission burns)
 FLOW_COLLATERAL_RPC = os.environ.get(
     "FLOW_COLLATERAL_RPC",
-    "https://lite.chain.opentensor.ai",
+    "https://archive.chain.opentensor.ai",
 )
 FLOW_COLLATERAL_PERIOD_ZERO = 1787004000  # 2026-08-17 22:00:00 UTC
 FLOW_COLLATERAL_NETUID = 123
