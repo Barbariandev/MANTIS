@@ -82,8 +82,13 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
-MAINNET_RPC = "https://lite.chain.opentensor.ai"
+MAINNET_RPC = "https://archive.chain.opentensor.ai"
 TESTNET_RPC = "https://test.chain.opentensor.ai"
+
+# FlowCollateralPool deploy block; log scans never need to look earlier.
+DEPLOY_BLOCK = 8859422
+# archive rejects wide eth_getLogs ranges (prohibited_shape); chunk to this.
+GETLOGS_CHUNK = 500
 
 # lite.chain.opentensor.ai 429s under burst reads (deploy receipt
 # polls, getLogs, eth_call).  Retry only transient transport; a
@@ -524,7 +529,7 @@ class CollateralClient:
         self._last_ok_ts: float = 0.0
         # incremental TradePosted cache for bets_map (append-only)
         self._bets: Dict[str, Tuple[float, Optional[float]]] = {}
-        self._bets_synced: int = 0
+        self._bets_synced: int = DEPLOY_BLOCK
         self._block_ts: Dict[int, float] = {}
 
     # ------------------------------------------------------------- read API
@@ -638,10 +643,15 @@ class CollateralClient:
             tip = int(self.w3.eth.block_number)
             start = min(self._bets_synced, tip)
             ev = self.contract.events.TradePosted
-            try:
-                logs = ev.get_logs(from_block=start)
-            except TypeError:   # web3 < 7 spells the kwarg fromBlock
-                logs = ev.get_logs(fromBlock=start)
+            logs = []
+            for lo in range(start, tip + 1, GETLOGS_CHUNK):
+                hi = min(lo + GETLOGS_CHUNK - 1, tip)
+                try:
+                    logs.extend(ev.get_logs(from_block=lo, to_block=hi))
+                except TypeError:   # web3 < 7 spells the kwargs fromBlock
+                    logs.extend(ev.get_logs(fromBlock=lo, toBlock=hi))
+                if hi < tip:
+                    time.sleep(0.25)    # pace the backfill; archive 429s bursts
             for lg in logs:
                 ref = ("0x" + bytes(lg["args"]["hotkey"]).hex()
                        + f"|{int(lg['args']['tradeKey'])}")
@@ -658,6 +668,12 @@ class CollateralClient:
         except Exception as e:  # noqa: BLE001 - RPC layer raises many types
             logger.warning("bet log scan failed (%s); serving %d cached "
                            "bets", e, len(self._bets))
+        if not self._bets:
+            logger.warning(
+                "bets_map is EMPTY after a full scan: every FLOW trade will "
+                "be priced at zero skin. If miners have posted bets, this "
+                "validator's RPC is likely pruning logs — use an archive "
+                "endpoint (FLOW_COLLATERAL_RPC).")
         return dict(self._bets)
 
     # ------------------------------------------------------------ write API
