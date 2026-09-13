@@ -1,5 +1,5 @@
 # MIT License
-# Copyright (c) 2024 MANTIS
+# Copyright (c) 2026 MANTIS
 
 from __future__ import annotations
 
@@ -344,65 +344,65 @@ def _compute_multi_breakout_salience_old(
     return {hks[i]: float(w[i]) for i in range(N) if w[i] > 1e-6}
 
 
-def _assign_episodes(samples: List[CompletedBreakoutSample],
-                     gap_sidxs: int = 1440) -> np.ndarray:
-    """Group samples into temporal episodes.  Samples whose trigger_sidx
-    differ by <= *gap_sidxs* belong to the same episode.  Returns an
-    int array of episode IDs parallel to *samples*."""
-    n = len(samples)
-    sidxs = np.array([s.trigger_sidx for s in samples], dtype=np.int64)
-    order = np.argsort(sidxs, kind='stable')
-    ep_ids = np.empty(n, dtype=np.int32)
-    ep = 0
-    ep_ids[order[0]] = 0
-    for i in range(1, n):
-        if sidxs[order[i]] - sidxs[order[i - 1]] > gap_sidxs:
-            ep += 1
-        ep_ids[order[i]] = ep
-    return ep_ids
+BURN_KEY = "__burn__"
+
+
+def _auc_confidence(a: float, n1: int, n0: int) -> float:
+    """P(AUC > 0.5) via Hanley-McNeil, mapped to [0, 1]."""
+    from math import erf, sqrt
+    q1 = a / (2.0 - a)
+    q2 = 2.0 * a * a / (1.0 + a)
+    var = (a * (1 - a) + (n1 - 1) * (q1 - a * a)
+           + (n0 - 1) * (q2 - a * a)) / (n1 * n0)
+    if var <= 0:
+        return 1.0 if a > 0.5 else 0.0
+    z = (a - 0.5) / sqrt(var)
+    p = 0.5 * (1.0 + erf(z / sqrt(2.0)))
+    return max(0.0, min(1.0, 2.0 * p - 1.0))
 
 
 def compute_multi_breakout_salience(
     completed_samples: List[CompletedBreakoutSample],
-    min_episodes: int = 2,
+    min_span_sidxs: int = 2 * 7 * 1440,
     min_std: float = 0.03,
     min_auc: float = 0.50,
     meta_C: float = 0.01,
-    episode_gap_sidxs: int = 1440,
+    min_paid: float = 0.50,
     **_,
 ) -> Dict[str, float]:
-    """Compute salience using the same pattern as salience_binary_prediction:
-    L2 logistic on z-scored miner predictions, |coef| as importance.
-    Adapted for small samples with episode-based weighting."""
+    """L2 logistic on z-scored miner predictions, |coef| as importance.
+    Eligibility: predictions spanning >= min_span_sidxs (~2 weeks).
+    Each weight is scaled by confidence the miner's AUC beats chance;
+    at least min_paid of the pool is paid, the rest goes to BURN_KEY."""
     from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import roc_auc_score
 
     if len(completed_samples) < 50:
         return {}
 
-    ep_ids = _assign_episodes(completed_samples, episode_gap_sidxs)
-    n_episodes = int(ep_ids.max()) + 1
-
     me: Dict[str, list] = {}
     my: Dict[str, list] = {}
-    me_ep: Dict[str, list] = {}
-    for i, s in enumerate(completed_samples):
+    me_sidx: Dict[str, list] = {}
+    for s in completed_samples:
         for hk, v in s.embeddings.items():
             a = np.asarray(v, dtype=np.float32)
             if a.shape == (2,):
                 me.setdefault(hk, []).append(float(a[0]))
                 my.setdefault(hk, []).append(s.label)
-                me_ep.setdefault(hk, []).append(int(ep_ids[i]))
+                me_sidx.setdefault(hk, []).append(int(s.trigger_sidx))
 
     qualified: Dict[str, float] = {}
+    conf: Dict[str, float] = {}
     for hk in me:
         e, y = np.array(me[hk]), np.array(my[hk])
-        hk_episodes = len(set(me_ep[hk]))
-        if hk_episodes < min_episodes or e.std() < min_std or len(np.unique(y)) < 2:
+        span = max(me_sidx[hk]) - min(me_sidx[hk])
+        if span < min_span_sidxs or e.std() < min_std or len(np.unique(y)) < 2:
             continue
         a = roc_auc_score(y, e)
         if a > min_auc:
             qualified[hk] = a
+            n1 = int(y.sum())
+            conf[hk] = _auc_confidence(a, n1, len(y) - n1)
     if not qualified:
         return {}
 
@@ -427,17 +427,8 @@ def compute_multi_breakout_salience(
     zmat = (mat - col_mu) / col_std
     zmat = np.nan_to_num(zmat, nan=0.0)
 
-    if len(np.unique(labels)) < 2 or n_episodes < min_episodes:
+    if len(np.unique(labels)) < 2:
         return {}
-
-    ep_weights = np.zeros(T, dtype=np.float64)
-    for ep in range(n_episodes):
-        mask = ep_ids == ep
-        cnt = mask.sum()
-        if cnt > 0:
-            ep_weights[mask] = 1.0 / cnt
-    ep_weights /= ep_weights.sum()
-    ep_weights *= T
 
     clf = LogisticRegression(
         penalty="l2",
@@ -447,11 +438,20 @@ def compute_multi_breakout_salience(
         max_iter=1000,
         random_state=42,
     )
-    clf.fit(zmat, labels, sample_weight=ep_weights)
+    clf.fit(zmat, labels)
 
     w = np.abs(clf.coef_.ravel())
     if w.sum() < 1e-12:
         return {}
     w /= w.sum()
-    return {hks[i]: float(w[i]) for i in range(N) if w[i] > 1e-6}
 
+    # scale by confidence of edge; floor total payout, burn the rest
+    paid = w * np.array([conf[hks[i]] for i in range(N)])
+    tot = float(paid.sum())
+    if tot <= 0:
+        return {}
+    if tot < min_paid:
+        paid *= min_paid / tot
+    out = {hks[i]: float(paid[i]) for i in range(N) if paid[i] > 1e-6}
+    out[BURN_KEY] = max(0.0, 1.0 - float(sum(out.values())))
+    return out
