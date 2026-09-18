@@ -288,7 +288,7 @@ ASSET_EMBEDDING_DIMS = {c["ticker"]: c["dim"] for c in CHALLENGES}
 # Lowered from 0.45 alongside the TRADE-MIX v2 launch: the v2 mechanism
 # burns the unearned share of its 10% pool, so the effective total burn
 # stays roughly where it was.
-BURN_PCT = 0.35
+BURN_PCT = 0.45
 
 MAX_DAYS = 60
 
