@@ -520,8 +520,9 @@ def compute_flow_salience(
             scores[hk] = s * math.exp(-(h - st["last"]) / cfg.kappa_hours)
 
         pool = 1.0
-        cleared = {hk for hk, st in state.items()
-                   if st["latched"] and hk in scores}
+        # significance gate cut: every scoring miner shares the main pool
+        # from day one.  Latch state is still tracked for diagnostics.
+        cleared = set(scores)
         dust_pool = cfg.dust * pool
         main_pool = pool - dust_pool
         if cleared:
