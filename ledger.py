@@ -1235,6 +1235,17 @@ class DataLog:
             return None
         D = dim
 
+        # Rows newer than the payload timelock are still encrypted at scoring
+        # time and carry all-zero embeddings.  Truncate them (the pipeline is
+        # index-based, so rows cannot be dropped mid-series): fed through,
+        # every miner's argmax on those rows is bucket 0, which the LBFGS
+        # uniqueness penalty read as near-total overlap and collapsed the
+        # classifier path onto a single hotkey.
+        score_cutoff = max_block_number
+        maturity = int(getattr(config, "PAYLOAD_MATURITY_BLOCKS", 0) or 0)
+        if max_block_number and maturity > 0:
+            score_cutoff = int(max_block_number) - maturity
+
         rows: list[np.ndarray] = []
         prices: list[float] = []
         sidx_list: list[int] = []
@@ -1245,7 +1256,7 @@ class DataLog:
             (ticker,),
         ):
             block = int(sidx) * SAMPLE_EVERY
-            if max_block_number and block > max_block_number:
+            if score_cutoff and block > score_cutoff:
                 break
             if price is None:
                 continue
