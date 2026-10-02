@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import weakref
 from typing import Dict, Iterable, Optional, Tuple
 
 import numpy as np
@@ -438,19 +439,17 @@ def _reduce_hist_to_cohort_reps(
     return (X_red, hk2idx_red), full_to_rep
 
 
-# Single-entry cache so the q-path reuses the linear path's cohort scan
-# (both receive the same hist object within a single calc_worker cycle).
-_cohort_cache_key: object = None
+_cohort_cache_ref: Optional[weakref.ref] = None
 _cohort_cache_val: object = None
 
 
 def _cached_reduce(hist: Tuple[np.ndarray, Dict[str, int]]):
-    global _cohort_cache_key, _cohort_cache_val
-    key = id(hist[0])
-    if key == _cohort_cache_key and _cohort_cache_val is not None:
+    global _cohort_cache_ref, _cohort_cache_val
+    arr = hist[0]
+    if _cohort_cache_ref is not None and _cohort_cache_ref() is arr and _cohort_cache_val is not None:
         return _cohort_cache_val
     result = _reduce_hist_to_cohort_reps(hist)
-    _cohort_cache_key = key
+    _cohort_cache_ref = weakref.ref(arr)
     _cohort_cache_val = result
     return result
 
