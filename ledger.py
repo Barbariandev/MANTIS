@@ -1863,6 +1863,17 @@ class DataLog:
             for hk in json.loads(hks_json):
                 if hk not in hotkey_first_block:
                     hotkey_first_block[hk] = block
+        # challenge_data.hotkeys is only populated once a payload decrypts
+        # (PAYLOAD_MATURITY_BLOCKS after submission), so a hotkey's first
+        # week of activity is visible only in the still-encrypted queue.
+        # Without this, a new miner is invisible to the young-UID floor
+        # until its first payload matures.
+        for hk, block in conn.execute(
+            "SELECT rp.hotkey, MIN(b.block) FROM raw_payloads rp "
+            "JOIN blocks b ON rp.ts = b.idx GROUP BY rp.hotkey",
+        ):
+            if block is not None and (hk not in hotkey_first_block or int(block) < hotkey_first_block[hk]):
+                hotkey_first_block[hk] = int(block)
         conn.close()
         return hotkey_first_block
 
