@@ -1849,6 +1849,18 @@ class DataLog:
 
     @staticmethod
     def get_hotkey_first_blocks_from_db(db_path: str, sample_every: int) -> dict[str, int]:
+        """Block of each hotkey's first submission, reset on re-registration.
+
+        Hotkeys only appear in challenge_data PAYLOAD_MATURITY_BLOCKS after
+        submission, so the still-encrypted queue (raw_payloads) is scanned
+        too.  append_step writes a raw_payloads row for every metagraph
+        hotkey each step ('{}' when nothing was downloaded), so a hotkey
+        missing from raw_payloads for >= REREG_GAP_SAMPLES steps that the
+        validator did sample was deregistered in between; its first
+        submission after that gap starts a new young window.  An offline
+        but registered miner, or a validator outage, produces no such gap.
+        """
+        REREG_GAP_SAMPLES = 1440  # one day of sampled steps
         conn = sqlite3.connect(db_path, check_same_thread=False)
         _attach_flow(conn, db_path)
         hotkey_first_block: dict[str, int] = {}
@@ -1863,17 +1875,22 @@ class DataLog:
             for hk in json.loads(hks_json):
                 if hk not in hotkey_first_block:
                     hotkey_first_block[hk] = block
-        # challenge_data.hotkeys is only populated once a payload decrypts
-        # (PAYLOAD_MATURITY_BLOCKS after submission), so a hotkey's first
-        # week of activity is visible only in the still-encrypted queue.
-        # Without this, a new miner is invisible to the young-UID floor
-        # until its first payload matures.
-        for hk, block in conn.execute(
-            "SELECT rp.hotkey, MIN(b.block) FROM raw_payloads rp "
-            "JOIN blocks b ON rp.ts = b.idx GROUP BY rp.hotkey",
+        last_idx: dict[str, int] = {}
+        rereg_pending: set[str] = set()
+        for hk, idx, block, plen in conn.execute(
+            "SELECT rp.hotkey, b.idx, b.block, length(rp.payload) FROM raw_payloads rp "
+            "JOIN blocks b ON rp.ts = b.idx ORDER BY b.idx ASC",
         ):
-            if block is not None and (hk not in hotkey_first_block or int(block) < hotkey_first_block[hk]):
-                hotkey_first_block[hk] = int(block)
+            prev = last_idx.get(hk)
+            last_idx[hk] = int(idx)
+            if prev is not None and int(idx) - prev >= REREG_GAP_SAMPLES:
+                rereg_pending.add(hk)
+            if plen is not None and plen > 2:  # a real payload, not '{}'
+                if hk in rereg_pending or hk not in hotkey_first_block:
+                    hotkey_first_block[hk] = int(block)
+                    rereg_pending.discard(hk)
+                elif int(block) < hotkey_first_block[hk]:
+                    hotkey_first_block[hk] = int(block)
         conn.close()
         return hotkey_first_block
 
