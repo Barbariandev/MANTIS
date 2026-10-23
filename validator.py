@@ -411,7 +411,10 @@ async def run_main_loop(
 
                         uids = metagraph.uids.tolist()
 
-                        young_threshold = 36000
+                        # Protection must outlast the payload timelock: nothing a
+                        # miner submits is scorable until PAYLOAD_MATURITY_BLOCKS
+                        # later, and the scorers need evidence after that.
+                        young_threshold = 36000 + int(getattr(config, "PAYLOAD_MATURITY_BLOCKS", 0) or 0)
                         hotkey_first_block = DataLog.get_hotkey_first_blocks_from_db(
                             db_path, int(config.SAMPLE_EVERY),
                         )
@@ -425,26 +428,25 @@ async def run_main_loop(
                                     young_uids.add(uid)
                         weights_logger.info(f"Found {len(young_uids)} young UIDs by hotkey-first-nonzero (<{young_threshold} blocks).")
 
-                        mature_uid_scores = {uid: score for uid, score in sal.items() if uid not in young_uids}
-                        
-                        total_mature_score = sum(mature_uid_scores.values())
-                        
+                        # Young UIDs are scored like everyone else; the fixed
+                        # weight is a floor on top of what they earn, not a
+                        # replacement for it (a replacement capped a miner with
+                        # real salience at the lowest weight on the subnet).
+                        total_score = sum(sal.values())
+
                         fixed_weight_per_young_uid = 0.0001
-                        
+
                         active_young_uids = {uid for uid in young_uids if uid in uids}
-                        
-                        weight_for_mature_uids = 1.0 - (len(active_young_uids) * fixed_weight_per_young_uid)
-                        weight_for_mature_uids = max(0, weight_for_mature_uids)
 
                         final_weights = {}
 
-                        if total_mature_score > 0 and weight_for_mature_uids > 0:
-                            for uid, score in mature_uid_scores.items():
+                        if total_score > 0:
+                            for uid, score in sal.items():
                                 if uid in uids:
-                                    final_weights[uid] = (score / total_mature_score) * weight_for_mature_uids
-                        
+                                    final_weights[uid] = score / total_score
+
                         for uid in active_young_uids:
-                            final_weights[uid] = fixed_weight_per_young_uid
+                            final_weights[uid] = max(final_weights.get(uid, 0.0), fixed_weight_per_young_uid)
 
                         if not final_weights:
                             weights_logger.warning("No weights to set after processing.")
