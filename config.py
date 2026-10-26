@@ -95,7 +95,7 @@ CHALLENGES = [
         "dim": 3,
         "blocks_ahead": 500,
         "loss_func": "hitfirst",
-        "weight": 1.25,
+        "weight": 0,
     },
     {
         "name": "ETH-LBFGS",
