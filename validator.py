@@ -442,10 +442,6 @@ async def run_main_loop(
                                 if uid in uids:
                                     final_weights[uid] = score / total_score
 
-                        established = [w for uid, w in final_weights.items() if uid not in active_young_uids and uid != 0 and w > 0]
-                        if established:
-                            fixed_weight_per_young_uid = max(fixed_weight_per_young_uid, 1.5 * min(established))
-
                         for uid in active_young_uids:
                             final_weights[uid] = max(final_weights.get(uid, 0.0), fixed_weight_per_young_uid)
 
@@ -512,6 +508,14 @@ async def run_main_loop(
                             if new_w_tensor.sum() > 0:
                                 final_w = new_w_tensor / new_w_tensor.sum()
                         
+                        established = [float(final_w[i]) for i, uid in enumerate(uids) if uid not in active_young_uids and uid != 0 and final_w[i] > 0]
+                        if established:
+                            floor = 1.5 * min(established)
+                            for i, uid in enumerate(uids):
+                                if uid in active_young_uids and final_w[i] < floor:
+                                    final_w[i] = floor
+                            final_w = final_w / final_w.sum()
+
                         # Update normalized_weights for logging
                         normalized_weights = {uid: float(final_w[i]) for i, uid in enumerate(uids)}
                         
