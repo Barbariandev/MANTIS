@@ -222,13 +222,9 @@ TRADE_MIX_ASSETS = ["BTC", "ETH", "TAO", "SOL"]
 # close-only, a priced degradation (section 6.14), so the publisher
 # must ship the keys from challenge start.
 #
-# Timeline (announced 2026-07-31):
-#   2026-08-17  challenge live: validators collect and score payloads,
-#               gate evidence accrues, emission weight 0 (nothing paid).
-#   2026-09-14  after four weeks of payload collection, emissions turn on
-#               at FLOW_TARGET_FRACTION of the pool.  That flip is a
-#               deliberate one-line PR: set "weight" below to
-#               _FLOW_WEIGHT_AT_TURNON.  It is NOT automatic.
+# Timeline:
+#   2026-08-17  challenge live at emission weight 0.
+#   2026-10-26  emissions on at FLOW_TARGET_FRACTION of the pool.
 FLOW_TARGET_FRACTION = 0.25
 _FLOW_WEIGHT_AT_TURNON = (
     FLOW_TARGET_FRACTION * sum(c["weight"] for c in CHALLENGES) /
@@ -242,7 +238,7 @@ FLOW_CHALLENGE = {
     "dim": 28,                    # 4 regimes x [d, f, sl, tp1, tp2, h, trade_id]
     "blocks_ahead": 0,            # resolution is horizon-driven, not fixed-lag
     "loss_func": "flow",
-    "weight": float(os.environ.get("MANTIS_FLOW_WEIGHT", "0.0")),
+    "weight": float(os.environ.get("MANTIS_FLOW_WEIGHT", _FLOW_WEIGHT_AT_TURNON)),
     # --- launch parameters (release paper section 1.8)
     "delta": 0.30,
     "lam": 0.50,
@@ -332,6 +328,5 @@ DRAND_PUBLIC_KEY = (
     "8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb"
     "5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a"
 )
-
 
 
