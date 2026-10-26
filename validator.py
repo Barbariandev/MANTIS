@@ -28,7 +28,7 @@ import pickle
 
 import bt_compat
 from cycle import get_miner_payloads
-from model import multi_salience as sal_fn
+from model import LAST_CLUSTERS, multi_salience as sal_fn
 from flow import BURN_KEY as CHALLENGE_BURN_KEY
 from ledger import (DataLog, ensure_datalog, ensure_flow_datalog,
                     flow_db_path)
@@ -375,6 +375,7 @@ async def run_main_loop(
                                 json.dumps(
                                     {
                                         "block": int(block_snapshot),
+                                        "clusters": LAST_CLUSTERS,
                                         "total_challenge_weight": total_w,
                                         "per_challenge": {
                                             t: {
@@ -428,10 +429,6 @@ async def run_main_loop(
                                     young_uids.add(uid)
                         weights_logger.info(f"Found {len(young_uids)} young UIDs by hotkey-first-nonzero (<{young_threshold} blocks).")
 
-                        # Young UIDs are scored like everyone else; the fixed
-                        # weight is a floor on top of what they earn, not a
-                        # replacement for it (a replacement capped a miner with
-                        # real salience at the lowest weight on the subnet).
                         total_score = sum(sal.values())
 
                         fixed_weight_per_young_uid = 0.0001
@@ -444,6 +441,10 @@ async def run_main_loop(
                             for uid, score in sal.items():
                                 if uid in uids:
                                     final_weights[uid] = score / total_score
+
+                        established = [w for uid, w in final_weights.items() if uid not in active_young_uids and uid != 0 and w > 0]
+                        if established:
+                            fixed_weight_per_young_uid = max(fixed_weight_per_young_uid, 1.5 * min(established))
 
                         for uid in active_young_uids:
                             final_weights[uid] = max(final_weights.get(uid, 0.0), fixed_weight_per_young_uid)
@@ -487,8 +488,6 @@ async def run_main_loop(
                             weights_logger.warning("Zero-sum weights tensor, skipping set.")
                             return
                         
-                        # Apply EMA to reduce block-to-block variance (~6000 blocks average age)
-                        # WEIGHT_CALC_INTERVAL is 1000 blocks, so alpha=0.15 gives an average age of ~5666 blocks
                         old_weights_data = load_weights()
                         if old_weights_data is not None:
                             old_w = old_weights_data["weights"]
@@ -499,8 +498,8 @@ async def run_main_loop(
                                 old_hks = old_weights_data["hotkeys"]
                                 old_hk_to_w = {hk: float(old_w[i]) for i, hk in enumerate(old_hks) if i < len(old_w)}
                                 for i, hk in enumerate(metagraph.hotkeys):
-                                    old_val = old_hk_to_w.get(hk, 0.0)
                                     new_val = float(final_w[i])
+                                    old_val = old_hk_to_w.get(hk, new_val)
                                     new_w_tensor[i] = alpha * new_val + (1.0 - alpha) * old_val
                             else:
                                 old_uids = old_weights_data["uids"]
