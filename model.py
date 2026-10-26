@@ -24,7 +24,7 @@ from cluster import (
     find_correlated_cohorts,
     select_representatives,
 )
-from bucket_forecast import compute_lbfgs_salience, compute_q_path_salience
+from bucket_forecast import _cached_reduce, compute_lbfgs_salience, compute_q_path_salience
 from hitfirst import compute_hitfirst_salience
 from range_breakout import compute_multi_breakout_salience
 from xsec_rank import compute_xsec_rank_salience
@@ -635,6 +635,9 @@ def salience_binary_prediction(
     return {hk: (v / total_imp) for hk, v in imp_map.items()} if total_imp > 0 else {}
 
 
+LAST_CLUSTERS: Dict[str, Dict[str, List[str]]] = {}
+
+
 def multi_salience(
     training_data,
     *,
@@ -664,12 +667,11 @@ def multi_salience(
         items = sorted(((hk, float(v)) for hk, v in s.items() if float(v) > 0.0), key=lambda kv: -kv[1])
         if not items:
             return {}
-        tau = max(1.0, k / 3.0)
-        weighted = [(hk, v * np.exp(-rank / tau)) for rank, (hk, v) in enumerate(items)]
-        tot = float(sum(v for _hk, v in weighted))
+        items = items[:k]
+        tot = float(sum(v for _hk, v in items))
         if tot <= 0.0:
             return {}
-        return {hk: (v / tot) for hk, v in weighted if v / tot > 1e-6}
+        return {hk: (v / tot) for hk, v in items if v / tot > 1e-6}
 
     def _trim_hist_price(
         hist_in: tuple[np.ndarray, Dict[str, int]], price_in: object
@@ -810,6 +812,11 @@ def multi_salience(
             if loss_type == "lbfgs":
                 se = int(config.SAMPLE_EVERY)
                 s_cls = compute_lbfgs_salience(hist, price, blocks_ahead=blocks_ahead, sample_every=se)
+                groups: Dict[str, List[str]] = {}
+                for hk, rep in _cached_reduce(hist)[1].items():
+                    if hk != rep:
+                        groups.setdefault(rep, []).append(hk)
+                LAST_CLUSTERS[ticker] = {rep: sorted(ms) for rep, ms in groups.items()}
                 s_q = compute_q_path_salience(hist, price, blocks_ahead=blocks_ahead, sample_every=se)
                 if _is_uniform_salience(s_cls):
                     s_cls = {}
@@ -831,9 +838,6 @@ def multi_salience(
                     hist, price, blocks_ahead=blocks_ahead, sample_every=int(config.SAMPLE_EVERY),
                 )
                 if s:
-                    # The LBFGS path equalizes cohorts inside bucket_forecast
-                    # (_cached_reduce); hitfirst has no internal collapse, so
-                    # route it through the same two-tier representative set.
                     s = _apply_reps(s, _cluster_reps(hist, spec.get("dim"), ticker))
             del hist, price
         elif loss_type == "range_breakout_multi":
