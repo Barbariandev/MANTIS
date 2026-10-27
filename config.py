@@ -224,8 +224,8 @@ TRADE_MIX_ASSETS = ["BTC", "ETH", "TAO", "SOL"]
 #
 # Timeline:
 #   2026-08-17  challenge live at emission weight 0.
-#   2026-10-26  emissions on at FLOW_TARGET_FRACTION of the pool.
-FLOW_TARGET_FRACTION = 0.25
+#   2026-10-26  emissions on at FLOW_TARGET_FRACTION; raised toward 25% as the field grows.
+FLOW_TARGET_FRACTION = 0.05
 _FLOW_WEIGHT_AT_TURNON = (
     FLOW_TARGET_FRACTION * sum(c["weight"] for c in CHALLENGES) /
     (1.0 - FLOW_TARGET_FRACTION)
@@ -328,5 +328,3 @@ DRAND_PUBLIC_KEY = (
     "8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb"
     "5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a"
 )
-
-
