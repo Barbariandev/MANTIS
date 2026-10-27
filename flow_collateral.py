@@ -75,6 +75,7 @@ the Solidity sources are not in the validator archive.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import time
@@ -531,6 +532,33 @@ class CollateralClient:
         self._bets: Dict[str, Tuple[float, Optional[float]]] = {}
         self._bets_synced: int = DEPLOY_BLOCK
         self._block_ts: Dict[int, float] = {}
+        self._load_bets_cache()
+
+    def _bets_cache_path(self) -> str:
+        try:
+            from config import STORAGE_DIR as d
+        except Exception:
+            d = ".storage"
+        return os.path.join(d, f"flow_bets_{self.contract.address.lower()}.json")
+
+    def _load_bets_cache(self) -> None:
+        try:
+            with open(self._bets_cache_path()) as f:
+                d = json.load(f)
+            self._bets = {k: (float(v[0]), v[1]) for k, v in d["bets"].items()}
+            self._bets_synced = int(d["synced"])
+        except Exception:
+            pass
+
+    def _save_bets_cache(self) -> None:
+        p = self._bets_cache_path()
+        try:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p + ".tmp", "w") as f:
+                json.dump({"synced": self._bets_synced, "bets": self._bets}, f)
+            os.replace(p + ".tmp", p)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("bets cache write failed (%s)", e)
 
     # ------------------------------------------------------------- read API
 
@@ -641,33 +669,34 @@ class CollateralClient:
         """
         try:
             tip = int(self.w3.eth.block_number)
-            start = min(self._bets_synced, tip)
+            lo = min(self._bets_synced, tip)
             ev = self.contract.events.TradePosted
-            logs = []
-            for lo in range(start, tip + 1, GETLOGS_CHUNK):
+            while lo <= tip:
                 hi = min(lo + GETLOGS_CHUNK - 1, tip)
                 try:
-                    logs.extend(ev.get_logs(from_block=lo, to_block=hi))
+                    logs = ev.get_logs(from_block=lo, to_block=hi)
                 except TypeError:   # web3 < 7 spells the kwargs fromBlock
-                    logs.extend(ev.get_logs(fromBlock=lo, toBlock=hi))
-                if hi < tip:
-                    time.sleep(0.25)    # pace the backfill; archive 429s bursts
-            for lg in logs:
-                ref = ("0x" + bytes(lg["args"]["hotkey"]).hex()
-                       + f"|{int(lg['args']['tradeKey'])}")
-                if ref in self._bets:
-                    continue    # immutable: first sighting wins
-                bn = int(lg["blockNumber"])
-                if bn not in self._block_ts:
-                    self._block_ts[bn] = float(
-                        self.w3.eth.get_block(bn)["timestamp"])
-                self._bets[ref] = (
-                    int(lg["args"]["collateralRao"]) / RAO_PER_ALPHA,
-                    self._block_ts[bn])
-            self._bets_synced = tip
+                    logs = ev.get_logs(fromBlock=lo, toBlock=hi)
+                for lg in logs:
+                    ref = ("0x" + bytes(lg["args"]["hotkey"]).hex()
+                           + f"|{int(lg['args']['tradeKey'])}")
+                    if ref in self._bets:
+                        continue    # immutable: first sighting wins
+                    bn = int(lg["blockNumber"])
+                    if bn not in self._block_ts:
+                        self._block_ts[bn] = float(
+                            self.w3.eth.get_block(bn)["timestamp"])
+                    self._bets[ref] = (
+                        int(lg["args"]["collateralRao"]) / RAO_PER_ALPHA,
+                        self._block_ts[bn])
+                self._bets_synced = hi + 1
+                lo = hi + 1
+                if lo <= tip:
+                    time.sleep(0.25)
         except Exception as e:  # noqa: BLE001 - RPC layer raises many types
-            logger.warning("bet log scan failed (%s); serving %d cached "
-                           "bets", e, len(self._bets))
+            logger.warning("bet log scan failed (%s); synced to %d, serving "
+                           "%d cached bets", e, self._bets_synced, len(self._bets))
+        self._save_bets_cache()
         if not self._bets:
             logger.warning(
                 "bets_map is EMPTY after a full scan: every FLOW trade will "
