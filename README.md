@@ -61,7 +61,7 @@ All challenges are defined in `config.py` under `CHALLENGES`. Each specifies a `
 | MULTI-BREAKOUT | `MULTIBREAKOUT` | 2/asset | event | `range_breakout_multi` | 5.0 | Range breakout continuation/reversal (33 assets) |
 | XSEC-RANK | `MULTIXSEC` | 1/asset | 1200 (4h) | `xsec_rank` | 3.0 | Cross-sectional return ranking (33 assets) |
 | FUNDING-XSEC | `FUNDINGXSEC` | 1/asset | 2400 (8h) | `funding_xsec` | 4.0 | Cross-sectional funding rate ranking (20 assets) |
-| FLOW-BTC | `FLOW` | 28 | horizon-driven, 1–336h | `flow` | 7.458 (25%, emissions on since 2026-10-26) | Capital-at-risk BTC bracket trades, evidence-gated payment |
+| FLOW-BTC | `FLOW` | 28 | horizon-driven, 1–336h | `flow` | 1.178 (5% since 2026-10-26; rising toward 25% as the field grows) | Capital-at-risk BTC bracket trades, evidence-gated payment |
 
 TRADE-MIX is deprecated as of the FLOW launch (2026-08-17): off the
 active roster, historical challenge data purged from validator
