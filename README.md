@@ -51,17 +51,17 @@ All challenges are defined in `config.py` under `CHALLENGES`. Each specifies a `
 | Challenge | Ticker | dim | Horizon | loss_func | Weight | Description |
 |---|---|---|---|---|---|---|
 | ETH-1H-BINARY | `ETH` | 2 | 300 (1h) | `binary` | 1.0 | Binary direction prediction |
-| CADUSD-1H-BINARY | `CADUSD` | 2 | 300 | `binary` | 0.5 | " |
-| NZDUSD-1H-BINARY | `NZDUSD` | 2 | 300 | `binary` | 0.5 | " |
-| CHFUSD-1H-BINARY | `CHFUSD` | 2 | 300 | `binary` | 1.0 | " |
-| XAGUSD-1H-BINARY | `XAGUSD` | 2 | 300 | `binary` | 1.0 | " |
+| CADUSD-1H-BINARY | `CADUSD` | 2 | 300 | `binary` | 0 | " |
+| NZDUSD-1H-BINARY | `NZDUSD` | 2 | 300 | `binary` | 0 | " |
+| CHFUSD-1H-BINARY | `CHFUSD` | 2 | 300 | `binary` | 0 | " |
+| XAGUSD-1H-BINARY | `XAGUSD` | 2 | 300 | `binary` | 0 | " |
 | ETH-HITFIRST | `ETHHITFIRST` | 3 | 500 | `hitfirst` | 0 (sunsetting) | Barrier-hit direction |
 | ETH-LBFGS | `ETHLBFGS` | 17 | 300 (1h) | `lbfgs` | 3.5 | Volatility regime + quantile paths |
 | BTC-LBFGS-6H | `BTCLBFGS` | 17 | 1800 (6h) | `lbfgs` | 2.875 | " |
 | MULTI-BREAKOUT | `MULTIBREAKOUT` | 2/asset | event | `range_breakout_multi` | 5.0 | Range breakout continuation/reversal (33 assets) |
 | XSEC-RANK | `MULTIXSEC` | 1/asset | 1200 (4h) | `xsec_rank` | 3.0 | Cross-sectional return ranking (33 assets) |
 | FUNDING-XSEC | `FUNDINGXSEC` | 1/asset | 2400 (8h) | `funding_xsec` | 4.0 | Cross-sectional funding rate ranking (20 assets) |
-| FLOW-BTC | `FLOW` | 28 | horizon-driven, 1–336h | `flow` | 1.178 (5% since 2026-10-26; rising toward 25% as the field grows) | Capital-at-risk BTC bracket trades, evidence-gated payment |
+| FLOW-BTC | `FLOW` | 28 | horizon-driven, 1–336h | `flow` | 1.020 (5% since 2026-10-26; rising toward 25% as the field grows) | Capital-at-risk BTC bracket trades, evidence-gated payment |
 
 TRADE-MIX is deprecated as of the FLOW launch (2026-08-17): off the
 active roster, historical challenge data purged from validator
@@ -247,7 +247,7 @@ Training data is streamed via generator iteration, not loaded into memory.
 | `TASK_INTERVAL` | 500 blocks | `config.py` |
 | `WEIGHT_CALC_INTERVAL` | 1000 blocks | `config.py` |
 | `WEIGHT_SET_INTERVAL` | 360 blocks | `config.py` |
-| `BURN_PCT` | 0.45 (UID 0) | `config.py` |
+| `BURN_PCT` | 0.52 (UID 0) | `config.py` |
 | `MAX_DAYS` | 60 | `config.py` |
 | `EMA alpha` | 0.3 | `validator.py` |
 | `TOP_K` (feature selection) | 20 | `funding_xsec.py`, `xsec_rank.py` |
