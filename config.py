@@ -121,7 +121,7 @@ CHALLENGES = [
         "dim": 2,
         "blocks_ahead": 300,
         "loss_func": "binary",
-        "weight": 0.5,
+        "weight": 0,
     },
     {
         "name": "NZDUSD-1H-BINARY",
@@ -129,7 +129,7 @@ CHALLENGES = [
         "dim": 2,
         "blocks_ahead": 300,
         "loss_func": "binary",
-        "weight": 0.5,
+        "weight": 0,
     },
     {
         "name": "CHFUSD-1H-BINARY",
@@ -137,7 +137,7 @@ CHALLENGES = [
         "dim": 2,
         "blocks_ahead": 300,
         "loss_func": "binary",
-        "weight": 1,
+        "weight": 0,
     },
     {
         "name": "XAGUSD-1H-BINARY",
@@ -145,7 +145,7 @@ CHALLENGES = [
         "dim": 2,
         "blocks_ahead": 300,
         "loss_func": "binary",
-        "weight": 1,
+        "weight": 0,
     },
 ]
 
@@ -281,10 +281,7 @@ CHALLENGE_MAP = {c["ticker"]: c for c in CHALLENGES}
 CHALLENGE_NAME_TO_TICKER = {c["name"]: c["ticker"] for c in CHALLENGES}
 ASSET_EMBEDDING_DIMS = {c["ticker"]: c["dim"] for c in CHALLENGES}
 
-# Lowered from 0.45 alongside the TRADE-MIX v2 launch: the v2 mechanism
-# burns the unearned share of its 10% pool, so the effective total burn
-# stays roughly where it was.
-BURN_PCT = 0.45
+BURN_PCT = 0.52
 
 MAX_DAYS = 60
 
