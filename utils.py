@@ -22,12 +22,68 @@ def rolling_std_fast(x: np.ndarray, window: int) -> np.ndarray:
     return np.sqrt(np.maximum(var, 0.0))
 
 
+def rolling_std_nan(x: np.ndarray, window: int, min_count: int | None = None) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    n = int(x.shape[0])
+    w = int(window)
+    if n < w:
+        return np.full(0, np.nan)
+    ok = np.isfinite(x)
+    xz = np.where(ok, x, 0.0)
+    mu = float(np.mean(xz[ok])) if np.any(ok) else 0.0
+    xc = np.where(ok, xz - mu, 0.0)
+    c0 = np.concatenate(([0.0], np.cumsum(ok.astype(np.float64))))
+    c1 = np.concatenate(([0.0], np.cumsum(xc)))
+    c2 = np.concatenate(([0.0], np.cumsum(xc * xc)))
+    cnt = c0[w:] - c0[:-w]
+    s1 = c1[w:] - c1[:-w]
+    s2 = c2[w:] - c2[:-w]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        var = (s2 - (s1 * s1) / np.maximum(cnt, 1.0)) / np.maximum(cnt - 1.0, 1.0)
+    out = np.sqrt(np.maximum(var, 0.0))
+    need = int(min_count) if min_count is not None else max(2, w // 2)
+    out[cnt < need] = np.nan
+    return out
+
+
+def forward_index(sidx: np.ndarray, steps: int) -> np.ndarray:
+    sidx = np.asarray(sidx, dtype=np.int64)
+    tgt = sidx + int(steps)
+    j = np.searchsorted(sidx, tgt)
+    jc = np.minimum(j, sidx.size - 1)
+    ok = (j < sidx.size) & (sidx[jc] == tgt)
+    return np.where(ok, jc, -1)
+
+
+def forward_log_return(
+    price: np.ndarray,
+    horizon_steps: int,
+    sidx: np.ndarray | None = None,
+    eps: float = EPS,
+) -> np.ndarray:
+    price = np.asarray(price, dtype=float)
+    h = int(horizon_steps)
+    T = int(price.shape[0])
+    n = T - h
+    if n <= 0:
+        return np.zeros(0, dtype=float)
+    lp = np.log(price + eps)
+    if sidx is None:
+        return lp[h:] - lp[:-h]
+    j = forward_index(sidx, h)[:n]
+    r = np.full(n, np.nan)
+    ok = j >= 0
+    r[ok] = lp[j[ok]] - lp[:n][ok]
+    return r
+
+
 def sigma_from_price(
     price: np.ndarray,
     *,
     return_horizon_steps: int,
     vol_window: int,
     eps: float = EPS,
+    sidx: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Rolling sigma at time t computed from *past* log returns over `return_horizon_steps`.
@@ -43,11 +99,11 @@ def sigma_from_price(
     if T <= h:
         return np.full(T, np.nan)
 
-    r_fwd = np.log(price[h:] + eps) - np.log(price[:-h] + eps)
+    r_fwd = forward_log_return(price, h, sidx, eps)
     n = int(r_fwd.shape[0])
 
     sig_fwd = np.full(n, np.nan)
-    sig_raw = rolling_std_fast(r_fwd, int(vol_window))
+    sig_raw = rolling_std_fast(r_fwd, int(vol_window)) if sidx is None else rolling_std_nan(r_fwd, int(vol_window))
     if sig_raw.size > 0:
         sig_fwd[int(vol_window) - 1 :] = sig_raw
 
@@ -64,6 +120,7 @@ def make_bins_from_price(
     sigma_return_horizon_steps: int | None = None,
     vol_window: int = 7200,
     eps: float = EPS,
+    sidx: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Returns:
@@ -85,12 +142,12 @@ def make_bins_from_price(
     if T <= horizon:
         return np.zeros(0, dtype=int), np.zeros(0, dtype=int)
 
-    r = np.log(price[horizon:] + eps) - np.log(price[:-horizon] + eps)
-    sigma_t = sigma_from_price(price, return_horizon_steps=sig_h, vol_window=int(vol_window), eps=eps)
+    r = forward_log_return(price, horizon, sidx, eps)
+    sigma_t = sigma_from_price(price, return_horizon_steps=sig_h, vol_window=int(vol_window), eps=eps, sidx=sidx)
     sigma_start = sigma_t[: r.shape[0]]
 
     idx_all = np.arange(r.shape[0], dtype=int)
-    valid_mask = np.isfinite(sigma_start) & (sigma_start > 0.0)
+    valid_mask = np.isfinite(sigma_start) & (sigma_start > 0.0) & np.isfinite(r)
     valid_idx = idx_all[valid_mask]
     if valid_idx.size == 0:
         return np.zeros(0, dtype=int), np.zeros(0, dtype=int)
