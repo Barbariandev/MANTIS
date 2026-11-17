@@ -700,7 +700,11 @@ def multi_salience(
         trimmed = _trim_hist_price(hist, price_raw)
         if trimmed[0] is None:
             return None
-        return trimmed[0], trimmed[1], blocks_ahead
+        sidx = payload.get("sidx")
+        if sidx is not None:
+            sidx = np.asarray(sidx, dtype=np.int64)
+            sidx = sidx[-trimmed[1].shape[0]:] if sidx.shape[0] >= trimmed[1].shape[0] else None
+        return trimmed[0], trimmed[1], blocks_ahead, sidx
 
     # Cap on rows fed to the cohort detectors.  Correlation estimates
     # saturate long before this; the cap bounds the F @ F.T cost for
@@ -808,16 +812,16 @@ def multi_salience(
             del payload
             if extracted is None:
                 continue
-            hist, price, blocks_ahead = extracted
+            hist, price, blocks_ahead, sidx = extracted
             if loss_type == "lbfgs":
                 se = int(config.SAMPLE_EVERY)
-                s_cls = compute_lbfgs_salience(hist, price, blocks_ahead=blocks_ahead, sample_every=se)
+                s_cls = compute_lbfgs_salience(hist, price, blocks_ahead=blocks_ahead, sample_every=se, sidx=sidx)
                 groups: Dict[str, List[str]] = {}
                 for hk, rep in _cached_reduce(hist)[1].items():
                     if hk != rep:
                         groups.setdefault(rep, []).append(hk)
                 LAST_CLUSTERS[ticker] = {rep: sorted(ms) for rep, ms in groups.items()}
-                s_q = compute_q_path_salience(hist, price, blocks_ahead=blocks_ahead, sample_every=se)
+                s_q = compute_q_path_salience(hist, price, blocks_ahead=blocks_ahead, sample_every=se, sidx=sidx)
                 if _is_uniform_salience(s_cls):
                     s_cls = {}
                 if _is_uniform_salience(s_q):
