@@ -11,10 +11,13 @@ from cluster import equalize_within_cluster
 from utils import (
     EPS,
     MIN_REQUIRED_SAMPLES,
+    forward_index,
+    forward_log_return,
     logit,
     make_bins_from_price,
     recent_mass_weights,
     rolling_std_fast,
+    rolling_std_nan,
 )
 
 logger = logging.getLogger(__name__)
@@ -246,6 +249,7 @@ def compute_linear_salience(
     sample_every: int,
     max_epochs: int = 80,
     device: str = "cpu",
+    sidx: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     """Walk-forward stacked-ensemble salience on deduplicated signals.
 
@@ -278,7 +282,7 @@ def compute_linear_salience(
     horizon_steps = max(1, int(round(blocks_ahead / max(1, sample_every))))
     vol_window = max(required // 2, 1000)
     y_all, valid_idx = make_bins_from_price(
-        price_arr, horizon_steps=horizon_steps, vol_window=vol_window
+        price_arr, horizon_steps=horizon_steps, vol_window=vol_window, sidx=sidx
     )
     if valid_idx.size < required:
         return {}
@@ -475,6 +479,7 @@ def compute_lbfgs_salience(
     min_days: float = 5.0,
     half_life_days: float = 5.0,
     use_class_weights: bool = True,
+    sidx: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     reduced_hist, full_to_rep = _cached_reduce(hist)
     s = compute_linear_salience(
@@ -482,6 +487,7 @@ def compute_lbfgs_salience(
         price_data,
         blocks_ahead=blocks_ahead,
         sample_every=sample_every,
+        sidx=sidx,
     )
     if full_to_rep:
         s = equalize_within_cluster(s, full_to_rep)
@@ -497,6 +503,7 @@ def compute_q_path_salience(
     half_life_days: float = 5.0,
     sigma_minutes: int = 60,
     gating_classes: Iterable[int] = (0, 1, 3, 4),
+    sidx: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     """Q-path scorer on the deduplicated hotkey set; cluster mass is
     equalised across members on the way out."""
@@ -510,10 +517,34 @@ def compute_q_path_salience(
         half_life_days=half_life_days,
         sigma_minutes=sigma_minutes,
         gating_classes=gating_classes,
+        sidx=sidx,
     )
     if full_to_rep:
         s = equalize_within_cluster(s, full_to_rep)
     return s
+
+
+def _range_extrema(x: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    n = hi - lo + 1
+    levels = int(np.floor(np.log2(max(int(n.max()), 1)))) + 1
+    mx = [np.asarray(x, dtype=float)]
+    mn = [np.asarray(x, dtype=float)]
+    for k in range(1, levels):
+        half = 1 << (k - 1)
+        mx.append(np.maximum(mx[-1][:-half], mx[-1][half:]))
+        mn.append(np.minimum(mn[-1][:-half], mn[-1][half:]))
+    k = np.floor(np.log2(n)).astype(int)
+    out_mx = np.empty(lo.shape[0], dtype=float)
+    out_mn = np.empty(lo.shape[0], dtype=float)
+    for kk in range(levels):
+        m = k == kk
+        if not np.any(m):
+            continue
+        a = lo[m]
+        b = hi[m] - (1 << kk) + 1
+        out_mx[m] = np.maximum(mx[kk][a], mx[kk][b])
+        out_mn[m] = np.minimum(mn[kk][a], mn[kk][b])
+    return out_mx, out_mn
 
 
 def _compute_q_path_salience_impl(
@@ -525,6 +556,7 @@ def _compute_q_path_salience_impl(
     half_life_days: float = 5.0,
     sigma_minutes: int = 60,
     gating_classes: Iterable[int] = (0, 1, 3, 4),
+    sidx: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     """
     Q-path salience: 12 independent balanced binary LogReg models
@@ -562,33 +594,39 @@ def _compute_q_path_salience_impl(
         return {}
 
     vol_window = max(required // 2, 1000)
-    y_all, valid_idx = make_bins_from_price(price, horizon_steps=horizon_steps, vol_window=vol_window)
+    y_all, valid_idx = make_bins_from_price(price, horizon_steps=horizon_steps, vol_window=vol_window, sidx=sidx)
     y_r = np.full(len_r, -1, dtype=int)
     if valid_idx.size > 0:
         y_r[valid_idx] = y_all
 
-    r_h = np.log(price[horizon_steps:] + EPS) - np.log(price[:-horizon_steps] + EPS)
+    r_h = forward_log_return(price, horizon_steps, sidx, EPS)
     vol_window_q = int(max(MIN_REQUIRED_SAMPLES, 10))
-    sig_raw = rolling_std_fast(r_h, vol_window_q)
+    sig_raw = rolling_std_fast(r_h, vol_window_q) if sidx is None else rolling_std_nan(r_h, vol_window_q)
     sigma_h = np.full(len_r, np.nan)
     if sig_raw.size > 0:
         sigma_h[vol_window_q - 1 :] = sig_raw
 
     logp = np.log(price + EPS)
-    from numpy.lib.stride_tricks import sliding_window_view
-
-    win = sliding_window_view(logp, int(horizon_steps) + 1)
-    max_lp = win.max(axis=1)
-    min_lp = win.min(axis=1)
-
     t0 = np.arange(1, len_r, dtype=int)
     base_lp = logp[t0 - 1]
-    up = max_lp[t0] - base_lp
-    dn = min_lp[t0] - base_lp
+    if sidx is None:
+        from numpy.lib.stride_tricks import sliding_window_view
+
+        win = sliding_window_view(logp, int(horizon_steps) + 1)
+        up = win.max(axis=1)[t0] - base_lp
+        dn = win.min(axis=1)[t0] - base_lp
+        path_ok = np.ones(t0.shape[0], dtype=bool)
+    else:
+        j_end = forward_index(sidx, horizon_steps)[t0 - 1]
+        path_ok = j_end >= 0
+        hi = np.where(path_ok, j_end, t0)
+        mx, mn = _range_extrema(logp, t0, hi)
+        up = mx - base_lp
+        dn = mn - base_lp
     sig = sigma_h[t0]
     y_bucket = y_r[t0]
 
-    valid_common = np.isfinite(sig) & (sig > 0.0) & (y_bucket >= 0)
+    valid_common = np.isfinite(sig) & (sig > 0.0) & (y_bucket >= 0) & path_ok
     if not np.any(valid_common):
         return {}
 
