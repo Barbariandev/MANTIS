@@ -50,13 +50,11 @@ for _k, _v in (
     ("OMP_DYNAMIC", "FALSE"),
     ("PYTHONHASHSEED", "0"),
     ("CUBLAS_WORKSPACE_CONFIG", ":4096:8"),
+    # Scoring is pure numpy/sklearn; hide CUDA unconditionally so GPU and CPU
+    # validators always execute the exact same numerical path.
+    ("CUDA_VISIBLE_DEVICES", ""),
 ):
-    os.environ.setdefault(_k, _v)
-# CUDA is hidden by default — the scoring path is pure numpy/sklearn, so
-# disabling GPU at the env layer guarantees that GPU and CPU validators take
-# exactly the same numerical path.  Set MANTIS_ALLOW_CUDA=1 to opt in.
-if os.environ.get("MANTIS_ALLOW_CUDA", "").lower() not in ("1", "true", "yes"):
-    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+    os.environ[_k] = _v
 
 DATALOG_ARCHIVE_URL = "https://pub-879ad825983e43529792665f4f510cd6.r2.dev/datalog.db"
 
@@ -238,7 +236,7 @@ FLOW_CHALLENGE = {
     "dim": 28,                    # 4 regimes x [d, f, sl, tp1, tp2, h, trade_id]
     "blocks_ahead": 0,            # resolution is horizon-driven, not fixed-lag
     "loss_func": "flow",
-    "weight": float(os.environ.get("MANTIS_FLOW_WEIGHT", _FLOW_WEIGHT_AT_TURNON)),
+    "weight": _FLOW_WEIGHT_AT_TURNON,
     # --- launch parameters (release paper section 1.8)
     "delta": 0.30,
     "lam": 0.50,
@@ -256,19 +254,136 @@ FLOW_CHALLENGE = {
 
 CHALLENGES.append(FLOW_CHALLENGE)
 
+# LOOP: the autoresearch challenge.  Miners design autoresearch
+# pipelines, publish their source with their own SayGM (gm_live_...)
+# key sealed to LOOP's rotating round key, and the auditor (the UID 0
+# validator) runs them sealed in daily rounds via loop-keyd: any SayGM
+# (SN28) model, experiments on the protocol's harness.  OpenRouter is
+# not used.
+# Trades are scored on FLOW criteria (same decoder/EWMA/gate machinery,
+# f-only skin); the audit checks each dossier is the runner's, replays
+# its numbers, and has a frontier model judge the pipeline against the
+# LOOP ruleset (autoresearch/audit.py).  Its multiplier gates the payout
+# — unearned mass burns.
+#
+# All consensus, security, sandbox, provider, and slot parameters below
+# are hardcoded in config.py (never overridable by environment variables)
+# so neither accidental shell state nor a tampered .env can weaken
+# isolation or diverge validator weight vectors.
+BT_NETWORK = "finney"
+
+LOOP_TARGET_FRACTION = 0.05
+_LOOP_WEIGHT_AT_TURNON = (
+    LOOP_TARGET_FRACTION * sum(c["weight"] for c in CHALLENGES) /
+    (1.0 - LOOP_TARGET_FRACTION)
+)
+
+AUTORESEARCH_CHALLENGE = {
+    "name": "LOOP-AUTORESEARCH",
+    "ticker": "LOOP",
+    "assets": ["BTC"],
+    "dim": 28,                    # FLOW wire format: 4 regimes x 7 fields
+    "blocks_ahead": 0,            # horizon-driven, like FLOW
+    "loss_func": "autoresearch",
+    "weight": _LOOP_WEIGHT_AT_TURNON,
+    # trade scoring inherits FlowConfig defaults (flow.py section 1.8)
+    # --- audit gate
+    # every validator, the auditor included, pays on the auditor's
+    # signed verdict map (weight consensus; see autoresearch/audit.py::
+    # ChainFeed).  The auditor is whoever holds UID 0 — the subnet
+    # owner's validator — read from the chain, as is where its verdicts
+    # are served (its on-chain commitment).
+    "auditor_hotkey": "",
+    "audit_db": "",
+    "audit_netuid": NETUID,
+    "audit_feed_url": "",
+    # the last verified verdict map, kept so a restart with the feed
+    # unreachable keeps paying on it rather than diverging
+    "audit_feed_cache": os.path.join(STORAGE_DIR, "loop_verdicts.json"),
+    # multiplier for hotkeys with no audited dossier: 0.0 = no research,
+    # no pay (hardcoded; never allow unaudited payouts).
+    "audit_default": 0.0,
+    # --- frontier credits (Refinery-style): beating the best audited
+    # FLOW EWMA score books a credit equal to the advance, halving every
+    # half-life and expiring after four; no live credit, the slice burns
+    "credit_half_life_h": 336.0,
+}
+
+CHALLENGES.append(AUTORESEARCH_CHALLENGE)
+
+# --- LOOP SayGM (SN28) inference & security constants (hardcoded) -------
+# Only secret credentials (SAYGM_API_KEY, optional RUNPOD_API_KEY) live
+# in environment variables; all URLs, caps, sandboxes, and paths live here.
+SAYGM_BASE_URL = "https://api.saygm.com/v1"
+LOOP_SAYGM_MAX_BALANCE_USD = 100.0    # max USD balance accepted on a miner gm_live_ burner key
+LOOP_GATEWAY_URL = ""                 # production has no HTTP submission gateway
+RUNPOD_ENDPOINTS: dict = {}
+
+# Mandatory sandbox & attestation enforcement in production rounds:
+LOOP_SANDBOX = "gvisor"
+LOOP_RUNSC_PATHS = (
+    "/usr/local/bin/runsc",
+    "/usr/bin/runsc",
+    "/opt/gvisor/runsc",
+)
+LOOP_ALLOW_UNSEALED = False
+
+# Frontier audit judge & pre-execution escape screen (SayGM SN28 slugs):
+LOOP_AUDIT_JUDGES = ["gpt-6-astra"]
+LOOP_SCREEN_MODELS = [
+    "kimi-k3.1-pro-tee",
+    "qwen3.5-397b-a17b-tee",
+    "qwen3.8-27b",
+]
+
+# --- LOOP 24h rounds, key separation & filesystem paths -----------------
+LOOP_UID0_HOTKEY = "5GxsywPcZyWVYYJ7iuJpfmtujaA695M4FMCiqNRRcqNba82o"
+OWNER_HPKE_PRIVATE_KEY_PATH = os.path.expanduser(
+    "~/.mantis/owner_hpke_x25519.pem")
+LOOP_SEAL_KEYRING_DIR = (
+    "/var/lib/loop-keyd/seal_keys"
+    if os.path.isdir("/var/lib/loop-keyd")
+    else os.path.expanduser("~/.mantis/loop_seal_keys")
+)
+LOOP_SEAL_RETENTION_DAYS = 5
+LOOP_SEAL_PUBLIC_KEY_HEX = ""         # empty = miners verify <LOOP_PUBLIC_URL>/seal_keys.json
+LOOP_SEAL_FETCH_LIVE = True           # verify live signed seal_keys.json; fail closed on error
+LOOP_KEYD_SOCKET = "/run/loop-keyd/keyd.sock"
+
+LOOP_LEDGER_DB = os.path.join(STORAGE_DIR, "loop_credits.db")
+LOOP_AUDIT_DB = os.path.join(STORAGE_DIR, "loop_audit.db")
+LOOP_DASHBOARD_DIR = os.path.join(STORAGE_DIR, "loop_dashboard")
+LOOP_ROUND_JOURNAL_DIR = os.path.join(PROJECT_ROOT, "logs", "loop")
+
+# Where the round dashboard (LOOP_DASHBOARD_DIR, redrawn every round) is
+# served: the same public bucket as the datalog archive.  After every
+# round the signed verdict map lands in it as verdicts/<digest>.json and
+# the auditor commits a pointer to that file on chain (<= 71 chars).
+LOOP_PUBLIC_URL = "https://pub-879ad825983e43529792665f4f510cd6.r2.dev/loop"
+LOOP_DASHBOARD_URL = LOOP_PUBLIC_URL + "/index.html"
+
+# --- LOOP round wall-clock & per-run cgroup v2 slot geometry ------------
+LOOP_ROUND_RUN_HOURS = 20.0
+LOOP_MAX_RUN_SECONDS = 43200
+LOOP_PAUSE_GRACE_SECONDS = 20.0
+LOOP_RESUME_WINDOW_SECONDS = 259200.0
+LOOP_HOLDOUT_BARS = 480
+LOOP_RUN_SLOTS = 20
+LOOP_RUN_CPUS = 1
+LOOP_RUN_MEMORY_MB = 4096
+LOOP_RUN_SCRATCH_MB = 64
+LOOP_RUN_PIDS = 512
+
 # Live FlowCollateralPool on Bittensor EVM mainnet (chain id 964).
 # Deployed 2026-08-16 in block 8859422; week 1 opens at periodZero.
-# Env overrides; FLOW_COLLATERAL_ADDRESS=off disables collateral reads.
-FLOW_COLLATERAL_ADDRESS = os.environ.get(
-    "FLOW_COLLATERAL_ADDRESS",
-    "0xD9c805202b16671A2901307fBC9A8750E2453427",
-).strip()
+FLOW_COLLATERAL_ADDRESS = "0xD9c805202b16671A2901307fBC9A8750E2453427"
 # archive, not lite: lite prunes event logs and returns [] without error,
 # which silently prices every bet at zero (all FLOW emission burns)
-FLOW_COLLATERAL_RPC = os.environ.get(
-    "FLOW_COLLATERAL_RPC",
-    "https://archive.chain.opentensor.ai",
-)
+FLOW_COLLATERAL_RPC = "https://archive.chain.opentensor.ai"
+FLOW_RPC_TIMEOUT_S = 45.0
+FLOW_RPC_RETRY_TRIES = 8
+FLOW_RPC_RETRY_BASE_S = 1.0
+FLOW_RPC_RETRY_MAX_S = 20.0
 FLOW_COLLATERAL_PERIOD_ZERO = 1787004000  # 2026-08-17 22:00:00 UTC
 FLOW_COLLATERAL_NETUID = 123
 FLOW_COLLATERAL_OWNER = "0x5186318Ba00Ca115d92C37D2b646eA3867C2c754"
@@ -301,9 +416,9 @@ TASK_INTERVAL = 500
 WEIGHT_CALC_INTERVAL = 1000
 WEIGHT_SET_INTERVAL = 360
 
-OWNER_HPKE_PUBLIC_KEY_HEX="fbfe185ded7a4e6865effceb23cbac32894170587674e751ac237a06f72b3067"
-TLOCK_DEFAULT_LOCK_SECONDS = int(os.getenv("TLOCK_DEFAULT_LOCK_SECONDS", "30"))
-TLOCK_PROD_SUGGESTED_LOCK_SECONDS = int(os.getenv("TLOCK_PROD_SUGGESTED_LOCK_SECONDS", "604800"))
+OWNER_HPKE_PUBLIC_KEY_HEX = "fbfe185ded7a4e6865effceb23cbac32894170587674e751ac237a06f72b3067"
+TLOCK_DEFAULT_LOCK_SECONDS = 30
+TLOCK_PROD_SUGGESTED_LOCK_SECONDS = 604800
 
 # Blocks a raw payload must age before the validator attempts decryption.
 # One week (matching the suggested tlock horizon above): a payload becomes
@@ -314,7 +429,7 @@ TLOCK_PROD_SUGGESTED_LOCK_SECONDS = int(os.getenv("TLOCK_PROD_SUGGESTED_LOCK_SEC
 # immediately.  Prices are recorded at submission time and embeddings
 # backfill onto those rows after decryption, so entry pricing is
 # unaffected by the delay.
-PAYLOAD_MATURITY_BLOCKS = int(os.getenv("PAYLOAD_MATURITY_BLOCKS", "50400"))
+PAYLOAD_MATURITY_BLOCKS = 50400
 ALG_LABEL_V2 = "x25519-hkdf-sha256+chacha20poly1305+drand-tlock"
 SUPPORTED_PAYLOAD_VERSIONS = {1, 2}
 

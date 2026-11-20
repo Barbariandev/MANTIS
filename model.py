@@ -47,7 +47,7 @@ def _flow_collateral_client():
             try:
                 from config import FLOW_COLLATERAL_ADDRESS as _addr
             except ImportError:
-                _addr = os.environ.get("FLOW_COLLATERAL_ADDRESS", "")
+                _addr = ""
             if _addr and _addr.lower() not in ("0", "none", "off", "-"):
                 # a configured contract that cannot be reached must be
                 # loud: silently weighting f-only while the operator
@@ -931,6 +931,34 @@ def multi_salience(
                 sidx_arr=sidx_trimmed,
                 spec=spec,
                 collateral_fn=_flow_bet_collateral_fn(sidx_trimmed),
+            )
+            del hist, prices_multi, prices_trimmed, sidx_trimmed
+        elif loss_type == "autoresearch":
+            # LOOP: FLOW-criteria trade scoring gated by the validator
+            # audit agent (autoresearch/).  Payload shape is identical
+            # to FLOW's (per-row BTC prices + wicks, sidx, 28-dim rows).
+            if not isinstance(payload, dict):
+                del payload
+                continue
+            hist = payload.get("hist")
+            prices_multi = payload.get("prices_multi")
+            sidx_arr = payload.get("sidx_arr")
+            del payload
+            if not isinstance(hist, tuple) or len(hist) != 2 or prices_multi is None:
+                continue
+            hist_trimmed = _trim_hist_price(hist, prices_multi[:, 0])
+            if hist_trimmed[0] is None:
+                continue
+            trim_len = hist_trimmed[0][0].shape[0]
+            prices_trimmed = prices_multi[-trim_len:]
+            sidx_trimmed = sidx_arr[-trim_len:] if sidx_arr is not None else None
+            from autoresearch.scoring import compute_autoresearch_salience
+            s = compute_autoresearch_salience(
+                (hist_trimmed[0][0], hist_trimmed[0][1]),
+                prices_trimmed,
+                sample_every=int(config.SAMPLE_EVERY),
+                sidx_arr=sidx_trimmed,
+                spec=spec,
             )
             del hist, prices_multi, prices_trimmed, sidx_trimmed
         else:

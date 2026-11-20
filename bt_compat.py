@@ -104,6 +104,31 @@ class Subtensor:
             )
         return result
 
+    def commit(self, wallet, netuid: int, data: str):
+        """Publish a small on-chain commitment string for the wallet's
+        hotkey (the same mechanism miners use for their payload URLs).
+        v11 has no intent for it: it is the raw ``Commitments`` call.
+        Older clients have a ``commit`` method."""
+        calls = getattr(bt, "calls", None)
+        if hasattr(calls, "Commitments"):
+            raw = data.encode()
+            call = calls.Commitments.set_commitment(
+                netuid, {"fields": [{f"Raw{len(raw)}": raw}]})
+            # a commitment belongs to the account that signs it, and
+            # submit_call signs with the coldkey unless told otherwise
+            result = self._client.submit_call(call, wallet, signer="hotkey")
+            if not getattr(result, "success", False):
+                logger.warning(
+                    "commit extrinsic did not succeed: %s",
+                    getattr(result, "message", result))
+            return result
+        for name in ("commit", "set_commitment"):
+            fn = getattr(self._client, name, None)
+            if callable(fn):
+                return fn(wallet, netuid, data)
+        raise RuntimeError("this bittensor client cannot publish "
+                           "commitments")
+
 
 class Metagraph:
     """Minimal stand-in for the old ``bittensor.Metagraph`` exposing ``.uids``

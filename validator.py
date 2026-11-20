@@ -131,6 +131,86 @@ async def get_asset_prices(session: aiohttp.ClientSession) -> dict[str, float] |
         logging.error(f"Failed to fetch prices from {config.PRICE_DATA_URL}: {e}")
         return base
 
+def holds_uid0(mg, hotkey: str) -> bool:
+    """Whether ``hotkey`` holds UID 0: the subnet owner's validator,
+    which is LOOP's auditor."""
+    return any(int(uid) == 0 and hk == hotkey
+               for uid, hk in zip(mg.uids, mg.hotkeys))
+
+
+def maybe_start_loop_rounds(datalog_path: str, wallet, mg,
+                            network: str = "finney",
+                            netuid: int = config.NETUID):
+    """LOOP's 24-hour rounds run on the validator holding UID 0, by
+    itself; every other validator mirrors its signed verdicts and never
+    executes miner code.  Submissions arrive through miners' own R2
+    payloads, read with the owner key as they are fetched; evaluation,
+    audit and publication all happen in this process.
+    Returns the round runner (``None`` when off): the main loop hands
+    it each batch of payloads, and shutdown parks its runs."""
+    auditor_hk = wallet.hotkey.ss58_address
+    if not holds_uid0(mg, auditor_hk):
+        return None
+    try:
+        from autoresearch import rounds as loop_rounds
+        from autoresearch.audit import compact_feed_pointer, publish_to_site
+
+        public_url = config.LOOP_PUBLIC_URL
+        compact_feed_pointer(public_url.rstrip("/") + "/verdicts",
+                             "0" * 64)           # too long: fail at start
+
+        def sign(msg: str) -> str:
+            return wallet.hotkey.sign(msg.encode()).hex()
+
+        def commit(text: str) -> bool:
+            sub = bt_compat.Subtensor(network=network)
+            try:
+                res = sub.commit(wallet, netuid, text)
+            finally:
+                try:
+                    sub._client.close()
+                except Exception:
+                    pass
+            return res is not False and getattr(res, "success",
+                                                True) is not False
+
+        def publish(panel):
+            payload = publish_to_site(panel, auditor_hk, sign,
+                                      loop_rounds.dashboard_dir(),
+                                      public_url, commit)
+            logging.info("LOOP verdicts published under %s and committed "
+                         "on chain (%d hotkeys)", public_url,
+                         len(payload["verdicts"]))
+
+        rr = loop_rounds.from_env(datalog_path, publish=publish,
+                                  auditor_hotkey=auditor_hk, sign=sign)
+        threading.Thread(target=rr.tick_forever, daemon=True,
+                         name="loop-rounds").start()
+        logging.info("LOOP rounds on (this validator holds UID 0): "
+                     "evaluating at 0000 UTC, journal in %s, dashboard "
+                     "at %s", rr.journal_dir, config.LOOP_DASHBOARD_URL)
+        return rr
+    except Exception:
+        logging.exception("LOOP rounds failed to start (the validator "
+                          "runs on without them)")
+        return None
+
+
+def park_loop_runs(rr) -> None:
+    """Shutdown: live LOOP runs checkpoint and are parked as paused; the
+    next start resumes them."""
+    try:
+        parked = rr.runner.pause_all()
+        logging.info("LOOP: parked %d run(s); they resume on the next "
+                     "start", len(parked))
+    except Exception:
+        logging.exception("LOOP: parking runs on shutdown failed")
+    try:
+        rr.close()
+    except Exception:
+        logging.exception("LOOP: stopping loop-keyd failed")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--wallet.name", required=True)
@@ -181,18 +261,31 @@ def main():
     ensure_flow_datalog(flow_db_path(DATALOG_PATH))
     logging.info(f"Loading datalog from {DATALOG_PATH}...")
     datalog = DataLog.load(DATALOG_PATH)
-        
+
+    loop_rr = maybe_start_loop_rounds(DATALOG_PATH, wallet, mg,
+                                      args.network, args.netuid)
+
     stop_event = asyncio.Event()
 
     try:
-        asyncio.run(run_main_loop(args, chain, wallet, mg, datalog, stop_event))
+        asyncio.run(run_main_loop(args, chain, wallet, mg, datalog, stop_event, loop_rr=loop_rr))
     except KeyboardInterrupt:
         logging.info("Exit signal received. Shutting down.")
     finally:
         stop_event.set()
+        # Parking can take LOOP_PAUSE_GRACE_SECONDS, so it runs beside the
+        # final save; a process manager that kills sooner only costs the
+        # grace (runs left marked running are parked on the next start).
+        parking = None
+        if loop_rr is not None:
+            parking = threading.Thread(target=park_loop_runs, args=(loop_rr,),
+                                       name="loop-park")
+            parking.start()
         if args.do_save:
             logging.info("Final save on shutdown...")
             asyncio.run(datalog.save(DATALOG_PATH))
+        if parking is not None:
+            parking.join()
         logging.info("Shutdown complete.")
 
 
@@ -305,6 +398,7 @@ async def run_main_loop(
     mg: "bt_compat.Metagraph",
     datalog: DataLog,
     stop_event: asyncio.Event,
+    loop_rr=None,
 ):
     last_block = await get_current_block_with_retry(chain)
     weight_thread: threading.Thread | None = None
@@ -341,6 +435,11 @@ async def run_main_loop(
                 
                 payloads = await get_miner_payloads(netuid=args.netuid, mg=mg)
                 logging.info(f"Retrieved {len(payloads)} payloads from miners. Hotkey sample: {list(payloads.keys())[:3]}")
+                if loop_rr is not None:
+                    try:
+                        await asyncio.to_thread(loop_rr.take_payloads, payloads)
+                    except Exception:
+                        logging.exception("LOOP intake failed (the validator runs on)")
                 await datalog.append_step(current_block, asset_prices, payloads, mg)
 
                 if (

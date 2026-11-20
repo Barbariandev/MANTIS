@@ -94,10 +94,18 @@ GETLOGS_CHUNK = 500
 # lite.chain.opentensor.ai 429s under burst reads (deploy receipt
 # polls, getLogs, eth_call).  Retry only transient transport; a
 # revert / bad nonce / insufficient gas is not a fetch failure.
-RPC_TIMEOUT_S = float(os.environ.get("FLOW_RPC_TIMEOUT", "45"))
-RPC_RETRY_TRIES = int(os.environ.get("FLOW_RPC_RETRIES", "8"))
-RPC_RETRY_BASE_S = float(os.environ.get("FLOW_RPC_RETRY_BASE", "1"))
-RPC_RETRY_MAX_S = float(os.environ.get("FLOW_RPC_RETRY_MAX", "20"))
+try:
+    from config import (
+        FLOW_RPC_RETRY_BASE_S as RPC_RETRY_BASE_S,
+        FLOW_RPC_RETRY_MAX_S as RPC_RETRY_MAX_S,
+        FLOW_RPC_RETRY_TRIES as RPC_RETRY_TRIES,
+        FLOW_RPC_TIMEOUT_S as RPC_TIMEOUT_S,
+    )
+except ImportError:
+    RPC_TIMEOUT_S = 45.0
+    RPC_RETRY_TRIES = 8
+    RPC_RETRY_BASE_S = 1.0
+    RPC_RETRY_MAX_S = 20.0
 
 
 def is_transient_rpc(exc: BaseException) -> bool:
@@ -978,8 +986,8 @@ def client_from_env() -> Optional[CollateralClient]:
         from config import FLOW_COLLATERAL_ADDRESS as _addr
         from config import FLOW_COLLATERAL_RPC as _rpc
     except ImportError:
-        _addr = os.environ.get("FLOW_COLLATERAL_ADDRESS", "").strip()
-        _rpc = os.environ.get("FLOW_COLLATERAL_RPC", MAINNET_RPC)
+        _addr = ""
+        _rpc = MAINNET_RPC
     addr = (_addr or "").strip()
     if not addr or addr.lower() in ("0", "none", "off", "-"):
         return None

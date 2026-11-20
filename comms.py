@@ -17,12 +17,15 @@ def _is_v2_payload(d: Any) -> bool:
 
 
 async def _object_size(url: str, session: aiohttp.ClientSession, timeout: int = 10) -> int | None:
-    async with session.head(url, timeout=timeout, headers={"Accept-Encoding": "identity"}) as r:
+    req_timeout = aiohttp.ClientTimeout(total=timeout)
+    async with session.head(url, timeout=req_timeout, allow_redirects=False,
+                            headers={"Accept-Encoding": "identity"}) as r:
         if r.status == 200:
             cl = r.headers.get("Content-Length")
             if cl and cl.isdigit():
                 return int(cl)
-    async with session.get(url, timeout=timeout, headers={"Accept-Encoding": "identity", "Range": "bytes=0-0"}) as r:
+    async with session.get(url, timeout=req_timeout, allow_redirects=False,
+                           headers={"Accept-Encoding": "identity", "Range": "bytes=0-0"}) as r:
         if r.status in (200, 206):
             cr = r.headers.get("Content-Range")
             if cr:
@@ -37,22 +40,33 @@ async def download(url: str, max_size_bytes: int | None = None) -> dict:
     Download a v2 JSON payload from a URL (used by cycle.py).
 
     Raises on:
-      - HTTP errors
-      - size limit exceeded (if max_size_bytes is set)
+      - HTTP errors or unexpected redirects
+      - size limit exceeded (checked both pre-flight and mid-stream)
       - invalid JSON / invalid v2 payload schema
     """
     parsed = urlparse(url)
     if not parsed.scheme or not parsed.netloc:
         raise ValueError("Invalid URL")
 
+    cap = int(max_size_bytes) if (max_size_bytes is not None and int(max_size_bytes) > 0) else None
+    get_timeout = aiohttp.ClientTimeout(total=45, connect=10, sock_read=20)
     async with aiohttp.ClientSession() as s:
-        if max_size_bytes is not None and int(max_size_bytes) > 0:
+        if cap is not None:
             sz = await _object_size(url, s)
-            if sz is not None and sz > int(max_size_bytes):
-                raise ValueError(f"Object size {sz} exceeds limit {int(max_size_bytes)}")
-        async with s.get(url, timeout=600) as r:
+            if sz is not None and sz > cap:
+                raise ValueError(f"Object size {sz} exceeds limit {cap}")
+        async with s.get(url, timeout=get_timeout, allow_redirects=False) as r:
+            if 300 <= r.status < 400:
+                raise ValueError(f"Redirects are not permitted for miner payloads ({r.status})")
             r.raise_for_status()
-            body = await r.read()
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in r.content.iter_chunked(65536):
+                total += len(chunk)
+                if cap is not None and total > cap:
+                    raise ValueError(f"Streamed payload exceeded limit {cap} bytes")
+                chunks.append(chunk)
+            body = b"".join(chunks)
 
     data = json.loads(body.decode("utf-8"))
     if not _is_v2_payload(data):

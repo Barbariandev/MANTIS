@@ -82,8 +82,8 @@ async def get_miner_payloads(
             return
 
         object_url = commits.get(hotkey)
-        if not object_url:
-            return
+        if not object_url or object_url.startswith("loopfeed"):
+            return                  # LOOP's verdict pointer, not a payload
 
         try:
             if not _is_valid_r2_url(object_url):

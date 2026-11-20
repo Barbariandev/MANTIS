@@ -365,6 +365,8 @@ def _hourly_vol_flags(price: np.ndarray, hours: np.ndarray,
 
 def _t_stat_window(block_sums: np.ndarray) -> float:
     n = len(block_sums)
+    if n < 2:               # one block has no variance to speak of
+        return float("-inf")
     sd = float(np.std(block_sums, ddof=1))
     if sd <= 1e-12:
         return float("-inf")
@@ -397,6 +399,7 @@ def compute_flow_salience(
     collateral: Optional[Dict[str, float]] = None,
     collateral_fn: Optional[Callable[..., float]] = None,
     return_diagnostics: bool = False,
+    score_paths: bool = False,
 ) -> Dict[str, float] | Tuple[Dict[str, float], dict]:
     """hotkey -> fraction of the FLOW pool (+ BURN_KEY; sums to 1).
 
@@ -468,6 +471,7 @@ def compute_flow_salience(
         ewma=np.zeros(N_REGIMES), next=0, first=None, last=None,
         blocks={}, stat=float("-inf"), latched=False, clear_hour=None,
         paid=np.zeros(n_hours),
+        spath=np.zeros(n_hours) if score_paths else None,
     ) for hk in sched}
 
     alloc_paid = np.zeros(n_hours)
@@ -518,6 +522,8 @@ def compute_flow_salience(
                     continue
                 s *= skin
             scores[hk] = s * math.exp(-(h - st["last"]) / cfg.kappa_hours)
+            if score_paths:
+                st["spath"][hi] = scores[hk]
 
         pool = 1.0
         # significance gate cut: every scoring miner shares the main pool
@@ -556,6 +562,7 @@ def compute_flow_salience(
         latched=state[hk]["latched"], clear_hour=state[hk]["clear_hour"],
         ewma=float(np.sum(state[hk]["ewma"])),
         paid=state[hk]["paid"],
+        **({"score_path": state[hk]["spath"]} if score_paths else {}),
     ) for hk in sched}
     diag["_pool"] = dict(n_hours=n_hours, n_miners=len(sched),
                          h_start=h_start, paid_trailing=paid_total)

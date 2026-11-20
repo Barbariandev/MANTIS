@@ -97,6 +97,21 @@ CREATE TABLE IF NOT EXISTS breakout_state (
     asset TEXT PRIMARY KEY,
     state_json TEXT NOT NULL
 );
+-- LOOP pipeline submissions, lifted from matured payloads: the public
+-- copy.  The round system (autoresearch/rounds.py) has usually run each
+-- (hotkey, sha256) a week earlier, read with the owner key on arrival;
+-- it runs one from here only if it never saw it then.  Plaintext by the
+-- time it lands here; key_sealed is stripped before insertion so no
+-- encrypted inference key ever enters the public datalog archive.
+CREATE TABLE IF NOT EXISTS loop_submissions (
+    hotkey TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    block INTEGER NOT NULL,
+    ts REAL NOT NULL,
+    submission TEXT NOT NULL,
+    PRIMARY KEY (hotkey, sha256)
+);
+CREATE INDEX IF NOT EXISTS idx_loop_submissions_ts ON loop_submissions(ts);
 CREATE INDEX IF NOT EXISTS idx_blocks_block ON blocks(block);
 """
 
@@ -113,8 +128,9 @@ def _emb_dtype(ticker: str):
     # embedding; float16 represents integers exactly only to 2048, so
     # ids above that collide (2049->2048) or overflow.  FLOW is stored
     # float32 (exact integers to 2**24); every other challenge, whose
-    # values live in [-1,1], stays float16.
-    return np.float32 if ticker == "FLOW" else np.float16
+    # values live in [-1,1], stays float16.  LOOP shares FLOW's wire
+    # format (trade ids, horizon hours) and therefore its dtype.
+    return np.float32 if ticker in ("FLOW", "LOOP") else np.float16
 
 
 def _pack_embeddings(emb: Dict[str, np.ndarray],
@@ -191,7 +207,7 @@ def ensure_datalog(path: str) -> str:
 # raw_payloads, drand_cache) stays in the main DB: a raw payload is one
 # blob covering every challenge, so it cannot be split per ticker.
 
-_FLOW_DB_TICKERS = frozenset({"FLOW"})
+_FLOW_DB_TICKERS = frozenset({"FLOW", "LOOP"})
 _FLOW_DB_FILENAME = "flow_datalog.db"
 
 _FLOW_SCHEMA_SQL = """
@@ -558,7 +574,7 @@ class DataLog:
                             (ticker, sidx, json.dumps(pd_map)),
                         )
                     continue
-                if ticker in ("TRADEMIX", "FLOW"):
+                if ticker in ("TRADEMIX", "FLOW", "LOOP"):
                     # Prices are recorded at BLOCK ARRIVAL, before payloads
                     # decrypt.  For FLOW this is what fixes the entry
                     # price E: miners commit brackets as fractions under
@@ -570,7 +586,7 @@ class DataLog:
                         pv = prices.get(a)
                         if isinstance(pv, (int, float)) and pv > 0:
                             pd_map[a] = float(pv)
-                            if ticker != "FLOW":
+                            if ticker not in ("FLOW", "LOOP"):
                                 continue
                             # Wick channels for spec-1.3 resolution: the
                             # price service may publish per-asset 1-minute
@@ -863,10 +879,15 @@ class DataLog:
                 if ticker == "TRADEMIX" and isinstance(vec, dict):
                     out[ticker] = _flatten_trademix_dict(vec)
                     continue
+                if ticker == "LOOP" and isinstance(vec, dict):
+                    # round-model form: {"trade": [...], "submit": {...}}
+                    vec = vec.get("trade")
                 if isinstance(vec, list) and len(vec) == dim:
                     if spec and spec.get("loss_func") == "lbfgs":
                         out[ticker] = _sanitize_lbfgs_vec(vec) if dim == 17 else [0.0] * dim
-                    elif spec and spec.get("loss_func") == "flow":
+                    elif spec and spec.get("loss_func") in ("flow", "autoresearch"):
+                        # LOOP shares FLOW's wire format: horizons and
+                        # trade ids legitimately exceed 1
                         out[ticker] = _sanitize_flow_vec(vec)
                     else:
                         ok = all(isinstance(v, (int, float)) and -1 <= v <= 1 for v in vec)
@@ -895,13 +916,16 @@ class DataLog:
                 if ticker == "TRADEMIX" and isinstance(vec, dict):
                     out[ticker] = _flatten_trademix_dict(vec)
                     continue
+                if ticker == "LOOP" and isinstance(vec, dict):
+                    # round-model form: {"trade": [...], "submit": {...}}
+                    vec = vec.get("trade")
                 dim = _get_storage_dim(ticker)
                 if not isinstance(vec, list) or len(vec) != dim:
                     continue
                 spec = config.CHALLENGE_MAP.get(ticker)
                 if spec and spec.get("loss_func") == "lbfgs" and dim == 17:
                     out[ticker] = _sanitize_lbfgs_vec(vec)
-                elif spec and spec.get("loss_func") == "flow":
+                elif spec and spec.get("loss_func") in ("flow", "autoresearch"):
                     out[ticker] = _sanitize_flow_vec(vec)
                 else:
                     if not all(isinstance(v, (int, float)) and -1 <= v <= 1 for v in vec):
@@ -963,7 +987,32 @@ class DataLog:
 
         dec = {}
         retained: set = set()
+        loop_subs: List[tuple] = []     # (hotkey, sha, block, json) found
         retain_before = int(config.PAYLOAD_MATURITY_BLOCKS) + DRAND_RETAIN_GRACE_BLOCKS
+
+        def _collect_loop_submission(hk: str, ts: int, obj: dict) -> None:
+            """A pipeline submission riding the payload's LOOP field —
+            matured, so plaintext now; stored once per (hotkey, sha) for
+            the round system, with ``key_sealed`` / ``key_id`` stripped so
+            no inference key ciphertext ever enters ``datalog.db``."""
+            field = obj.get("LOOP")
+            sub = field.get("submit") if isinstance(field, dict) else None
+            if not isinstance(sub, dict):
+                return
+            public_sub = {k: v for k, v in sub.items()
+                          if k not in ("key_sealed", "key_id")}
+            try:
+                body = json.dumps(public_sub, sort_keys=True,
+                                  separators=(",", ":"))
+            except (TypeError, ValueError):
+                return
+            if len(body) > 400_000:
+                return
+            sha = public_sub.get("sha256")
+            if not (isinstance(sha, str) and len(sha) == 64
+                    and all(c in "0123456789abcdef" for c in sha)):
+                sha = hashlib.sha256(body.encode()).hexdigest()
+            loop_subs.append((hk, sha, ts_to_block.get(ts, 0), body))
 
         async def _work(rnd, items, sess: aiohttp.ClientSession):
             sig = None
@@ -1002,6 +1051,7 @@ class DataLog:
                             obj = json.loads(pt_bytes.decode("utf-8"))
                             if isinstance(obj, dict) and obj.get("hotkey") == hk:
                                 vecs = self._validate_submission(obj)
+                                _collect_loop_submission(hk, ts, obj)
                         except Exception:
                             stats["decrypt_failures"] += 1
                             stats["v2_fail"] += 1
@@ -1066,6 +1116,16 @@ class DataLog:
 
             self._backfill_breakout_embeddings()
             self._flush_breakout_state()
+
+            if loop_subs:
+                now = time.time()
+                c.executemany(
+                    "INSERT OR IGNORE INTO loop_submissions "
+                    "(hotkey, sha256, block, ts, submission) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    [(hk, sha, blk, now, body)
+                     for hk, sha, blk, body in loop_subs],
+                )
 
             c.executemany(
                 "DELETE FROM raw_payloads WHERE ts=? AND hotkey=?",
@@ -1187,9 +1247,10 @@ class DataLog:
                     yield ticker, payload
                 continue
 
-            if loss_func in ("trade_mix", "flow"):
-                # FLOW reuses the trade-mix payload shape: per-hotkey
-                # embeddings (dim x assets) + per-row prices + sidx.
+            if loss_func in ("trade_mix", "flow", "autoresearch"):
+                # FLOW (and LOOP) reuse the trade-mix payload shape:
+                # per-hotkey embeddings (dim x assets) + per-row prices
+                # + sidx.
                 payload = DataLog._build_trade_mix_from_db(
                     conn, ticker, blocks_ahead, max_block_number,
                     active_hotkeys=active_hotkeys, spec=spec,

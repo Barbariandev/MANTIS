@@ -322,14 +322,11 @@ def _client(args, need_key: bool) -> CollateralClient:
     except ImportError:
         FLOW_COLLATERAL_ADDRESS = ""
         FLOW_COLLATERAL_RPC = "https://lite.chain.opentensor.ai"
-    rpc = (args.rpc or os.environ.get("FLOW_RPC")
-           or os.environ.get("FLOW_COLLATERAL_RPC") or FLOW_COLLATERAL_RPC)
-    contract = (args.contract or os.environ.get("FLOW_CONTRACT")
-                or os.environ.get("FLOW_COLLATERAL_ADDRESS")
-                or FLOW_COLLATERAL_ADDRESS)
+    rpc = args.rpc or FLOW_COLLATERAL_RPC
+    contract = args.contract or FLOW_COLLATERAL_ADDRESS
     key = args.evm_key or os.environ.get("FLOW_EVM_KEY")
     if not rpc or not contract or contract.lower() in ("off", "none", "-"):
-        raise SystemExit("need --rpc/--contract (or FLOW_RPC/FLOW_CONTRACT)")
+        raise SystemExit("need --rpc/--contract (or config.py FLOW_COLLATERAL_*)")
     if need_key and not key:
         raise SystemExit("need --evm-key (or FLOW_EVM_KEY) to post")
     return CollateralClient(contract, rpc,

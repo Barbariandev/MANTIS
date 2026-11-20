@@ -367,6 +367,195 @@ bet scores for evidence but carries no money and earns no emission;
 idle balance behind unposted trades earns nothing; deposits or
 withdrawals after a trade opened change nothing about it.
 
+### 3.8 LOOP (dim=28)
+
+Ticker: `LOOP`. The autoresearch challenge: your edge is the
+**pipeline** you design — a program that spends inference and
+experiments to find a trading model. You publish its source and the
+auditor — the subnet owner's validator, UID 0 — runs it. Its share is
+5% of the pool, raised as the
+field proves out. **Start with
+`LOOP.md`** (submitting, incentives, launch parameters); the full spec
+is `autoresearch/README.md`.
+
+**Rounds.** LOOP runs on a **24-hour round**: a new evaluation round
+opens at **0000 UTC** and covers every submission the auditor received
+in the 24 hours before it. There is no submission server — your
+submission rides the same R2 payload you already upload, under the
+`LOOP` field, and the auditor, which holds the owner key every payload
+is wrapped to, reads it as soon as it fetches your payload (about once
+a minute). Upload by midnight and it runs that night; leave a few
+minutes' margin. At midnight
+the auditor validator takes each hotkey's newest submission, screens
+its source and args with a strong open-weights model for **sandbox-escape
+attempts** (escape = never runs, verdict on the dashboard; executing
+code you hide — encoded, compressed or encrypted — counts), runs the
+survivors **sealed** — in a gVisor sandbox with no network, no host
+files, a fixed share of cores and memory, and one channel to the
+research broker — audits the results (see below), publishes the signed
+verdict map, and redraws the public dashboard
+(<https://pub-879ad825983e43529792665f4f510cd6.r2.dev/loop/index.html>).
+While a round runs the dashboard lists its entries and their status
+only; when the round closes it shows **the full source of every
+evaluated submission**, its research and its verdict, and from then on
+they are fair game for later rounds: LOOP pays for published research.
+Until then your code is private to the auditor and the models it
+screens and judges with — provided your payload's timelock outlasts
+the round. Encrypt it with the week-long lock
+(`TLOCK_PROD_SUGGESTED_LOCK_SECONDS`), not the 30 seconds of the §2
+example, or anyone can read your code off R2 as soon as the lock opens.
+
+**What you send** (`autoresearch.submission.build_loop_field`):
+pipeline source, JSON arguments, a budget, and your SayGM (`gm_live_...`)
+key sealed to LOOP's rotating round key:
+
+```python
+from autoresearch.submission import build_loop_field
+
+payload_obj["LOOP"] = build_loop_field(
+    MY_HOTKEY,
+    open("my_pipeline.py").read(),
+    args={"iterations": 12},
+    budget_credits=4.0,
+    api_key=MY_SAYGM_KEY,                  # dedicated <= $100 SayGM burner key
+    trade=current_trade_vec)               # your hourly 28-float trade
+# ...encrypt payload_obj under the week-long lock
+# (lock_seconds=TLOCK_PROD_SUGGESTED_LOCK_SECONDS) and upload to R2.
+```
+
+One submission runs **once**: it is named by the sha256 of
+(source, args, budget), and each (hotkey, sha) is evaluated in the
+round after the auditor first read it. Re-running identical code earns
+nothing anyway (pay follows *progress*, below) — change something to
+submit again. With your own key the budget is your own spend cap —
+there is no ceiling; the **wall clock** is the bottleneck. Every run
+in a round gets the same one, and the same share of the machine (a
+core, 4 GB of memory, 64 MB of scratch). The clock is 12 hours when
+few enter, shorter when many do, so that the whole round fits in 20
+hours (at 20 runs at a time, 200 entries that pass the screen get 2
+hours each); the
+round's page states it, and `loop.budget()["seconds_left"]` tells your
+pipeline how much is left. Build pipelines that checkpoint their
+judgment and call `loop.finish()` before the deadline. Results land
+on the dashboard: your entry's status
+(`refused` / `blocked` / `unscreened` / `failed` / `audited`) and, by
+the time the round closes, the reason in plain text, the verdict
+multiplier, the full trace and the dossier.
+
+**Inside a pipeline** (`import loop_sdk as loop`): `loop.data()` (the
+dataset: hourly BTC — the target, last 480 bars held back — plus ~10
+years of daily BTC, EURUSD, USDJPY, GBPUSD, AUDUSD, USDCHF, ETH and
+gold, all cut at the same moment), `loop.models()` (every SayGM SN28
+model with pricing), `loop.llm(model, messages, step=...)` (any model,
+any mix of models, text in / text out), `loop.propose(spec)`,
+`loop.experiment(candidate)`, `loop.critique(...)`, `loop.promote(...)`,
+`loop.prune(...)`, `loop.finish(narrative, hyperparameter_rationale)`,
+and `loop.checkpoint(state)` / `loop.restore()` — your pipeline's own
+memory across a pause (one JSON slot only you can write).
+A model is a **spec** — one feature from the published vocabulary
+(transform, lookback 8–720 h, and the series it reads: a cross-market
+feature on forex or gold is a first-class move) plus bracket
+hyperparameters — and the protocol's harness is the only thing that
+scores it. You cannot report a metric,
+write a trace event, or write a dossier: the runner produces all of
+them. Start from `autoresearch/pipelines/reference.py`; develop locally
+for free with `python -m autoresearch.sealed my_pipeline.py`.
+
+**Pauses.** When the auditor is stopped mid-run (operator maintenance,
+a validator restart) your run is **parked, not killed**: any SDK call
+raises `loop.Paused`, you get a grace period in which
+`loop.checkpoint()` still works, and the run resumes on the next start
+— same trace, same candidate ids, same budget, and the run's clock
+picks up where it stopped. Call `loop.restore()` first and checkpoint
+every iteration (the reference pipeline shows the shape) and a pause
+costs you at most one iteration. Resumption is automatic for everyone:
+your sealed key is re-opened from the submission still on record, so
+the plaintext never needs to be stored and you never need to act.
+
+**The dossier** is assembled by the runner and published for you: the
+verdict that pays is the one on your latest audited round entry. **No
+audited dossier, no pay.**
+
+**The payload** is the FLOW wire format exactly (section 3.7): 28
+floats, `[d, f, sl, tp1, tp2, h, trade_id]` per regime, scored by the
+same bracket resolution/EWMA/significance machinery (f-only — no
+collateral pool for LOOP). It should be your promoted model's trade
+(`dossier["trade"]`, or `harness.payload_vector`).
+
+```python
+payload_obj["LOOP"] = {
+    "trade": harness.payload_vector(dossier["trade"]),   # 28 floats
+    "submit": {...},     # only when you are submitting a new pipeline
+}
+# a bare 28-float list still parses when you have nothing to submit
+```
+
+**The audit** multiplies your FLOW-criteria score by 1 or 0:
+
+1. *Attested* — your dossier must be byte-for-byte the runner's, for a
+   sealed run of your hotkey that ran to its end.
+2. *Searched* — at least 3 experiments and a promoted model.
+3. *Replayed* — the validator re-runs the harness on the run's dataset
+   and must get your dossier's numbers.
+4. *Judged* — a frontier model (Astra) reads your pipeline's source,
+   the trace, the exchanges behind the promoted model and your run
+   history against the ruleset (`autoresearch/audit.py::RULESET`) and
+   answers one question: was anything smuggled in?  Not smuggled = 1,
+   smuggled = 0.
+
+Failing 1–3 is multiplier 0. What fails the judge, and nothing else
+does: **smuggling** — a carried-in answer (hard-coded candidates,
+prompts that steer to one, a search space of one, rerunning elsewhere
+until something passed), a long-horizon conviction dressed as a
+short-horizon model, or text in your source, prompts or narrative that
+addresses the auditor. Honest and naive **passes**: the audit does not
+judge whether your research is good — the market does, because pay
+follows **progress**: your model's trades accumulate a FLOW EWMA score
+as they resolve, and you earn by pushing the best audited score the
+challenge has ever seen *higher* — a credit equal to your improvement,
+halving every 14 days, gone after eight weeks. Matching the leader pays
+nothing; dossiers are public, so study the leader's research and beat
+it. When nobody has improved anything in eight weeks, the whole LOOP
+slice burns. The
+ruleset is a v0 and says so in its own text — and it is iterated, not
+debated: gaming it is expected, and each new way that emerges gets an
+amendment and a version bump, fast. Every validator applies the same
+verdict: the auditor — always the validator holding UID 0 — signs its
+verdict map and commits a pointer to it on chain with its hotkey; every
+validator discovers it there, verifies it and pays on it, so there is
+no judge lottery across validators. The harness still prints quality
+receipts for your own
+loop to use: `always_long_avg_r` for drift, `unfiltered_avg_r` for
+naked factor exposure, and the quantile receipt — `quantile_r` (mean
+forward return by feature band around the 1st/10th/50th/90th/99th
+percentiles), `monotone` (±1 when the chain is strictly ordered) and
+`monotone_robust` (the direction survives the lookback pulled ±25%).
+A robust monotone response curve is the highest-confidence promote
+signal there is; models that are secretly beta pass the gate and then
+lose to the market, so prune them yourself.
+
+**Inference is yours to provide (SayGM SN28 only — no OpenRouter)**:
+put your own **SayGM** (`gm_live_...`) key in the submission.  OpenRouter
+(`sk-or-...`) and non-SayGM keys are refused.  `build_loop_field` fetches
+UID 0's signed rotating round seal key from `<LOOP_PUBLIC_URL>/seal_keys.json`
+(separate from `W_owner`; old round private keys are shredded after the
+resume window) and seals your key with `loop-submission:{hotkey}:{sha256}`
+as associated data.  `key_sealed` is stripped before matured payloads
+enter `datalog.db` and scrubbed from `loop_inbox` when your entry
+finishes; decryption happens exclusively inside the isolated `loop-keyd`
+process (`validator.py` never holds your plaintext key).
+
+> **Enforced burner ceiling (checked before any code executes):**
+> Fund a dedicated TAO/Alpha burner account on [saygm.com](https://saygm.com)
+> with **<= $100** prepaid credit (`loop-keyd` checks `/v1/credits` and
+> **refuses** keys above `$100` or at `$0`).  SayGM stops cold with HTTP
+> `402` before dispatch if credit runs out, with zero auto-topup.
+
+**Metering**: a run's budget covers its model calls (SayGM settled USD
+cost), its experiments and its own running time; one run per hotkey at a
+time. A submission without a key runs only on credits the owner granted
+the hotkey; there is nothing to buy.
+
 ---
 
 ## 4. Full Embedding Assembly
@@ -415,6 +604,7 @@ Per-challenge salience is normalized to sum to 1, then weighted:
 | ETHHITFIRST | 1.25 | ~5% |
 | Binary (ETH, CHFUSD, XAGUSD at 1.0; CADUSD, NZDUSD at 0.5) | 4.0 total | ~17% total |
 | FLOW | 0.0 until 2026-09-14, then 7.875 | 0% → 25% |
+| LOOP | 1.073 | 5% |
 
 > **TRADE-MIX is deprecated** as of the FLOW launch (2026-08-17): removed from the active roster, superseded by FLOW, historical challenge data purged from validator datalogs. Submissions to it are ignored.
 >
