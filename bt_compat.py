@@ -16,13 +16,64 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import Optional
+import threading
+from typing import Callable, Optional, TypeVar
 
 import numpy as np
 import bittensor as bt
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+
+def call_with_deadline(fn: Callable[[], T], timeout: float, what: str) -> T:
+    box: dict = {}
+    done = threading.Event()
+
+    def target():
+        try:
+            box["result"] = fn()
+        except BaseException as e:  # noqa: BLE001
+            box["error"] = e
+        finally:
+            done.set()
+
+    threading.Thread(target=target, name=what, daemon=True).start()
+    if not done.wait(float(timeout)):
+        raise TimeoutError(f"{what} did not complete within {timeout:.0f}s")
+    if "error" in box:
+        raise box["error"]
+    return box["result"]
+
+
+async def run_with_deadline(fn: Callable[[], T], timeout: float, what: str) -> T:
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future = loop.create_future()
+
+    def settle(result, error):
+        if not fut.done():
+            if error is None:
+                fut.set_result(result)
+            else:
+                fut.set_exception(error)
+
+    def target():
+        try:
+            r = fn()
+        except BaseException as e:  # noqa: BLE001
+            r, err = None, e
+        else:
+            err = None
+        try:
+            loop.call_soon_threadsafe(settle, r, err)
+        except RuntimeError:
+            pass
+
+    threading.Thread(target=target, name=what, daemon=True).start()
+    return await asyncio.wait_for(fut, timeout=float(timeout))
 
 
 class Subtensor:

@@ -27,6 +27,7 @@ import numpy as np
 import pickle
 
 import bt_compat
+from bt_compat import call_with_deadline, run_with_deadline
 from cycle import get_miner_payloads
 from model import LAST_CLUSTERS, multi_salience as sal_fn
 from flow import BURN_KEY as CHALLENGE_BURN_KEY
@@ -65,6 +66,12 @@ os.makedirs(config.STORAGE_DIR, exist_ok=True)
 DATALOG_PATH = os.path.join(config.STORAGE_DIR, "mantis_datalog.db")
 WEIGHTS_PATH = os.path.join(config.STORAGE_DIR, "saved_weights.pkl")
 SAVE_INTERVAL = 480
+STARTUP_CONNECT_TIMEOUT = 180.0
+METAGRAPH_SYNC_TIMEOUT = 120.0
+SET_WEIGHTS_TIMEOUT = 180.0
+COMMIT_TIMEOUT = 180.0
+LOOP_INTAKE_TIMEOUT = 300.0
+PRICE_FETCH_TIMEOUT = 20.0
 
 
 def save_weights(weights_tensor: torch.Tensor, uids: list[int], block: int, hotkeys: list[str] = None):
@@ -91,7 +98,7 @@ async def get_asset_prices(session: aiohttp.ClientSession) -> dict[str, float] |
     specs = list(config.CHALLENGES)
     base = {spec["ticker"]: 0.0 for spec in specs}
     try:
-        async with session.get(config.PRICE_DATA_URL) as resp:
+        async with session.get(config.PRICE_DATA_URL, timeout=aiohttp.ClientTimeout(total=PRICE_FETCH_TIMEOUT)) as resp:
             resp.raise_for_status()
             text = await resp.text()
             data = json.loads(text)
@@ -163,14 +170,20 @@ def maybe_start_loop_rounds(datalog_path: str, wallet, mg,
             return wallet.hotkey.sign(msg.encode()).hex()
 
         def commit(text: str) -> bool:
-            sub = bt_compat.Subtensor(network=network)
-            try:
-                res = sub.commit(wallet, netuid, text)
-            finally:
+            def submit():
+                sub = bt_compat.Subtensor(network=network)
                 try:
-                    sub._client.close()
-                except Exception:
-                    pass
+                    return sub.commit(wallet, netuid, text)
+                finally:
+                    try:
+                        sub._client.close()
+                    except Exception:
+                        pass
+            try:
+                res = call_with_deadline(submit, COMMIT_TIMEOUT, "loop-commit")
+            except TimeoutError as e:
+                logging.warning("LOOP commit: %s", e)
+                return False
             return res is not False and getattr(res, "success",
                                                 True) is not False
 
@@ -238,11 +251,15 @@ def main():
     )
     args = p.parse_args()
 
+    def connect():
+        chain = ChainConnection(network=args.network)
+        mg = bt_compat.Metagraph(netuid=args.netuid, network=args.network, sync=True, subtensor=chain.sub)
+        return chain, mg
+
     while True:
         try:
-            chain = ChainConnection(network=args.network)
+            chain, mg = call_with_deadline(connect, STARTUP_CONNECT_TIMEOUT, "startup-connect")
             wallet = bt.Wallet(name=getattr(args, "wallet.name"), hotkey=getattr(args, "wallet.hotkey"))
-            mg = bt_compat.Metagraph(netuid=args.netuid, network=args.network, sync=True, subtensor=chain.sub)
             break
         except Exception as e:
             logging.exception("Subtensor connect failed")
@@ -358,11 +375,7 @@ async def get_current_block_with_retry(chain: "ChainConnection",
                 with lock:
                     return sub.get_current_block()
 
-            current_block = await asyncio.wait_for(
-                asyncio.to_thread(get_block),
-                timeout=float(timeout)
-            )
-            return current_block
+            return await run_with_deadline(get_block, timeout, "get_block")
         except asyncio.TimeoutError:
             failures += 1
             logging.warning(
@@ -381,14 +394,36 @@ async def get_current_block_with_retry(chain: "ChainConnection",
                 "presumed stale, rebuilding the websocket (and its lock).",
                 failures,
             )
-            try:
-                await asyncio.to_thread(chain.reconnect)
-                logging.info("Chain connection rebuilt.")
-            except Exception:
-                logging.exception(
-                    "Reconnect failed; will retry with the old connection."
-                )
+            await reconnect_chain(chain)
         await asyncio.sleep(retry_delay)
+
+
+RECONNECT_TIMEOUT = 60.0
+
+
+async def reconnect_chain(chain: "ChainConnection") -> None:
+    try:
+        await run_with_deadline(chain.reconnect, RECONNECT_TIMEOUT, "reconnect")
+        logging.info("Chain connection rebuilt.")
+    except asyncio.TimeoutError:
+        logging.warning("Reconnect did not complete within %.0fs; will retry later.", RECONNECT_TIMEOUT)
+    except Exception:
+        logging.exception("Reconnect failed; will retry with the old connection.")
+
+
+async def chain_call(chain: "ChainConnection", fn, timeout: float, what: str):
+    sub, lock = chain.sub, chain.lock
+
+    def run():
+        with lock:
+            return fn(sub)
+
+    try:
+        return await run_with_deadline(run, timeout, what)
+    except asyncio.TimeoutError:
+        logging.warning("%s timed out after %.0fs: connection presumed stale, rebuilding the websocket.", what, timeout)
+        await reconnect_chain(chain)
+        raise
 
 
 async def run_main_loop(
@@ -402,6 +437,7 @@ async def run_main_loop(
 ):
     last_block = await get_current_block_with_retry(chain)
     weight_thread: threading.Thread | None = None
+    weights_pending = False
 
     tasks = [
         asyncio.create_task(decrypt_loop(datalog, stop_event)),
@@ -423,10 +459,12 @@ async def run_main_loop(
                 logging.info(f"Sampled block {current_block}")
 
                 if current_block % 100 == 0:
-                    sub, lock = chain.sub, chain.lock
-                    with lock:
-                        mg.sync(subtensor=sub)
-                    logging.info("Metagraph synced.")
+                    try:
+                        await chain_call(chain, lambda sub: mg.sync(subtensor=sub),
+                                         METAGRAPH_SYNC_TIMEOUT, "Metagraph sync")
+                        logging.info("Metagraph synced.")
+                    except Exception:
+                        logging.exception("Metagraph sync failed; continuing with the previous metagraph.")
 
                 asset_prices = await get_asset_prices(session)
                 if not asset_prices:
@@ -437,7 +475,8 @@ async def run_main_loop(
                 logging.info(f"Retrieved {len(payloads)} payloads from miners. Hotkey sample: {list(payloads.keys())[:3]}")
                 if loop_rr is not None:
                     try:
-                        await asyncio.to_thread(loop_rr.take_payloads, payloads)
+                        await run_with_deadline(lambda: loop_rr.take_payloads(payloads),
+                                                LOOP_INTAKE_TIMEOUT, "loop-intake")
                     except Exception:
                         logging.exception("LOOP intake failed (the validator runs on)")
                 await datalog.append_step(current_block, asset_prices, payloads, mg)
@@ -642,12 +681,16 @@ async def run_main_loop(
                     weight_thread.start()
                 
                 if current_block % config.WEIGHT_SET_INTERVAL == 0:
+                    weights_pending = True
+                if weights_pending:
                     if args.skip_set_weights:
                         logging.info(f"Block {current_block}: --skip-set-weights active, not setting weights on-chain.")
+                        weights_pending = False
                     else:
                         weights_data = load_weights()
                         if weights_data is None:
                             logging.info(f"No saved weights found at block {current_block}, skipping weight setting.")
+                            weights_pending = False
                         else:
                             calc_block = weights_data.get("block", "unknown")
                             final_w = weights_data["weights"]
@@ -657,15 +700,27 @@ async def run_main_loop(
                             
                             if list(saved_uids) != mg.uids.tolist():
                                 weights_logger.warning("UID mismatch between saved weights and current metagraph, skipping.")
+                                weights_pending = False
                             else:
-                                chain.sub.set_weights(
-                                    netuid=args.netuid,
-                                    wallet=wallet,
-                                    uids=mg.uids,
-                                    weights=final_w,
-                                    wait_for_inclusion=False,
-                                )
-                                weights_logger.info(f"Weights set at block {current_block} (from block {calc_block}, max={final_w.max():.4f})")
+                                try:
+                                    await chain_call(
+                                        chain,
+                                        lambda sub: sub.set_weights(
+                                            netuid=args.netuid,
+                                            wallet=wallet,
+                                            uids=mg.uids,
+                                            weights=final_w,
+                                            wait_for_inclusion=False,
+                                        ),
+                                        SET_WEIGHTS_TIMEOUT,
+                                        "set_weights",
+                                    )
+                                    weights_pending = False
+                                    weights_logger.info(f"Weights set at block {current_block} (from block {calc_block}, max={final_w.max():.4f})")
+                                except Exception:
+                                    weights_logger.exception(
+                                        f"Weight set at block {current_block} failed; retrying at the next sampled block."
+                                    )
 
             except KeyboardInterrupt:
                 stop_event.set()

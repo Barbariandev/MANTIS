@@ -34,6 +34,7 @@ NETWORK = "finney"
 _sub = None
 
 MAX_PAYLOAD_BYTES = 25 * 1024 * 1024
+COMMITMENTS_TIMEOUT = 60.0
 
 
 def _get_subtensor():
@@ -66,7 +67,8 @@ async def get_miner_payloads(
     for attempt in range(2):
         s = _get_subtensor()
         try:
-            commits = s.get_all_commitments(netuid)
+            commits = await bt_compat.run_with_deadline(
+                lambda: s.get_all_commitments(netuid), COMMITMENTS_TIMEOUT, "commitments")
             break
         except Exception:
             logger.warning("get_all_commitments failed (attempt %d/2), reconnecting subtensor", attempt + 1)
