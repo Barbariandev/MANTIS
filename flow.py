@@ -95,6 +95,8 @@ class FlowConfig:
     gamma: float = 0.25          # path penalty on R_MAE
     tau: float = 1.00            # tail amplifier (2x)
     tail_mult: float = 2.0       # tail when sigma_24h > tail_mult * sigma_30d
+    fee: float = 0.0             # round-trip fee, fraction of notional
+    fee_from_block: int = 0      # trades opened at/after this block pay it
     # --- aggregation
     ewma_alpha: float = 0.05
     kappa_hours: float = 672.0   # >= 2x the longest regime horizon (336h)
@@ -124,13 +126,17 @@ class FlowConfig:
         if not spec:
             return cls()
         kw = {}
-        for k in ("delta", "lam", "gamma", "tau", "tail_mult", "ewma_alpha",
+        for k in ("delta", "lam", "gamma", "tau", "tail_mult", "fee",
+                  "fee_from_block", "ewma_alpha",
                   "kappa_hours", "probation_hours", "gate_block_h",
                   "gate_min_n", "gate_z_in", "gate_z_out", "dust",
                   "period_loss_cap", "p_bound", "smooth_hours"):
             if k in spec:
                 kw[k] = type(getattr(cls, k))(spec[k])
         return cls(**kw)
+
+    def fee_from_hour(self) -> float:
+        return self.fee_from_block * SECONDS_PER_BLOCK / 3600.0
 
 
 @dataclass
@@ -303,6 +309,8 @@ def _resolve(tr: Trade, price: np.ndarray, hours: np.ndarray,
     def R(P: float) -> float:
         return di * (P - tr.entry) / risk
 
+    fee = (cfg.fee * tr.entry / risk
+           if cfg.fee > 0.0 and tr.open_hour >= cfg.fee_from_hour() else 0.0)
     if tr.event == "SL":
         s = -1.0                                    # no path penalty on stops
     elif tr.event == "TP2":
@@ -312,8 +320,8 @@ def _resolve(tr: Trade, price: np.ndarray, hours: np.ndarray,
     else:
         s = R(float(price[tr.resolve_row])) - cfg.gamma * r_mae
     tr.s_base = (-1.0 if tr.event == "SL"
-                 else s + cfg.gamma * r_mae)        # gate input: pre-path R
-    tr.s_weighted = s                               # path applied; tail + f later
+                 else s + cfg.gamma * r_mae) - fee  # gate input: pre-path R
+    tr.s_weighted = s - fee                         # path applied; tail + f later
 
 
 # ------------------------------------------------------------------- salience

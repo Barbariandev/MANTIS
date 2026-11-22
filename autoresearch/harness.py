@@ -71,6 +71,7 @@ HARNESS_SOURCE = r'''
 import json, math, sys
 
 FOLDS = 4
+FEE = 0.0010
 
 def _feature(closes, kind, lb):
     """One causal transform over a series, rolling sums: O(n)."""
@@ -211,18 +212,19 @@ def _bracket_r(closes, t, d, sl, tp1, tp2, horizon, lam=0.5, delta=0.3):
     tp1_px = E * (1.0 + d * tp1)
     tp2_px = E * (1.0 + d * tp2)
     hit1 = False
+    fee = FEE / sl
     end = min(t + horizon, len(closes) - 1)
     for i in range(t + 1, end + 1):
         px = closes[i]
         if (d > 0 and px <= sl_px) or (d < 0 and px >= sl_px):
-            return -1.0
+            return -1.0 - fee
         if (d > 0 and px >= tp2_px) or (d < 0 and px <= tp2_px):
-            return (tp1 / sl) * lam + (tp2 / sl) * (1.0 - lam) * (1.0 + delta)
+            return (tp1 / sl) * lam + (tp2 / sl) * (1.0 - lam) * (1.0 + delta) - fee
         if (d > 0 and px >= tp1_px) or (d < 0 and px <= tp1_px):
             hit1 = True
     fin = d * (closes[end] / E - 1.0) / sl
-    return lam * (tp1 / sl) + (1.0 - lam) * max(min(fin, tp1 / sl), -1.0) \
-        if hit1 else max(min(fin, 1.0), -1.0)
+    return (lam * (tp1 / sl) + (1.0 - lam) * max(min(fin, tp1 / sl), -1.0)
+            if hit1 else max(min(fin, 1.0), -1.0)) - fee
 
 def _params(ds, spec):
     feat = spec["feature"]; hp = spec["hyperparams"]

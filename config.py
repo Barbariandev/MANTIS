@@ -229,6 +229,9 @@ _FLOW_WEIGHT_AT_TURNON = (
     (1.0 - FLOW_TARGET_FRACTION)
 )
 
+FLOW_FEE = 0.0010
+FLOW_FEE_FROM_BLOCK = 9_565_700
+
 FLOW_CHALLENGE = {
     "name": "FLOW-BTC",
     "ticker": "FLOW",
@@ -250,6 +253,8 @@ FLOW_CHALLENGE = {
     "gate_z_in": 1.25,
     "gate_z_out": 0.50,
     "dust": 0.02,
+    "fee": FLOW_FEE,
+    "fee_from_block": FLOW_FEE_FROM_BLOCK,
 }
 
 CHALLENGES.append(FLOW_CHALLENGE)
@@ -287,6 +292,8 @@ AUTORESEARCH_CHALLENGE = {
     "loss_func": "autoresearch",
     "weight": _LOOP_WEIGHT_AT_TURNON,
     # trade scoring inherits FlowConfig defaults (flow.py section 1.8)
+    "fee": FLOW_FEE,
+    "fee_from_block": 0,
     # --- audit gate
     # every validator, the auditor included, pays on the auditor's
     # signed verdict map (weight consensus; see autoresearch/audit.py::
